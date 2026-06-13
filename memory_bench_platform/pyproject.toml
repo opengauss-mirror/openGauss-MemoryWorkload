@@ -1,0 +1,22 @@
+[project]
+name = "memory-bench-platform"
+version = "0.1.0"
+description = "Benchmark orchestrator for memory-oriented agents"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7",
+  "jsonschema>=4.22",
+  "PyYAML>=6.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+]
+
+[project.scripts]
+memory-bench = "memory_bench_platform.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

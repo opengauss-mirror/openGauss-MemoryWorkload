@@ -1,0 +1,21 @@
+# 冒烟测试 — small 数据集, sample 0, 只跑 health_check
+
+[general]
+name = "smoke-test"
+env_file = "env.toml"
+dataset = "small"
+sample = 0
+memory_mode = "openviking"
+parallel = 1
+user = "eval-1"
+agent_id = "locomo-eval"
+
+[session]
+policy = "isolated"
+
+[steps]
+health_check = true
+ingest = false
+qa = false
+judge = false
+stats = false

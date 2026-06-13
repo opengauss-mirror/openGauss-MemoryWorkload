@@ -1,0 +1,13 @@
+kind: benchmark
+id: longmemeval
+version: 0.1.0
+entry:
+  task_builder: scripts/build_tasks.py
+dataset:
+  default_split: dev
+execution:
+  mode: multi_turn
+  requires_stateful_agent: true
+  task_isolation: per_task
+judging:
+  mode: external

@@ -1,0 +1,22 @@
+# 迷你测试 — small 数据集, sample 0, 只跑 3 道 QA
+
+[general]
+name = "mini-test"
+env_file = "env.toml"
+dataset = "small"
+sample = 0
+count = 3
+memory_mode = "openviking"
+parallel = 1
+user = "eval-1"
+agent_id = "locomo-eval"
+
+[session]
+policy = "isolated"
+
+[steps]
+health_check = true
+ingest = true
+qa = true
+judge = false
+stats = false

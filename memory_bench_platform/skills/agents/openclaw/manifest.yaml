@@ -1,0 +1,15 @@
+kind: agent
+id: openclaw
+version: 0.1.0
+entry:
+  runner: scripts/run_task.py
+  healthcheck: scripts/healthcheck.py
+runtime:
+  mode: service
+io:
+  protocol_mode: stateful_session
+lifecycle:
+  startup_required: true
+collection:
+  stdout: true
+  stderr: true
