@@ -4,11 +4,12 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from .loader import load_all_skills
 from .manifests import AgentManifest, BenchmarkManifest
-from .paths import SKILLS_ROOT
-from .protocol import RenderedTaskInput
+from .paths import PROJECT_ROOT, SKILLS_ROOT
+from .protocol import EntryPointRecord, RenderedTaskInput
 
 
 def _manifest_path(kind: str, skill_id: str) -> Path:
@@ -89,3 +90,69 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
         _script_for_manifest(manifest_path, manifest.entry.runner),
         stdin_payload=rendered_input.model_dump(),
     )
+
+
+def classify_entrypoint(entry: dict[str, Any]) -> str:
+    if entry.get("external_runner"):
+        return "external_runner"
+    if entry.get("case_builder") or entry.get("task_builder"):
+        return "case_builder"
+    return "unknown"
+
+
+def resolve_benchmark_entrypoint(skill_id: str, entrypoint_id: str | None = None) -> EntryPointRecord:
+    manifest = get_benchmark_manifest(skill_id)
+    manifest_path = _manifest_path("benchmarks", skill_id)
+
+    if entrypoint_id:
+        configured = manifest.execution.get("entrypoints", {}).get(entrypoint_id, {})
+        kind = classify_entrypoint(configured)
+        if kind == "external_runner":
+            script_path = manifest_path.parent / configured["external_runner"]
+            command = _command_for_script(script_path)
+            return EntryPointRecord(
+                entrypoint_id=entrypoint_id,
+                entrypoint_kind="external_runner",
+                command=command,
+                metadata=configured,
+            )
+        raise ValueError(f"unsupported benchmark entrypoint: {skill_id}:{entrypoint_id}")
+
+    builder = manifest.entry.case_builder or manifest.entry.task_builder
+    if not builder:
+        raise ValueError(f"benchmark skill {skill_id} has no case_builder/task_builder")
+    return EntryPointRecord(
+        entrypoint_id="default",
+        entrypoint_kind="case_builder",
+        command=[sys.executable, str(_script_for_manifest(manifest_path, builder))],
+    )
+
+
+def _command_for_script(script_path: Path) -> list[str]:
+    if script_path.suffix == ".py":
+        return [sys.executable, str(script_path)]
+    if script_path.suffix == ".sh":
+        return ["bash", str(script_path)]
+    return [str(script_path)]
+
+
+def execute_external_runner(
+    entrypoint: EntryPointRecord,
+    *,
+    env: dict[str, str],
+    cwd: Path | None = None,
+) -> dict[str, Any]:
+    proc = subprocess.run(
+        entrypoint.command,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=str(cwd or PROJECT_ROOT),
+        check=False,
+    )
+    return {
+        "status": "passed" if proc.returncode == 0 else "failed",
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }

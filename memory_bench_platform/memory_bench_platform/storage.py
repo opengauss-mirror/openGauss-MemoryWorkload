@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 from .protocol import RunRecord
 
@@ -27,3 +28,11 @@ class RunStorage:
         target = run_dir / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def mirror_tree(self, run_dir: Path, source_dir: Path, relative_target: str) -> Path:
+        target = run_dir / relative_target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source_dir, target)
+        return target

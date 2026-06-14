@@ -99,6 +99,7 @@ class Config:
     agent_id: str = "main"
     memory_mode: str = "openviking"
     output_dir: str = "output"
+    run_lock_dir: str = ""
 
     # sub-configs
     gateway: GatewayEnv = field(default_factory=GatewayEnv)
@@ -174,6 +175,7 @@ def load_config(test_toml_path: str) -> Config:
     cfg.agent_id = g.get("agent_id", cfg.agent_id)
     cfg.memory_mode = str(g.get("memory_mode", cfg.memory_mode)).lower()
     cfg.output_dir = g.get("output_dir", cfg.output_dir)
+    cfg.run_lock_dir = g.get("run_lock_dir", os.environ.get("LOCOMO_RUN_LOCK_DIR", ""))
 
     # --- gateway (env.toml overridden by test.toml) ---
     gw_env = env.get("gateway", {})

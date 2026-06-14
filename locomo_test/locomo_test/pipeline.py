@@ -36,6 +36,24 @@ class _TeeStream(io.TextIOBase):
 STEP_ORDER = ["health_check", "ingest", "qa", "judge", "stats"]
 
 
+def _lock_path(cfg: Config, output_dir: str) -> Path:
+    if cfg.run_lock_dir:
+        return Path(cfg.run_lock_dir) / f"{cfg.name or 'locomo-test'}.lock"
+    return Path(output_dir) / ".run.lock"
+
+
+def ensure_run_lock(lock_path: Path) -> None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.exists():
+        raise RuntimeError(f"existing run lock: {lock_path}")
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def release_run_lock(lock_path: Path) -> None:
+    if lock_path.exists():
+        lock_path.unlink()
+
+
 def resolve_output_dir(cfg: Config) -> str:
     """Create and return the output directory for this run."""
     run_id = cfg.name or time.strftime("%Y%m%d_%H%M%S")
@@ -89,6 +107,8 @@ def run_pipeline(
     # Resolve paths
     output_dir = resolve_output_dir(cfg)
     cfg.data_file = resolve_data_file(cfg)
+    lock_path = _lock_path(cfg, output_dir)
+    ensure_run_lock(lock_path)
 
     # Tee stderr to log file
     log_path = os.path.join(output_dir, "pipeline.log")
@@ -106,42 +126,45 @@ def run_pipeline(
 
     memory_token_totals: dict | None = None
 
-    for step, enabled in active:
-        if not enabled:
-            continue
+    try:
+        for step, enabled in active:
+            if not enabled:
+                continue
 
-        print(f"\n--- Step: {step} ---", file=sys.stderr)
-        t0 = time.time()
+            print(f"\n--- Step: {step} ---", file=sys.stderr)
+            t0 = time.time()
 
-        if step == "health_check":
-            ok = check_health(cfg)
-            if not ok:
-                print("Health check failed. Are services running?", file=sys.stderr)
-                sys.exit(1)
+            if step == "health_check":
+                ok = check_health(cfg)
+                if not ok:
+                    print("Health check failed. Are services running?", file=sys.stderr)
+                    sys.exit(1)
 
-        elif step == "ingest":
-            _, memory_token_totals = run_ingest(cfg, output_dir)
+            elif step == "ingest":
+                _, memory_token_totals = run_ingest(cfg, output_dir)
 
-        elif step == "qa":
-            run_qa(cfg, output_dir)
-            issues = check_qa_results(output_dir)
-            report_issues("qa", issues)
+            elif step == "qa":
+                run_qa(cfg, output_dir)
+                issues = check_qa_results(output_dir)
+                report_issues("qa", issues)
 
-        elif step == "judge":
-            run_judge(cfg, output_dir)
-            issues = check_judge_results(output_dir)
-            report_issues("judge", issues)
+            elif step == "judge":
+                run_judge(cfg, output_dir)
+                issues = check_judge_results(output_dir)
+                report_issues("judge", issues)
 
-        elif step == "stats":
-            run_stats(cfg, output_dir, memory_token_totals=memory_token_totals)
+            elif step == "stats":
+                run_stats(cfg, output_dir, memory_token_totals=memory_token_totals)
 
-        elapsed = time.time() - t0
-        print(f"  [{step}] done in {elapsed:.1f}s", file=sys.stderr)
+            elapsed = time.time() - t0
+            print(f"  [{step}] done in {elapsed:.1f}s", file=sys.stderr)
 
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"  Pipeline complete. Output: {output_dir}", file=sys.stderr)
-    print(f"  Log: {log_path}", file=sys.stderr)
-    print(f"{'='*60}", file=sys.stderr)
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  Pipeline complete. Output: {output_dir}", file=sys.stderr)
+        print(f"  Log: {log_path}", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
+    finally:
+        release_run_lock(lock_path)
 
     # Restore stderr
     sys.stderr = sys.stderr._original if isinstance(sys.stderr, _TeeStream) else sys.stderr

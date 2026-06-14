@@ -449,6 +449,18 @@ def _ogmem_token_delta(before: dict, after: dict) -> dict:
     }
 
 
+def normalize_ov_task_query_mode(memory_mode: str) -> str:
+    if memory_mode == "openviking":
+        return "direct_ov_stable"
+    return "legacy"
+
+
+def should_attempt_gateway_compact(memory_mode: str) -> bool:
+    if memory_mode != "openviking":
+        return True
+    return os.environ.get("LOCOMO_OPENVIKING_FORCE_COMPACT", "").lower() in {"1", "true", "yes", "on"}
+
+
 def _empty_memory_token_totals(provider: str) -> dict:
     return {
         "provider": provider,
@@ -722,30 +734,27 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 memory_token_usage = None
                 ov_token_usage = None
                 if cfg.memory_mode == "openviking":
-                    compact_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
-                    sid = None
-                    if oc_session_key:
-                        found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
-                        if found:
-                            sid = Path(found[0]).stem
-                    if not sid:
-                        sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
+                    query_mode = normalize_ov_task_query_mode(cfg.memory_mode)
+                    if should_attempt_gateway_compact(cfg.memory_mode):
+                        compact_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
+                        compact_result = None
+                        try:
+                            compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
+                        except Exception as compact_error:
+                            print(f"    [compact] fallback to legacy task polling: {compact_error}", file=sys.stderr)
 
-                    compact_result = None
-                    try:
-                        compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
-                    except Exception as compact_error:
-                        print(f"    [compact] fallback to session_commit polling: {compact_error}", file=sys.stderr)
+                        if cfg.openviking.api_url:
+                            task_id = compact_result.get("taskId") if compact_result else None
+                            if task_id:
+                                ov_token_usage = query_ov_task_token_usage(cfg.openviking.api_url, task_id)
+                            if not ov_token_usage:
+                                ov_token_usage = wait_for_ov_latest_task(cfg.openviking.api_url)
+                    else:
+                        print(f"    [ov-task] skip compact in {query_mode} mode", file=sys.stderr)
 
-                    if cfg.openviking.api_url:
-                        task_id = compact_result.get("taskId") if compact_result else None
-                        if task_id:
-                            ov_token_usage = query_ov_task_token_usage(cfg.openviking.api_url, task_id)
-                        if not ov_token_usage:
-                            ov_token_usage = wait_for_ov_latest_task(cfg.openviking.api_url)
-                        if ov_token_usage:
-                            print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
-                            memory_token_usage = {"provider": "openviking", **ov_token_usage}
+                    if ov_token_usage:
+                        print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
+                        memory_token_usage = {"provider": "openviking", **ov_token_usage}
                 elif cfg.memory_mode == "ogmem":
                     wait_for_ogmem_after_turn_extract(
                         container=cfg.ogmem.docker_container,

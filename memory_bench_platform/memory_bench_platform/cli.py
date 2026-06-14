@@ -4,10 +4,17 @@ import argparse
 import json
 from dataclasses import asdict
 from datetime import datetime
+import os
 from pathlib import Path
 
 from .backends import validate_openviking_source
-from .integration import build_cases_from_source, validate_agent, validate_benchmark
+from .integration import (
+    build_cases_from_source,
+    execute_external_runner,
+    resolve_benchmark_entrypoint,
+    validate_agent,
+    validate_benchmark,
+)
 from .loader import load_all_skills
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
@@ -37,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--memory-backend")
     p_run.add_argument("--hardware-profile")
     p_run.add_argument("--data-path")
+    p_run.add_argument("--entrypoint")
 
     p_validate = sub.add_parser("validate")
     p_validate.add_argument("--benchmark")
@@ -102,11 +110,12 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     storage = RunStorage(Path.cwd() / "runs")
-    cases_payload = build_cases_from_source(args.benchmark, args.data_path)
+    entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
+    source_kind = "external_benchmark_runner" if entrypoint.entrypoint_kind == "external_runner" else "benchmark_case_source"
     run_record = RunRecord(
         run_id=plan.run_id,
-        source_id=plan.benchmark_id,
-        source_kind=cases_payload.get("source_kind", "benchmark_case_source"),
+        source_id=f"{plan.benchmark_id}:{entrypoint.entrypoint_id}" if args.entrypoint else plan.benchmark_id,
+        source_kind=source_kind,
         operator_targets=[args.agent],
         benchmark_version=plan.benchmark_version,
         agent_id=plan.agent_id,
@@ -119,6 +128,53 @@ def main(argv: list[str] | None = None) -> None:
     run_record.status = "running"
     run_record.started_at = datetime.now()
     run_dir = storage.init_run(run_record)
+
+    if entrypoint.entrypoint_kind == "external_runner":
+        output_dir = run_dir / "external_artifacts" / entrypoint.entrypoint_id
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUN_ID": plan.run_id,
+                "OUTPUT_DIR": str(output_dir),
+                "DATA_PATH": args.data_path or "",
+                "BENCHMARK_ID": args.benchmark,
+                "AGENT_ID": args.agent,
+            }
+        )
+        runner_result = execute_external_runner(entrypoint, env=env, cwd=Path.cwd().parent)
+        (run_dir / "logs" / "external_runner.stdout.log").write_text(runner_result["stdout"], encoding="utf-8")
+        (run_dir / "logs" / "external_runner.stderr.log").write_text(runner_result["stderr"], encoding="utf-8")
+        if output_dir.exists():
+            storage.write_json_record(
+                run_dir,
+                "records/external_entrypoint.json",
+                {
+                    "entrypoint_id": entrypoint.entrypoint_id,
+                    "command": entrypoint.command,
+                    "output_dir": str(output_dir),
+                    "status": runner_result["status"],
+                    "exit_code": runner_result["exit_code"],
+                },
+            )
+        final_status = "passed" if runner_result["status"] == "passed" else "failed"
+        run_record.status = final_status
+        run_record.ended_at = datetime.now()
+        storage.write_run_record(run_dir, run_record)
+        summary_record = ReportSummary(
+            run_id=run_record.run_id,
+            status=final_status,
+            case_total=0,
+            case_passed=0,
+            case_failed=0,
+            resource_summary={},
+            category_summary={},
+        )
+        write_summary(run_dir, summary_record.model_dump(mode="json"))
+        write_case_results(run_dir, [])
+        print(str(run_dir))
+        return
+
+    cases_payload = build_cases_from_source(args.benchmark, args.data_path)
     cases = [CaseRecord(run_id=run_record.run_id, **item) for item in cases_payload.get("cases", [])]
     steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
     execution_spec = ExecutionSpec(**cases_payload.get("execution_spec", {}))

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 class RunRecord(BaseModel):
     run_id: str
     source_id: str
-    source_kind: Literal["benchmark_case_source", "native_workflow"]
+    source_kind: Literal["benchmark_case_source", "native_workflow", "external_benchmark_runner"]
     operator_targets: list[str] = Field(default_factory=list)
     benchmark_version: str | None = None
     agent_id: str | None = None
@@ -151,6 +151,14 @@ class ReportSummary(BaseModel):
     case_failed: int
     resource_summary: dict[str, Any] = Field(default_factory=dict)
     category_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class EntryPointRecord(BaseModel):
+    entrypoint_id: str
+    entrypoint_kind: Literal["case_builder", "external_runner"]
+    command: list[str] = Field(default_factory=list)
+    output_dir: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskRecord(BaseModel):
