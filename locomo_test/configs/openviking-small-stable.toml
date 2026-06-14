@@ -1,0 +1,20 @@
+# 稳定跑数配置 — LoCoMo small / OpenClaw + OpenViking
+
+[general]
+name = "openviking-small-stable"
+env_file = "env.toml"
+dataset = "small"
+memory_mode = "openviking"
+parallel = 1
+user = "locomo-small-stable"
+agent_id = "locomo-eval"
+
+[session]
+policy = "isolated"
+
+[steps]
+health_check = true
+ingest = true
+qa = true
+judge = true
+stats = true
