@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class EntryPoints(BaseModel):
+    case_builder: str | None = None
     task_builder: str | None = None
     scorer: str | None = None
     validator: str | None = None

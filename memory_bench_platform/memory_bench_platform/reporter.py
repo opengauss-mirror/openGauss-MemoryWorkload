@@ -9,3 +9,10 @@ def write_summary(run_dir: Path, summary: dict) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(summary, ensure_ascii=False, indent=2)
     (reports_dir / "summary.json").write_text(payload, encoding="utf-8")
+
+
+def write_case_results(run_dir: Path, case_results: list[dict]) -> None:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(case_results, ensure_ascii=False, indent=2)
+    (reports_dir / "case_results.json").write_text(payload, encoding="utf-8")

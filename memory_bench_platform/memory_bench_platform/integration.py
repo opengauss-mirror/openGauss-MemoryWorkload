@@ -50,9 +50,9 @@ def run_json_script(script_path: Path, *, args: list[str] | None = None, stdin_p
 def validate_benchmark(skill_id: str, source_path: str | None = None) -> dict:
     manifest = get_benchmark_manifest(skill_id)
     manifest_path = _manifest_path("benchmarks", skill_id)
-    script = manifest.entry.validator or manifest.entry.task_builder
+    script = manifest.entry.validator or manifest.entry.case_builder or manifest.entry.task_builder
     if not script:
-        raise ValueError(f"benchmark skill {skill_id} has no validator or task_builder")
+        raise ValueError(f"benchmark skill {skill_id} has no validator or case_builder/task_builder")
     args = [source_path] if source_path else []
     return run_json_script(_script_for_manifest(manifest_path, script), args=args)
 
@@ -69,10 +69,15 @@ def validate_agent(skill_id: str) -> dict:
 def build_benchmark_tasks(skill_id: str, source_path: str | None = None) -> dict:
     manifest = get_benchmark_manifest(skill_id)
     manifest_path = _manifest_path("benchmarks", skill_id)
-    if not manifest.entry.task_builder:
-        raise ValueError(f"benchmark skill {skill_id} has no task_builder")
+    builder = manifest.entry.case_builder or manifest.entry.task_builder
+    if not builder:
+        raise ValueError(f"benchmark skill {skill_id} has no case_builder or task_builder")
     args = [source_path] if source_path else []
-    return run_json_script(_script_for_manifest(manifest_path, manifest.entry.task_builder), args=args)
+    return run_json_script(_script_for_manifest(manifest_path, builder), args=args)
+
+
+def build_cases_from_source(skill_id: str, source_path: str | None = None) -> dict:
+    return build_benchmark_tasks(skill_id, source_path)
 
 
 def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:

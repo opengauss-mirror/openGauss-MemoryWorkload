@@ -6,13 +6,18 @@ import sys
 
 def main() -> None:
     request = json.load(sys.stdin)
+    user_message = ""
+    for message in reversed(request.get("messages", [])):
+        if message.get("role") == "user":
+            user_message = str(message.get("content", ""))
+            break
     response = {
         "status": "ok",
         "agent": "generic-cli",
         "request": request,
-        "turns": [],
+        "turns": [{"text": user_message}],
         "artifacts": [],
-        "metrics": [],
+        "metrics": [{"name": "duration_ms", "value": 0}],
     }
     json.dump(response, sys.stdout)
 

@@ -1,7 +1,6 @@
 # Memory Benchmark Platform
 
-Minimal benchmark orchestrator for evaluating memory-oriented agents against
-benchmark skills and agent skills with a unified run protocol.
+Workflow/case oriented benchmark and test platform for memory-oriented systems.
 
 ## MVP Matrix
 
@@ -10,11 +9,17 @@ benchmark skills and agent skills with a unified run protocol.
 
 ## Current Scope
 
-- Unified run protocol
-- Directory skill loading
-- Stub execution contract
-- JSON run archive
+- CaseSource driven execution
+- Workflow/case core
+- Builtin judge
+- JSON archive with `cases/steps/traces/judge_results/metrics`
 - ClusterBench-style resource monitor extraction
+
+## Core Path
+
+```text
+CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidence -> Judge -> Report/Archive
+```
 
 ## Quick Checks
 

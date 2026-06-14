@@ -1,384 +1,338 @@
-# 记忆评测平台架构方案
+# 记忆测试平台 workflow/case 架构计划
 
-> **For agentic workers:** 必选子技能：使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans` 按任务逐步执行本计划。步骤使用复选框语法 `- [ ]` 进行跟踪。
+> 执行路线固定为：`Python 过渡实现 + 面向未来 Go 兼容的模型设计`
 
-**目标：** 在开始实现前，明确记忆评测平台的端到端架构，包括组件职责、交互边界，以及 MVP 的执行模型。
+## 1. 目标
 
-**架构：** 平台围绕一个轻量 orchestrator、一套统一 run protocol、定义“测什么”的 benchmark skill、定义“怎么执行”的 agent skill，以及负责保存运行证据的采集/归档层来组织。`Run Protocol` 除了 `Run / Task / Turn / Artifact / MetricRecord / JudgeResult` 之外，还必须显式承载 `ExecutionSpec`、`RenderedTaskInput` 和 `JudgeInput`。`ClusterBench` 不是平台核心；只有它的主机级资源监控逻辑和运行目录组织模式可以选择性复用。
+把当前“benchmark 驱动的最小执行底座”升级为“以 workflow/case 为中心的完整 benchmark/test 平台”。
 
-**技术栈：** Python 3.11+、YAML manifest、JSON record、目录型 skill、主机级资源监控
-
----
-
-### Task 1: 固定系统上下文与顶层设计约束
-
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
-
-- [ ] **Step 1: 写清架构目标与范围**
+本轮目标不是迁移语言，而是先把以下闭环做成平台主路径：
 
 ```text
-目标:
-- 支持多个 benchmark
-- 支持多个 agent
-- 为未来 memory backend 和 hardware 维度预留扩展点
-- 保持平台核心足够薄
-
-MVP 不做:
-- 跨 benchmark 的统一评分归一化
-- 完整硬件调度器
-- 复用 ClusterBench 的 workload driver 模型
+CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidence -> Judge -> Report/Archive
 ```
 
-- [ ] **Step 2: 固定架构风格**
+## 2. 关键决策
+
+### 决策 1：保持 Python 实现，按未来 Go 兼容设计
+
+推荐结论：
+
+- 当前执行内核、技能目录、测试和外部验证都已经在 Python 上
+- 本轮核心风险在执行模型重构，不在语言
+- 因此先用 Python 跑通 workflow/case 闭环
+- 所有核心对象和接口命名按未来 Go 迁移友好方式收敛
+
+不做：
+
+- 本轮不直接切换 Go 作为主执行器
+- 本轮不因为 Go 方向而推迟平台闭环
+
+### 决策 2：benchmark 降级为 CaseSource，而不是继续作为主执行中心
+
+推荐结论：
+
+- `LoCoMo / LongMemEval` 负责把样本转换为标准 `CaseRecord + StepRecord`
+- `ovtest` 类场景属于原生 `WorkflowCase`
+- 平台主内核只理解 `Case / Step / Trace / Judge`
+
+这意味着：
+
+- benchmark 不再直接驱动 agent
+- agent 不再是一等业务对象，而是一种 operator adapter
+- 最终判定不再是“题目评分器”，而是“case 末端判定器”
+
+### 决策 3：deterministic gate 与 final judge 必须分层
+
+推荐结论：
+
+- step 内 gate 负责程序化检查、early exit、retry
+- case 末端 judge 负责基于自然语言 reference 进行 pass/fail + rationale
+
+禁止：
+
+- 在每个 step 上直接挂 LLM judge 作为常规执行路径
+- 把 deterministic check 混进 final judge 里
+
+### 决策 4：第一阶段先做 builtin judge 闭环，LLM judge 作为扩展点
+
+推荐结论：
+
+- 第一阶段必须先保证平台闭环可运行、可测试、可集成
+- 因此先实现 builtin judge 接口和最小规则集
+- 再为外部/LLM judge 预留 adapter
+
+原因：
+
+- 先把 `JudgeInput -> JudgeResult` 路打通
+- 降低外部模型依赖带来的不稳定性
+- 为后续 OpenViking / ovtest 场景扩展保留接口
+
+## 3. 重构后的平台分层
+
+### 3.1 CaseSource Layer
+
+职责：
+
+- 输入来源转换为标准 `CaseRecord + StepRecord + ExecutionSpec`
+
+来源类型：
+
+- `BenchmarkCaseSource`
+  - `LoCoMo`
+  - `LongMemEval`
+- `NativeWorkflowCaseSource`
+  - `ovtest`
+
+### 3.2 Workflow Core
+
+职责：
+
+- 管理 run / case 生命周期
+- 按 `depends_on` 调度 step
+- 处理 gate / retry / early-exit
+- 生成 trace 与 step result
+
+限制：
+
+- 不关心 step 底层是 agent / bash / http
+- 不直接理解 benchmark 特有语义
+
+### 3.3 Operator Layer
+
+职责：
+
+- 黑盒执行 step
+
+最小 operator 集合：
+
+- `bash operator`
+- `http operator`
+- `agent operator`
+- `wait operator`
+
+### 3.4 Judge Layer
+
+职责：
+
+- 在 case 末端对整条 trace 做最终判定
+
+输入：
+
+- `reference`
+- `step_results`
+- `trace_events`
+- `artifacts`
+- `resource_summary`
+
+输出：
+
+- `JudgeResult`
+
+### 3.5 Monitor Layer
+
+职责：
+
+- run 级资源监控
+- 至少采集 CPU 信息
+- 如可行补充 memory / process snapshot
+
+输出：
+
+- monitor artifacts
+- `MetricRecord`
+
+### 3.6 Archive / Report Layer
+
+职责：
+
+- 写结构化记录
+- 写原始 artifacts
+- 输出 run summary 和 case results
+
+## 4. 主数据模型
+
+平台主模型改为：
+
+- `RunRecord`
+- `CaseRecord`
+- `StepRecord`
+- `StepResultRecord`
+- `TraceEventRecord`
+- `ExecutionSpec`
+- `JudgeInput`
+- `JudgeResult`
+- `ArtifactRecord`
+- `MetricRecord`
+- `ReportSummary`
+
+兼容策略：
+
+- 旧 `TaskRecord / TurnRecord` 降级为兼容层
+- 新执行主链不再以 `Task / Turn` 为中心
+
+## 5. 执行语义
+
+### 5.1 主路径
 
 ```text
-风格:
-- 一个中心 orchestrator
-- 两侧插件：benchmark skills 和 agent skills
-- 一套内部 run protocol
-- 一条统一的采集/归档链路
+1. CLI 选择 CaseSource 和 operator targets
+2. CaseSource 产出 Case / Step / ExecutionSpec
+3. Workflow Core 调度 step
+4. Operator 执行 step
+5. Gate 做 deterministic check
+6. 若失败且允许 retry，则重试
+7. 所有事件写入 TraceEvent
+8. case 结束后组装 JudgeInput
+9. Judge 产出 JudgeResult
+10. Archive/Report 写出结构化 records 与 summary
 ```
 
-- [ ] **Step 3: 写清硬边界规则**
+### 5.2 Gate 规则
 
-```text
-硬规则:
-- Benchmark skill 定义“测什么”
-- Agent skill 定义“怎么执行”
-- Platform core 不能包含 benchmark 特判分支
-- Platform core 不能包含 agent 私有 runtime 逻辑
-- ClusterBench 的复用仅限资源监控和归档布局思路
-```
+- `hard`
+  - 失败即终止 case 或终止后续依赖分支
+- `soft`
+  - 失败仅记录，不中断执行
+- `none`
+  - 不执行 gate
 
-### Task 2: 定义组件模型
+### 5.3 Retry 规则
 
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
+- retry 属于 step 级能力
+- retry 次数显式记录到 trace 和 metrics
+- retry 只在 operator 失败或 gate 失败且策略允许时触发
 
-- [ ] **Step 1: 定义核心组件**
+## 6. LoCoMo / LongMemEval / ovtest 映射
 
-```text
-核心组件:
-1. Config / CLI
-2. Orchestrator
-3. Run Protocol
-4. Benchmark Skills
-5. Agent Skills
-6. Agent Runtime
-7. Collector / Judge / Resource Monitor
-8. Storage / Run Archive
-```
+### 6.1 LoCoMo
 
-- [ ] **Step 2: 写组件职责表**
+- 每个 QA 转成一个 `Case`
+- 默认包含一个主 step：`agent_query`
+- `reference` 必须包含：
+  - question
+  - gold answer
+  - category
+  - sample_id / split / metadata
 
-```text
-Config / CLI
-- 接收 run 配置
-- 选择 benchmark、agent、split、sample 范围和 runtime 参数
+### 6.2 LongMemEval
 
-Orchestrator
-- 加载 skills
-- 校验 manifest 和 schema
-- 生成 run plan
-- 协调执行和生命周期
-- 触发采集和归档
+- 作为第二个 `BenchmarkCaseSource`
+- 输出结构与 LoCoMo 对齐到统一 Case 模型
 
-Run Protocol
-- 定义内部对象：Run、Task、Turn、ExecutionSpec、RenderedTaskInput、JudgeInput、Artifact、MetricRecord、JudgeResult
-- 隔离 benchmark 侧和 agent 侧的差异
+### 6.3 ovtest
 
-Benchmark Skills
-- 准备数据集
-- 将原始 sample 展开为 Task/Turn
-- 声明执行约束并产出 ExecutionSpec
-- 产出 RenderedTaskInput 语义内容
-- 定义评分语义、JudgeInput 需求和 scorer 入口
+- 原生输出多 step DAG
+- `reference` 为自然语言 expected trace
+- 最终 judge 按整条 trace 判定，而不是单答案比对
 
-Agent Skills
-- 启停具体 agent
-- 将 Task 执行到 agent runtime
-- 管理 session 和 runtime 生命周期
-- 把 RenderedTaskInput 落到具体 transport
-- 把原始输出适配成 protocol 输出
+## 7. 资源监控接入
 
-Agent Runtime
-- 被测的具体 service/process/CLI 目标
+第一阶段最小要求：
 
-Collector / Judge / Resource Monitor
-- 收集 stdout/stderr/logs/artifacts
-- 收集 tokens/time/exit code
-- 收集主机资源指标
-- 执行被 orchestrator 调用的 judge/scorer 运行时
+- run 开始时启动 monitor
+- 周期采集 CPU 信息
+- run 结束时停止 monitor
+- 写出：
+  - `artifacts/monitor/cpu_status.csv`
+  - `records/metrics.json` 中的 CPU 摘要
+  - `reports/summary.json` 中的资源摘要
 
-Storage / Run Archive
-- 持久化结构化 records
-- 持久化原始 artifacts
-- 持久化 reports 和配置快照
-```
-
-- [ ] **Step 3: 固定组件边界**
-
-```text
-边界规则:
-- Benchmark skills 不负责启动或管理 agents
-- Agent skills 不负责解析原始 benchmark 数据集
-- Orchestrator 驱动两侧，但不拥有任一侧的私有逻辑
-- Run Protocol 是唯一共享的内部契约
-- Judge/scorer 的调用权属于 orchestrator，不属于 collector 自主决策
-```
-
-### Task 3: 定义交互模型
-
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
-
-- [ ] **Step 1: 写控制流顺序**
-
-```text
-1. CLI 接收 run 请求
-2. Orchestrator 加载选定的 benchmark skill 和 agent skill
-3. Benchmark skill 校验并准备数据集
-4. Benchmark skill 将数据集展开为 Task/Turn records，并产出 ExecutionSpec 与 RenderedTaskInput
-5. Orchestrator 创建 Run 和执行计划
-6. Agent skill 通过具体 runtime 执行 Tasks
-7. Agent skill 将 runtime 原始输出适配为 protocol 输出
-8. Collector 收集输出和指标
-9. Orchestrator 组装 JudgeInput
-10. Orchestrator 调用 benchmark skill 提供的 scorer/judge 入口
-11. Judge/scorer 产出 JudgeResult
-12. Storage 将所有输出持久化到 run 目录
-```
-
-- [ ] **Step 2: 写数据流关系**
-
-```text
-Benchmark Skill -> Task/Turn/ExecutionSpec/RenderedTaskInput -> Orchestrator
-Orchestrator -> Agent Skill -> Agent Runtime
-Agent Runtime -> raw outputs/artifacts/metrics -> Agent Skill
-Agent Skill -> protocol outputs/artifacts/metrics -> Collector
-Benchmark Skill -> scorer entry + JudgeInput rules -> Orchestrator
-Orchestrator -> JudgeInput -> Judge/Scorer
-Collector + Judge + Resource Monitor -> Storage
-Storage -> run records + reports
-```
-
-- [ ] **Step 3: 固定编排语义**
-
-```text
-语义:
-- Orchestrator 负责 run 生命周期
-- Benchmark skill 负责测试语义
-- Agent skill 负责执行语义
-- Collector 负责证据采集
-- Storage 负责持久化布局
-```
-
-### Task 4: 定义 run protocol 作为共享契约
-
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
-
-- [ ] **Step 1: 定义最小共享对象**
-
-```text
-Run
-- 一次 benchmark 对一个 agent、在一组配置下的完整执行
-
-Task
-- 从一个 benchmark sample 派生出的一个可执行单元
-
-Turn
-- Task 内的一次对话或交互步骤
-
-ExecutionSpec
-- Task 或 Run 级执行约束对象，定义单轮/多轮、并发、隔离、stateful 等语义
-
-RenderedTaskInput
-- 已经带有 benchmark 语义的统一输入对象，等待 agent skill 传输落地
-
-JudgeInput
-- 给 scorer/judge 的统一输入对象，包含 task、agent output、gold 和必要元数据
-
-Artifact
-- 一个被持久化的原始输出文件或 trace
-
-MetricRecord
-- 一个挂在 run/task/turn 范围上的数值或类别指标
-
-JudgeResult
-- 一个针对 Task 或 run 的评分/通过失败解释
-```
-
-- [ ] **Step 2: 写清 protocol 存在的原因**
-
-```text
-Protocol 目的:
-- 防止 benchmark 特有逻辑泄漏进 orchestrator
-- 防止 agent 特有 runtime 细节泄漏进 benchmark 处理过程
-- 让执行约束、输入模板和评分输入成为显式契约
-- 让归档和报告所依赖的输出保持稳定
-```
-
-### Task 5: 定义 skill 模型
-
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
-
-- [ ] **Step 1: 定义 benchmark skill 契约**
-
-```text
-Benchmark skill 必须提供:
-- 身份与版本
-- 数据集准备
-- 任务展开
-- 执行约束
-- RenderedTaskInput 语义内容
-- 评分语义
-- JudgeInput 需要的字段约定
-- scorer/judge 入口
-- benchmark 特有 artifact 声明
-```
-
-- [ ] **Step 2: 定义 agent skill 契约**
-
-```text
-Agent skill 必须提供:
-- 身份与版本
-- startup/healthcheck/teardown
-- task 执行方式
-- session 处理模型
-- RenderedTaskInput 到 transport 的映射
-- 输出采集适配
-- runtime artifact 声明
-```
-
-- [ ] **Step 3: 定义 skill 目录布局**
-
-```text
-skills/
-  benchmarks/
-    locomo/
-      SKILL.md
-      manifest.yaml
-      scripts/
-      schemas/
-  agents/
-    openclaw/
-      SKILL.md
-      manifest.yaml
-      scripts/
-      schemas/
-```
-
-### Task 6: 定义 MVP 架构切片
-
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
-
-- [ ] **Step 1: 固定 MVP 矩阵**
-
-```text
-Benchmarks:
-- LoCoMo
-- LongMemEval
-
-Agents:
-- OpenClaw
-- Generic CLI Agent
-```
-
-- [ ] **Step 2: 定义 MVP 归档布局**
+## 8. 新归档结构
 
 ```text
 runs/<run_id>/
   run.json
   records/
+    cases.json
+    steps.json
+    step_results.json
+    traces.json
+    judge_results.json
+    metrics.json
   artifacts/
+    step-stdout/
+    step-stderr/
+    judge/
+    monitor/
   logs/
   reports/
+    summary.json
+    case_results.json
   config_snapshot/
 ```
 
-- [ ] **Step 3: 定义 MVP 对 ClusterBench 的复用边界**
+## 9. 第一阶段实现顺序
 
-```text
-允许复用:
-- 主机级资源监控逻辑
-- 归档目录组织模式
+1. 重写架构文档到 workflow/case 模型
+2. 升级协议模型
+3. 重构 LoCoMo skill 为 `CaseSource`
+4. 新增 workflow executor
+5. 接 builtin judge 闭环
+6. 接 CPU monitor 到主链
+7. 重构 archive / report
+8. 本地测试
+9. 外部最小集成验证
 
-禁止复用:
-- workload driver 抽象
-- L1/L2 mode 模型
-- test_result report schema
-```
+## 10. 第一阶段代码范围
 
-### Task 7: 定义风险与非目标
+必须改：
 
-**Files:**
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
+- `memory_bench_platform/memory_bench_platform/protocol.py`
+- `memory_bench_platform/memory_bench_platform/cli.py`
+- `memory_bench_platform/memory_bench_platform/storage.py`
+- `memory_bench_platform/memory_bench_platform/reporter.py`
+- `memory_bench_platform/memory_bench_platform/integration.py`
+- `memory_bench_platform/memory_bench_platform/executor.py`
+- `memory_bench_platform/skills/benchmarks/locomo/scripts/build_tasks.py`
 
-- [ ] **Step 1: 记录主要风险**
+建议新增：
 
-```text
-风险:
-- benchmark skills 过薄，导致语义泄漏进 orchestrator
-- agent skills 过薄，导致 runtime 逻辑泄漏进 orchestrator
-- run protocol 过于抽象，丢失必要执行细节
-- ClusterBench 的复用越过监控/归档边界，污染核心模型
-- judge/scorer 调用边界不清，导致 benchmark 评分规则重新散落到 core
-```
+- `memory_bench_platform/memory_bench_platform/workflow.py`
+- `memory_bench_platform/memory_bench_platform/judges.py`
 
-- [ ] **Step 2: 记录显式非目标**
+## 11. P1/P2 Review
 
-```text
-非目标:
-- 在 MVP 内构建通用集群调度器
-- 在 MVP 内统一所有 benchmark 的评分方法
-- 强制所有 agent 在接入前都暴露原生 SDK/API
-```
+### P1
 
-### Task 8: 将架构转成实现检查点
+如果第一阶段同时追求：
 
-**Files:**
-- Modify: `docs/superpowers/plans/2026-06-08-memory-benchmark-platform-mvp.md`
-- Create: `docs/superpowers/plans/2026-06-09-memory-benchmark-platform-architecture-plan.md`
+- 完整并行 DAG
+- 外部 LLM judge
+- ovtest 原生 case
+- LoCoMo/LongMemEval 全量闭环
 
-- [ ] **Step 1: 定义实现顺序**
+风险过高。
 
-```text
-实现顺序:
-1. protocol + storage
-2. manifest + loader
-3. benchmark skills
-4. agent skills
-5. orchestrator/executor
-6. collector/judge/monitor
-7. archive/report
-```
+修正：
 
-- [ ] **Step 2: 将本架构方案绑定到现有 MVP 实现 plan**
+- 第一阶段只要求跑通 `LoCoMo -> CaseSource -> Workflow -> Builtin Judge -> Report`
+- operator、trace、gate、retry、CPU monitor 必须进入主链
 
-```text
-映射关系:
-- 本文档定义架构边界
-- `2026-06-08` 的 MVP plan 定义第一批实现任务
-- 后续任务 plan 不能违反本文声明的组件边界
-```
+### P2
 
-### 架构 Review 检查表
+如果新平台继续把 `tasks.json` 当主结构，只是额外增加 case 文件，会长期形成双主模型。
 
-- [ ] 检查每个组件是否只有一个清晰职责。
-- [ ] 检查每个跨组件交互是否都经过显式契约。
-- [ ] 检查 benchmark 语义是否由 benchmark skills 持有，而不是 orchestrator。
-- [ ] 检查 runtime 机制是否由 agent skills 持有，而不是 orchestrator。
-- [ ] 检查 `ExecutionSpec`、`RenderedTaskInput`、`JudgeInput` 是否为显式对象，而不是隐式临时字段。
-- [ ] 检查 ClusterBench 的复用是否仅限监控/归档相关能力。
+修正：
 
-### Review 结论
+- 第一阶段即把 archive 主结构切换到 `cases / steps / step_results / traces / judge_results / metrics`
+- 旧 task 输出只保留兼容或直接废弃
 
-当前 review 状态:
-- 本轮未发现阻塞性架构冲突。
-- benchmark 输入模板语义与 agent 侧输入传输方式的边界，已通过 `RenderedTaskInput` 明确为中间契约。
-- judge orchestration 已收敛为 orchestrator 负责组装 `JudgeInput` 并调用 benchmark skill scorer。
-- 剩余风险之一是混合评分 benchmark 下 scorer 路由字段的设计。
+## 12. 完成标准
+
+本轮完成不是“文档改完”，而是以下四类证据共同成立：
+
+1. 文档：
+   - plan
+   - 架构说明
+   - 决策记录
+2. 代码：
+   - workflow/case 主链实现
+   - builtin judge
+   - CPU monitor 主链接入
+3. 测试：
+   - 本地测试覆盖 case/workflow/gate/retry/judge/archive
+4. 外部验证：
+   - LoCoMo -> CaseSource -> 执行 -> judge -> report
+   - OpenClaw -> agent operator
+   - OpenViking -> workflow/native case 或 memory backend 验证

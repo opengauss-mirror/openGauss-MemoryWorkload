@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .protocol import RunRecord
@@ -21,3 +22,8 @@ class RunStorage:
 
     def write_run_record(self, run_dir: Path, run: RunRecord) -> None:
         (run_dir / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
+
+    def write_json_record(self, run_dir: Path, relative_path: str, payload: object) -> None:
+        target = run_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

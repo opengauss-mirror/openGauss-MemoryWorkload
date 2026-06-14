@@ -7,13 +7,15 @@ from datetime import datetime
 from pathlib import Path
 
 from .backends import validate_openviking_source
-from .integration import build_benchmark_tasks, run_agent_task, validate_agent, validate_benchmark
+from .integration import build_cases_from_source, validate_agent, validate_benchmark
 from .loader import load_all_skills
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
-from .protocol import RenderedTaskInput
-from .reporter import write_summary
+from .protocol import CaseRecord, ExecutionSpec, ReportSummary, RunRecord, StepRecord
+from .reporter import write_case_results, write_summary
+from .resource_monitor import ResourceMonitor
 from .storage import RunStorage
+from .workflow import execute_cases
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,44 +102,98 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     storage = RunStorage(Path.cwd() / "runs")
-    run_record = plan.to_run_record()
+    cases_payload = build_cases_from_source(args.benchmark, args.data_path)
+    run_record = RunRecord(
+        run_id=plan.run_id,
+        source_id=plan.benchmark_id,
+        source_kind=cases_payload.get("source_kind", "benchmark_case_source"),
+        operator_targets=[args.agent],
+        benchmark_version=plan.benchmark_version,
+        agent_id=plan.agent_id,
+        agent_version=plan.agent_version,
+        memory_backend=plan.memory_backend,
+        hardware_profile=plan.hardware_profile,
+        config={"data_path": args.data_path} if args.data_path else {},
+        status="pending",
+    )
     run_record.status = "running"
     run_record.started_at = datetime.now()
     run_dir = storage.init_run(run_record)
-    tasks_payload = build_benchmark_tasks(args.benchmark, args.data_path)
-    tasks = tasks_payload.get("tasks", [])
-    agent_output = None
-    if tasks:
-        first_task = tasks[0]
-        rendered = RenderedTaskInput(
-            task_id=first_task["task_id"],
-            messages=[{"role": "user", "content": first_task.get("question", "")}],
-            metadata={"sample_id": first_task.get("sample_id", "")},
-        )
-        agent_output = run_agent_task(args.agent, rendered)
-    final_status = "partial" if agent_output is not None else "stubbed"
+    cases = [CaseRecord(run_id=run_record.run_id, **item) for item in cases_payload.get("cases", [])]
+    steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
+    execution_spec = ExecutionSpec(**cases_payload.get("execution_spec", {}))
+
+    monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
+    monitor.setup_writers()
+    cpu_snapshot = monitor.capture_once()
+
+    workflow_output = execute_cases(
+        run_id=run_record.run_id,
+        agent_id=args.agent,
+        cases=cases,
+        steps=steps,
+        execution_spec=execution_spec,
+        run_dir=run_dir,
+    )
+
+    judge_results = workflow_output["judge_results"]
+    passed_cases = sum(1 for item in judge_results if item.passed)
+    failed_cases = len(judge_results) - passed_cases
+    final_status = "passed" if judge_results and failed_cases == 0 else "partial"
     run_record.status = final_status
     run_record.ended_at = datetime.now()
     storage.write_run_record(run_dir, run_record)
-    summary = {
-        "run_id": plan.run_id,
-        "benchmark_id": plan.benchmark_id,
-        "agent_id": plan.agent_id,
-        "status": final_status,
-        "task_count": len(tasks),
-        "first_task_id": tasks[0]["task_id"] if tasks else None,
-        "agent_output_status": None if agent_output is None else agent_output.get("status"),
-    }
-    (run_dir / "records" / "tasks.json").write_text(
-        json.dumps(tasks_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+
+    storage.write_json_record(run_dir, "records/cases.json", [item.model_dump(mode="json") for item in cases])
+    storage.write_json_record(run_dir, "records/steps.json", [item.model_dump(mode="json") for item in steps])
+    storage.write_json_record(
+        run_dir,
+        "records/step_results.json",
+        [item.model_dump(mode="json") for item in workflow_output["step_results"]],
     )
-    if agent_output is not None:
-        (run_dir / "artifacts" / "agent-output.json").write_text(
-            json.dumps(agent_output, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    write_summary(run_dir, summary)
+    storage.write_json_record(
+        run_dir,
+        "records/traces.json",
+        [item.model_dump(mode="json") for item in workflow_output["traces"]],
+    )
+    storage.write_json_record(
+        run_dir,
+        "records/judge_results.json",
+        [item.model_dump(mode="json") for item in judge_results],
+    )
+    storage.write_json_record(
+        run_dir,
+        "records/metrics.json",
+        [item.model_dump(mode="json") for item in workflow_output["metrics"]]
+        + [
+            {
+                "metric_id": f"{run_record.run_id}-cpu-idle",
+                "run_id": run_record.run_id,
+                "case_id": None,
+                "step_id": None,
+                "scope": "run",
+                "name": "cpu_idle_percent",
+                "value": cpu_snapshot["summary_util_idle"],
+                "unit": "percent",
+                "dimension": {},
+            }
+        ],
+    )
+
+    summary_record = ReportSummary(
+        run_id=run_record.run_id,
+        status=final_status,
+        case_total=len(cases),
+        case_passed=passed_cases,
+        case_failed=failed_cases,
+        resource_summary={"cpu": cpu_snapshot},
+        category_summary={},
+    )
+    write_summary(run_dir, summary_record.model_dump(mode="json"))
+    write_case_results(
+        run_dir,
+        [item.model_dump(mode="json") for item in judge_results],
+    )
     print(str(run_dir))
 
 

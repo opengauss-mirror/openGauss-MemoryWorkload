@@ -342,12 +342,19 @@ def _parse_ov_task_result(data: dict) -> dict | None:
     }
 
 
+def _ov_headers() -> dict | None:
+    api_key = os.environ.get("OPENVIKING_API_KEY") or os.environ.get("OPENVIKING_ROOT_API_KEY")
+    if api_key:
+        return {"X-API-Key": api_key}
+    return None
+
+
 def query_ov_task_token_usage(ov_api_url: str, task_id: str, max_wait: int = 60) -> dict | None:
     deadline = time.time() + max_wait
     interval = 2
     try:
         while True:
-            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", timeout=30)
+            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", headers=_ov_headers(), timeout=30)
             resp.raise_for_status()
             data = resp.json()
             status = data.get("result", {}).get("status", "") if isinstance(data.get("result"), dict) else ""
@@ -367,7 +374,7 @@ def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None) -> dic
         params = {"task_type": "session_commit", "status": "completed", "limit": 1}
         if resource_id:
             params["resource_id"] = resource_id
-        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, timeout=30)
+        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, headers=_ov_headers(), timeout=30)
         resp.raise_for_status()
         data = resp.json()
         tasks = data.get("result", [])
@@ -380,6 +387,23 @@ def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None) -> dic
     except Exception as e:
         print(f"    [ov-task] Error querying latest task: {e}", file=sys.stderr)
     return None
+
+
+def wait_for_ov_latest_task(
+    ov_api_url: str,
+    resource_id: str | None = None,
+    max_wait: int = 60,
+) -> dict | None:
+    deadline = time.time() + max_wait
+    interval = 2
+    while True:
+        result = query_ov_latest_task(ov_api_url, resource_id=resource_id)
+        if result:
+            return result
+        if time.time() >= deadline:
+            return None
+        time.sleep(interval)
+        interval = min(interval * 2, 10)
 
 
 # ---------------------------------------------------------------------------
@@ -509,22 +533,40 @@ def trigger_openclaw_compact(
         if challenge.get("event") != "connect.challenge":
             raise RuntimeError(f"[compact] Expected connect.challenge, got: {challenge}")
 
-        connect_id = str(uuid.uuid4())
-        ws.send(json.dumps({
-            "type": "req", "id": connect_id, "method": "connect",
-            "params": {
-                "minProtocol": 4, "maxProtocol": 4,
-                "client": {"id": "openclaw-control-ui", "version": "1.0.0", "platform": sys.platform, "mode": "webchat"},
-                "scopes": ["operator.admin", "operator.read", "operator.write"],
-                "auth": {"token": token},
-            },
-        }))
-
+        protocol = 4
+        attempted_protocols: set[int] = set()
         while True:
-            msg = json.loads(ws.recv())
-            if msg.get("type") == "res" and msg.get("id") == connect_id:
-                if not msg.get("ok"):
-                    raise RuntimeError(f"[compact] Handshake rejected: {msg.get('error', msg)}")
+            attempted_protocols.add(protocol)
+            connect_id = str(uuid.uuid4())
+            ws.send(json.dumps({
+                "type": "req", "id": connect_id, "method": "connect",
+                "params": {
+                    "minProtocol": protocol, "maxProtocol": protocol,
+                    "client": {"id": "openclaw-control-ui", "version": "1.0.0", "platform": sys.platform, "mode": "webchat"},
+                    "scopes": ["operator.admin", "operator.read", "operator.write"],
+                    "auth": {"token": token},
+                },
+            }))
+
+            while True:
+                msg = json.loads(ws.recv())
+                if msg.get("type") == "res" and msg.get("id") == connect_id:
+                    if msg.get("ok"):
+                        break
+                    error = msg.get("error", msg)
+                    expected_protocol = error.get("details", {}).get("expectedProtocol")
+                    if isinstance(expected_protocol, int) and expected_protocol not in attempted_protocols:
+                        print(
+                            f"    [compact] retry with gateway protocol {expected_protocol}",
+                            file=sys.stderr,
+                        )
+                        protocol = expected_protocol
+                        break
+                    raise RuntimeError(f"[compact] Handshake rejected: {error}")
+            else:
+                continue
+
+            if msg.get("ok"):
                 break
 
         compact_id = str(uuid.uuid4())
@@ -681,14 +723,26 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 ov_token_usage = None
                 if cfg.memory_mode == "openviking":
                     compact_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
-                    compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
-                    if compact_result and compact_result.get("compacted") and cfg.openviking.api_url:
-                        task_id = compact_result.get("taskId")
+                    sid = None
+                    if oc_session_key:
+                        found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
+                        if found:
+                            sid = Path(found[0]).stem
+                    if not sid:
+                        sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
+
+                    compact_result = None
+                    try:
+                        compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
+                    except Exception as compact_error:
+                        print(f"    [compact] fallback to session_commit polling: {compact_error}", file=sys.stderr)
+
+                    if cfg.openviking.api_url:
+                        task_id = compact_result.get("taskId") if compact_result else None
                         if task_id:
                             ov_token_usage = query_ov_task_token_usage(cfg.openviking.api_url, task_id)
                         if not ov_token_usage:
-                            sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
-                            ov_token_usage = query_ov_latest_task(cfg.openviking.api_url, resource_id=sid)
+                            ov_token_usage = wait_for_ov_latest_task(cfg.openviking.api_url)
                         if ov_token_usage:
                             print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
                             memory_token_usage = {"provider": "openviking", **ov_token_usage}

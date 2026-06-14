@@ -6,7 +6,13 @@ from memory_bench_platform.storage import RunStorage
 
 def test_run_storage_creates_expected_layout(tmp_path: Path):
     storage = RunStorage(tmp_path)
-    run = RunRecord(run_id="run-001", benchmark_id="locomo", agent_id="openclaw", status="pending")
+    run = RunRecord(
+        run_id="run-001",
+        source_id="locomo",
+        source_kind="benchmark_case_source",
+        operator_targets=["openclaw"],
+        status="pending",
+    )
     run_dir = storage.init_run(run)
     assert (run_dir / "run.json").exists()
     assert (run_dir / "artifacts").is_dir()

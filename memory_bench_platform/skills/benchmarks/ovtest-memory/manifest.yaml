@@ -1,14 +1,13 @@
 kind: benchmark
-id: longmemeval
+id: ovtest-memory
 version: 0.1.0
 entry:
   case_builder: scripts/build_tasks.py
-  validator: scripts/validate.py
 dataset:
-  default_split: dev
+  default_split: smoke
 execution:
   mode: multi_turn
-  requires_stateful_agent: true
+  requires_stateful_agent: false
   task_isolation: per_task
 judging:
-  mode: external
+  mode: builtin

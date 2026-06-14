@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -32,3 +33,41 @@ class ResourceMonitor:
         ]
         for writer in writers:
             writer.create()
+
+    def _read_cpu_percentages(self) -> tuple[float, float, float]:
+        cpu_line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+        parts = cpu_line.split()[1:]
+        values = [float(item) for item in parts[:7]]
+        total = sum(values) or 1.0
+        user = values[0] / total * 100
+        system = values[2] / total * 100
+        idle = values[3] / total * 100
+        return round(user, 2), round(system, 2), round(idle, 2)
+
+    def _read_memory_usage_mb(self) -> tuple[float, float]:
+        meminfo = {}
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, value = line.split(":", 1)
+            meminfo[key] = float(value.strip().split()[0])
+        total_mb = meminfo.get("MemTotal", 0.0) / 1024.0
+        available_mb = meminfo.get("MemAvailable", 0.0) / 1024.0
+        used_mb = max(0.0, total_mb - available_mb)
+        return round(available_mb, 2), round(used_mb, 2)
+
+    def capture_once(self) -> dict[str, float | str]:
+        timestamp = datetime.now().isoformat()
+        user, system, idle = self._read_cpu_percentages()
+        mem_free_mb, mem_used_mb = self._read_memory_usage_mb()
+        cpu_row = [timestamp, user, system, idle]
+        with (self.output_dir / "cpu_status.csv").open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow(cpu_row)
+        with (self.output_dir / "mem_status.csv").open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow([timestamp, mem_free_mb, mem_used_mb])
+        return {
+            "timestamp": timestamp,
+            "summary_util_user": user,
+            "summary_util_sys": system,
+            "summary_util_idle": idle,
+            "mem_free_mb": mem_free_mb,
+            "mem_used_mb": mem_used_mb,
+        }
