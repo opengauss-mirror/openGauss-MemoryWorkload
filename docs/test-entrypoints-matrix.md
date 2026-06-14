@@ -9,7 +9,7 @@
 | 入口 | 当前用途 | 关键依赖 | 当前状态 | 推荐级别 | 已知问题 |
 | --- | --- | --- | --- | --- | --- |
 | `locomo_test` | LoCoMo `small` / `locomo10` 主跑数入口 | OpenClaw gateway、OpenViking、judge LLM、远端容器 `jcp-dev` | 可跑并已产出可信结果 | 高 | 旧 compact / task 兼容层仍需清理；部分 token 统计链路过时 |
-| `memory_bench_platform` | 统一 workflow/case 平台、skill 验证、归档与报告 | benchmark skill、agent skill、native workflow、OpenClaw/OpenViking | 部分可跑 | 中 | 还未统一 external runner；OpenViking 真实 benchmark 入口未封装稳定 |
+| `memory_bench_platform` | 统一 workflow/case 平台、skill 验证、归档与报告 | benchmark skill、agent skill、native workflow、OpenClaw/OpenViking | 部分可跑 | 中 | external runner 骨架和结果导入器已接入；官方 `official_small` 仍在做端到端稳定性验证 |
 | `benchmark/locomo/openclaw/phase_a_off.py` 及 `run_clean_small_in_container.sh` | 官方 LoCoMo direct-ov 基线入口 | OpenViking benchmark 目录、OpenClaw 插件配置、远端容器 `jcp-dev` | 可跑但易串口径 | 中 | 并发 run 会污染插件配置、账号前缀与评测结果 |
 
 ## 3. 当前推荐
@@ -48,7 +48,8 @@
 
 - `memory_bench_platform`
   - 已完成 benchmark skill / agent skill / native workflow / archive / report 最小闭环。
-  - 仍需补 external runner 统一接入与真实 benchmark 结果导入。
+  - 已完成 external runner 骨架与结果导入。
+  - 仍需完成官方 `official_small` 的最终稳定性验证。
 
 ### 可跑但还不能裸用
 

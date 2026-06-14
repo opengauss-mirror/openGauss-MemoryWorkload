@@ -30,6 +30,30 @@ python3 -m memory_bench_platform.cli validate --agent openclaw
 python3 -m memory_bench_platform.cli run --benchmark locomo --agent generic-cli
 ```
 
+## External Runner
+
+The platform can dispatch an external benchmark runner declared by a benchmark
+manifest and then import its result files back into the platform run archive.
+
+Example:
+
+```bash
+python3 -m memory_bench_platform.cli run \
+  --benchmark locomo \
+  --agent openclaw \
+  --entrypoint official_small
+```
+
+Expected run artifacts:
+
+- `run.json` with `source_kind = "external_benchmark_runner"`
+- `records/external_entrypoint.json`
+- `logs/external_runner.stdout.log`
+- `logs/external_runner.stderr.log`
+- `reports/summary.json`
+- `reports/case_results.json`
+- `reports/external_result_summary.json`
+
 ## External Integration Examples
 
 ```bash

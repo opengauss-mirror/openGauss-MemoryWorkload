@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from .backends import validate_openviking_source
+from .external_report_import import import_external_result
 from .integration import (
     build_cases_from_source,
     execute_external_runner,
@@ -19,7 +20,7 @@ from .loader import load_all_skills
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
 from .protocol import CaseRecord, ExecutionSpec, ReportSummary, RunRecord, StepRecord
-from .reporter import write_case_results, write_summary
+from .reporter import write_case_results, write_external_result_summary, write_summary
 from .resource_monitor import ResourceMonitor
 from .storage import RunStorage
 from .workflow import execute_cases
@@ -145,6 +146,7 @@ def main(argv: list[str] | None = None) -> None:
         (run_dir / "logs" / "external_runner.stdout.log").write_text(runner_result["stdout"], encoding="utf-8")
         (run_dir / "logs" / "external_runner.stderr.log").write_text(runner_result["stderr"], encoding="utf-8")
         if output_dir.exists():
+            imported = import_external_result(output_dir)
             storage.write_json_record(
                 run_dir,
                 "records/external_entrypoint.json",
@@ -156,21 +158,37 @@ def main(argv: list[str] | None = None) -> None:
                     "exit_code": runner_result["exit_code"],
                 },
             )
-        final_status = "passed" if runner_result["status"] == "passed" else "failed"
+            write_external_result_summary(run_dir, imported)
+            case_results = imported["case_results"]
+            summary_record = ReportSummary(
+                run_id=run_record.run_id,
+                status="passed" if runner_result["status"] == "passed" else "failed",
+                case_total=imported["summary"]["total_questions"],
+                case_passed=imported["summary"]["total_correct"],
+                case_failed=imported["summary"]["total_graded"] - imported["summary"]["total_correct"],
+                resource_summary={
+                    "token_totals": imported["summary"].get("token_totals", {}),
+                    "memory_token_totals": imported["summary"].get("memory_token_totals", {}),
+                },
+                category_summary=imported["summary"].get("accuracy_by_category", {}),
+            )
+        else:
+            case_results = []
+            summary_record = ReportSummary(
+                run_id=run_record.run_id,
+                status="passed" if runner_result["status"] == "passed" else "failed",
+                case_total=0,
+                case_passed=0,
+                case_failed=0,
+                resource_summary={},
+                category_summary={},
+            )
+        final_status = summary_record.status
         run_record.status = final_status
         run_record.ended_at = datetime.now()
         storage.write_run_record(run_dir, run_record)
-        summary_record = ReportSummary(
-            run_id=run_record.run_id,
-            status=final_status,
-            case_total=0,
-            case_passed=0,
-            case_failed=0,
-            resource_summary={},
-            category_summary={},
-        )
         write_summary(run_dir, summary_record.model_dump(mode="json"))
-        write_case_results(run_dir, [])
+        write_case_results(run_dir, case_results)
         print(str(run_dir))
         return
 
