@@ -374,6 +374,18 @@ python3 -m memory_bench_platform.cli run \
 
 ## 7. 当前判断
 
+### 当前入口推荐
+
+- `locomo_test`
+  - 当前可信主跑数入口。
+  - 已在远端 `OpenClaw + OpenViking` 环境跑出完整 `small` 结果。
+- `memory_bench_platform`
+  - 当前可信的平台闭环与归档入口。
+  - 更适合做 workflow/case、native workflow、skill 验证与统一归档。
+- `benchmark/locomo/openclaw/phase_a_off.py` / `run_clean_small_in_container.sh`
+  - 当前可执行，但仍属于底层基线脚本。
+  - 必须加独占运行包装后再复用，不能直接裸跑。
+
 ### 已验证通过
 
 - workflow/case 主模型文档与计划
@@ -395,16 +407,21 @@ python3 -m memory_bench_platform.cli run \
 - `LongMemEval` 虽已支持官方格式，但尚未接入真实官方数据文件
 - builtin judge 仍是最小规则，不是最终 LLM judge
 - `ovtest-admin-memory` 当前语义结果仍失败，尚未拿到“成功检索目标记忆”的通过样本
+- `memory_bench_platform` 尚未统一封装 OpenViking 官方 LoCoMo benchmark 脚本入口
+- 官方 `phase_a_off.py` / `run_clean_small_in_container.sh` 在共享远端环境中仍存在并发串口径风险
+- `locomo_test` 中旧 compact/task 统计兼容逻辑与当前 OpenClaw / OpenViking 接口不完全一致
 
 限制原因：
 
 - 当前 WSL 中 `OpenClaw` 版本低于官方插件要求
 - workflow executor 目前是 Python 过渡实现
 - 当前真实 `ov admin/add-memory/find` workflow 已跑通闭环，但环境中 memory extraction 结果还不稳定
+- 远端 `jcp-dev` 当前是共享容器，多个评测脚本会竞争同一份 gateway/plugin/OpenViking 运行态
 
 ## 8. 下一步建议
 
-1. 继续扩 workflow executor 的 DAG / 并发能力
-2. 接入真实外部 `ovtest/OpenViking` workflow case
-3. 为 builtin judge 之外增加外部/LLM judge adapter
-4. 引入官方 `LongMemEval` 数据文件并完成外部验证
+1. 为全部入口增加独占运行守护，禁止并发 `phase_a_off.py` 串口径
+2. 修复 `locomo_test` 中旧 compact/task 兼容层，替换成当前接口下的稳定逻辑
+3. 让 `memory_bench_platform` 支持 external runner，并接入官方 LoCoMo benchmark 脚本
+4. 为 builtin judge 之外增加外部/LLM judge adapter
+5. 引入官方 `LongMemEval` 数据文件并完成外部验证
