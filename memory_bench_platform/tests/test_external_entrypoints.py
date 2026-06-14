@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import sys
+import json
 
 from memory_bench_platform.integration import classify_entrypoint, execute_external_runner, resolve_benchmark_entrypoint
 
@@ -40,3 +41,55 @@ def test_execute_external_runner_captures_process_result(tmp_path: Path):
     assert result["status"] == "passed"
     assert result["exit_code"] == 0
     assert "runner-ok" in result["stdout"]
+
+
+def test_external_runner_missing_output_becomes_failed_summary(monkeypatch, tmp_path: Path):
+    from memory_bench_platform import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_plan_from_args",
+        lambda args: type(
+            "Plan",
+            (),
+            {
+                "run_id": "run-ext-fail",
+                "benchmark_id": args.benchmark,
+                "agent_id": args.agent,
+                "benchmark_version": None,
+                "agent_version": None,
+                "memory_backend": None,
+                "hardware_profile": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_benchmark_entrypoint",
+        lambda benchmark, entrypoint_id: type(
+            "EntryPoint",
+            (),
+            {
+                "entrypoint_id": "official_small",
+                "entrypoint_kind": "external_runner",
+                "command": ["bash", "dummy.sh"],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "execute_external_runner",
+        lambda entrypoint, env, cwd=None: {"status": "passed", "exit_code": 0, "stdout": "", "stderr": ""},
+    )
+    monkeypatch.setattr(cli_module.Path, "cwd", lambda: tmp_path)
+
+    cli_module.main(["run", "--benchmark", "locomo", "--agent", "openclaw", "--entrypoint", "official_small"])
+
+    run_dir = tmp_path / "runs" / "run-ext-fail"
+    summary = json.loads((run_dir / "reports" / "summary.json").read_text(encoding="utf-8"))
+    entry = json.loads((run_dir / "records" / "external_entrypoint.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert "external_error" in summary["resource_summary"]
+    assert entry["status"] == "failed"

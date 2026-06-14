@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--memory-backend")
     p_plan.add_argument("--hardware-profile")
     p_plan.add_argument("--data-path")
+    p_plan.add_argument("--run-id")
 
     p_run = sub.add_parser("run")
     p_run.add_argument("--benchmark", required=True)
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--hardware-profile")
     p_run.add_argument("--data-path")
     p_run.add_argument("--entrypoint")
+    p_run.add_argument("--run-id")
 
     p_validate = sub.add_parser("validate")
     p_validate.add_argument("--benchmark")
@@ -65,6 +67,7 @@ def _plan_from_args(args: argparse.Namespace):
     request = RunPlanRequest(
         benchmark_id=args.benchmark,
         agent_id=args.agent,
+        run_id=getattr(args, "run_id", None),
         memory_backend=args.memory_backend,
         hardware_profile=args.hardware_profile,
         data_path=args.data_path,
@@ -146,7 +149,58 @@ def main(argv: list[str] | None = None) -> None:
         (run_dir / "logs" / "external_runner.stdout.log").write_text(runner_result["stdout"], encoding="utf-8")
         (run_dir / "logs" / "external_runner.stderr.log").write_text(runner_result["stderr"], encoding="utf-8")
         if output_dir.exists():
-            imported = import_external_result(output_dir)
+            try:
+                imported = import_external_result(output_dir)
+            except FileNotFoundError as exc:
+                storage.write_json_record(
+                    run_dir,
+                    "records/external_entrypoint.json",
+                    {
+                        "entrypoint_id": entrypoint.entrypoint_id,
+                        "command": entrypoint.command,
+                        "output_dir": str(output_dir),
+                        "status": "failed",
+                        "exit_code": runner_result["exit_code"],
+                        "error": str(exc),
+                    },
+                )
+                case_results = []
+                summary_record = ReportSummary(
+                    run_id=run_record.run_id,
+                    status="failed",
+                    case_total=0,
+                    case_passed=0,
+                    case_failed=0,
+                    resource_summary={"external_error": str(exc)},
+                    category_summary={},
+                )
+            else:
+                storage.write_json_record(
+                    run_dir,
+                    "records/external_entrypoint.json",
+                    {
+                        "entrypoint_id": entrypoint.entrypoint_id,
+                        "command": entrypoint.command,
+                        "output_dir": str(output_dir),
+                        "status": runner_result["status"],
+                        "exit_code": runner_result["exit_code"],
+                    },
+                )
+                write_external_result_summary(run_dir, imported)
+                case_results = imported["case_results"]
+                summary_record = ReportSummary(
+                    run_id=run_record.run_id,
+                    status="passed" if runner_result["status"] == "passed" else "failed",
+                    case_total=imported["summary"]["total_questions"],
+                    case_passed=imported["summary"]["total_correct"],
+                    case_failed=imported["summary"]["total_graded"] - imported["summary"]["total_correct"],
+                    resource_summary={
+                        "token_totals": imported["summary"].get("token_totals", {}),
+                        "memory_token_totals": imported["summary"].get("memory_token_totals", {}),
+                    },
+                    category_summary=imported["summary"].get("accuracy_by_category", {}),
+                )
+        else:
             storage.write_json_record(
                 run_dir,
                 "records/external_entrypoint.json",
@@ -154,33 +208,19 @@ def main(argv: list[str] | None = None) -> None:
                     "entrypoint_id": entrypoint.entrypoint_id,
                     "command": entrypoint.command,
                     "output_dir": str(output_dir),
-                    "status": runner_result["status"],
+                    "status": "failed",
                     "exit_code": runner_result["exit_code"],
+                    "error": f"missing external output dir: {output_dir}",
                 },
             )
-            write_external_result_summary(run_dir, imported)
-            case_results = imported["case_results"]
-            summary_record = ReportSummary(
-                run_id=run_record.run_id,
-                status="passed" if runner_result["status"] == "passed" else "failed",
-                case_total=imported["summary"]["total_questions"],
-                case_passed=imported["summary"]["total_correct"],
-                case_failed=imported["summary"]["total_graded"] - imported["summary"]["total_correct"],
-                resource_summary={
-                    "token_totals": imported["summary"].get("token_totals", {}),
-                    "memory_token_totals": imported["summary"].get("memory_token_totals", {}),
-                },
-                category_summary=imported["summary"].get("accuracy_by_category", {}),
-            )
-        else:
             case_results = []
             summary_record = ReportSummary(
                 run_id=run_record.run_id,
-                status="passed" if runner_result["status"] == "passed" else "failed",
+                status="failed",
                 case_total=0,
                 case_passed=0,
                 case_failed=0,
-                resource_summary={},
+                resource_summary={"external_error": f"missing external output dir: {output_dir}"},
                 category_summary={},
             )
         final_status = summary_record.status

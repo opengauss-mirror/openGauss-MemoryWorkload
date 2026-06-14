@@ -31,6 +31,9 @@ JUDGE_MODEL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["model
 
 mkdir -p "${LOCAL_OUTPUT_DIR}"
 
+EXISTING_PHASE_CSV="$(find "${LOCAL_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)"
+if [ -z "${EXISTING_PHASE_CSV}" ]; then
+
 ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -s" <<INNER
 set -euo pipefail
 
@@ -86,6 +89,8 @@ for log_name in "${RUN_ID}.master.log" "${RUN_ID}.ov.log" "${RUN_ID}.gw.log"; do
   fi
 done
 
+fi
+
 if [ "${SKIP_JUDGE}" != "true" ]; then
   PHASE_CSV="$(find "${LOCAL_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1)"
   if [ -z "${PHASE_CSV}" ]; then
@@ -101,7 +106,8 @@ if [ "${SKIP_JUDGE}" != "true" ]; then
     --model "${JUDGE_MODEL}" \
     --parallel "${JUDGE_PARALLEL}"
 
-  python3 - "${PHASE_CSV}" "${LOCAL_OUTPUT_DIR}/meta.json" "${RUN_ID}" <<'PY'
+  QA_CSV="${LOCAL_OUTPUT_DIR}/qa_results.csv"
+  python3 - "${QA_CSV}" "${LOCAL_OUTPUT_DIR}/meta.json" "${RUN_ID}" <<'PY'
 import csv
 import json
 import sys

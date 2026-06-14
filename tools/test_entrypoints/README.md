@@ -18,6 +18,9 @@
   - 远端运行 `phaseA`，本地补 judge 与 `meta.json`。
 - `run_official_locomo_sample.sh`
   - sample 级别 wrapper，复用 `run_official_locomo_small.sh`。
+- `run_locomo_test_remote.sh`
+  - `locomo_test` 主入口的远端稳定 wrapper。
+  - 自动同步本地 `locomo_test` 代码、生成远端 `env.toml`，并在容器内跑完整 pipeline。
 
 ## 预期新增
 

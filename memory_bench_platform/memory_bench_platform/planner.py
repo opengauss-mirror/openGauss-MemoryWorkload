@@ -10,6 +10,7 @@ from .protocol import RunRecord
 class RunPlanRequest:
     benchmark_id: str
     agent_id: str
+    run_id: str | None = None
     benchmark_version: str | None = None
     agent_version: str | None = None
     memory_backend: str | None = None
@@ -44,8 +45,9 @@ class RunPlan:
 
 def build_run_plan(request: RunPlanRequest) -> RunPlan:
     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    run_id = request.run_id or f"{request.benchmark_id}-{request.agent_id}-{stamp}"
     return RunPlan(
-        run_id=f"{request.benchmark_id}-{request.agent_id}-{stamp}",
+        run_id=run_id,
         benchmark_id=request.benchmark_id,
         agent_id=request.agent_id,
         benchmark_version=request.benchmark_version,
