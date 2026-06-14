@@ -107,7 +107,7 @@ async def _run_judge(cfg: Config, csv_path: str):
 
     api_format = j.api_format
     if api_format is None:
-        api_format = "anthropic" if "/coding" in j.base_url else "openai"
+        api_format = "openai"
     print(f"    Judge: {api_format}, model={j.model}, parallel={j.parallel}", file=sys.stderr)
 
     rows, fieldnames = _load_csv(csv_path)
