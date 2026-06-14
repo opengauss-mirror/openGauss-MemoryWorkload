@@ -10,7 +10,7 @@
   - 已完成独占端到端验证。
 - `memory_bench_platform` external runner
   - 已完成 external runner 调用、结果导入、恢复模式验证。
-  - from-scratch 长跑路径现在可以完整收尾，但本次导入结果只覆盖了 15 题，不是完整 35 题。
+  - 已完成 from-scratch 完整 `35` 题收尾验证。
 
 ## 2. 验证结果
 
@@ -49,16 +49,16 @@
   - `runs/locomo-openclaw-importprobe/reports/case_results.json`
 
 - from-scratch 收尾入口：
-  - `python3 -m memory_bench_platform.cli run --benchmark locomo --agent openclaw --entrypoint official_small --run-id locomo-openclaw-fromscratch-final`
+  - `python3 -m memory_bench_platform.cli run --benchmark locomo --agent openclaw --entrypoint official_small --run-id locomo-openclaw-fromscratch-full`
 - 产物目录：
-  - `/mnt/d/code/Agent/test/memory_bench_platform/runs/locomo-openclaw-fromscratch-final`
-- 当前导入结果：`10/15 = 66.67%`
+  - `/mnt/d/code/Agent/test/memory_bench_platform/runs/locomo-openclaw-fromscratch-full`
+- 当前导入结果：`7/35 = 20.00%`
 - 关键产物：
-  - `runs/locomo-openclaw-fromscratch-final/run.json`
-  - `runs/locomo-openclaw-fromscratch-final/records/external_entrypoint.json`
-  - `runs/locomo-openclaw-fromscratch-final/reports/summary.json`
-  - `runs/locomo-openclaw-fromscratch-final/reports/external_result_summary.json`
-  - `runs/locomo-openclaw-fromscratch-final/reports/case_results.json`
+  - `runs/locomo-openclaw-fromscratch-full/run.json`
+  - `runs/locomo-openclaw-fromscratch-full/records/external_entrypoint.json`
+  - `runs/locomo-openclaw-fromscratch-full/reports/summary.json`
+  - `runs/locomo-openclaw-fromscratch-full/reports/external_result_summary.json`
+  - `runs/locomo-openclaw-fromscratch-full/reports/case_results.json`
 
 ## 3. 当前推荐
 
@@ -69,5 +69,6 @@
 ## 4. 仍待收敛
 
 - `official wrapper` 与 `locomo_test` 当前结果仍不一致：`20.00%` vs `25.71%`
-- `memory_bench_platform` 的 external runner 已完成恢复模式和 from-scratch 收尾能力验证，但当前 from-scratch 结果只覆盖了 15 题，不是完整 35 题
+- `official wrapper` 与 `locomo_test` 当前结果仍不一致：`20.00%` vs `25.71%`
+- `memory_bench_platform` from-scratch 与 `official wrapper` 当前对齐到 `20.00%`
 - `locomo_test` 的 `memory_token_totals` / `ov_token_totals` 仍未恢复成可信统计

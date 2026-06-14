@@ -406,6 +406,8 @@ python3 -m memory_bench_platform.cli run \
   - 独占远端运行 `locomo_test` 主入口，并拉回完整 `meta.json` / `qa_results.csv`
 - `memory_bench_platform` external runner 恢复模式
   - 可导入既有 `official_small` 产物并生成平台 `summary.json` / `case_results.json`
+- `memory_bench_platform` external runner from-scratch
+  - 可从零发起 `official_small`，完整落回 `external_artifacts`，并生成平台 `summary.json` / `case_results.json`
 
 ### 已验证失败 / 仍有限制
 
@@ -416,7 +418,7 @@ python3 -m memory_bench_platform.cli run \
 - `memory_bench_platform` 尚未统一封装 OpenViking 官方 LoCoMo benchmark 脚本入口
 - 官方 `phase_a_off.py` / `run_clean_small_in_container.sh` 在共享远端环境中仍存在并发串口径风险
 - `locomo_test` 中旧 compact/task 统计兼容逻辑与当前 OpenClaw / OpenViking 接口不完全一致
-- `memory_bench_platform` 的 external runner from-scratch 长跑路径还缺一条完整成功收尾证据
+- `memory_bench_platform` / `official wrapper` / `locomo_test` 当前 LoCoMo `small` 结果仍未对齐
 
 限制原因：
 
@@ -429,6 +431,5 @@ python3 -m memory_bench_platform.cli run \
 
 1. 为全部入口增加独占运行守护，禁止并发 `phase_a_off.py` 串口径
 2. 继续收敛 `official wrapper` 与 `locomo_test` 当前 `20.00%` / `25.71%` 的结果差异
-3. 为 `memory_bench_platform` 补一条 from-scratch external runner 完整成功证据
-4. 为 builtin judge 之外增加外部/LLM judge adapter
-5. 引入官方 `LongMemEval` 数据文件并完成外部验证
+3. 为 builtin judge 之外增加外部/LLM judge adapter
+4. 引入官方 `LongMemEval` 数据文件并完成外部验证

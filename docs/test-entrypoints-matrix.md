@@ -9,7 +9,7 @@
 | 入口 | 当前用途 | 关键依赖 | 当前状态 | 推荐级别 | 已知问题 |
 | --- | --- | --- | --- | --- | --- |
 | `locomo_test` | LoCoMo `small` / `locomo10` 主跑数入口 | OpenClaw gateway、OpenViking、judge LLM、远端容器 `jcp-dev` | 可跑并已产出可信结果 | 高 | 旧 compact / task 兼容层仍需清理；部分 token 统计链路过时 |
-| `memory_bench_platform` | 统一 workflow/case 平台、skill 验证、归档与报告 | benchmark skill、agent skill、native workflow、OpenClaw/OpenViking | 可跑 | 中 | external runner 已完成恢复模式导入验证；from-scratch 长跑路径还缺一条完整成功证据 |
+| `memory_bench_platform` | 统一 workflow/case 平台、skill 验证、归档与报告 | benchmark skill、agent skill、native workflow、OpenClaw/OpenViking | 可跑并已完成 from-scratch 验证 | 中 | external runner 当前结果与 `official wrapper` 对齐，但与 `locomo_test` 主入口仍有结果差异 |
 | `benchmark/locomo/openclaw/phase_a_off.py` 及 `run_clean_small_in_container.sh` | 官方 LoCoMo direct-ov 基线入口 | OpenViking benchmark 目录、OpenClaw 插件配置、远端容器 `jcp-dev` | 可跑但易串口径 | 中 | 并发 run 会污染插件配置、账号前缀与评测结果 |
 
 ## 3. 当前推荐
@@ -51,8 +51,8 @@
 - `memory_bench_platform`
   - 已完成 benchmark skill / agent skill / native workflow / archive / report 最小闭环。
   - 已完成 external runner 骨架与结果导入。
-  - 已验证 `official_small` 产物导入结果：`7/35 = 20.00%`
-  - from-scratch 长跑路径已补失败落盘，不再因缺少外部产物直接崩溃。
+  - 已验证 `official_small` 恢复模式导入结果：`7/35 = 20.00%`
+  - 已验证 `official_small` from-scratch 完整收尾结果：`7/35 = 20.00%`
 
 ### 可跑但还不能裸用
 
@@ -65,4 +65,4 @@
 
 - 为三条入口补统一远端独占锁和环境探测。
 - 让 `memory_bench_platform` 支持 external runner，并把官方 benchmark 脚本纳入统一归档。
-- 把 `locomo_test` 中旧 compact/task 兼容逻辑替换成与当前 OpenClaw / OpenViking 接口一致的实现。
+- 继续收敛 `locomo_test` 与 `official wrapper` / `memory_bench_platform` 当前 `25.71%` / `20.00%` 的结果差异。
