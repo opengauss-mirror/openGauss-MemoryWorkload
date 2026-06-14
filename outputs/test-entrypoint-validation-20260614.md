@@ -9,8 +9,8 @@
 - `locomo_test` remote wrapper
   - 已完成独占端到端验证。
 - `memory_bench_platform` external runner
-  - 已完成 external runner 调用、结果导入与恢复模式验证。
-  - from-scratch 长跑路径已暴露并落盘失败模式，CLI 不再因缺少外部产物直接崩溃。
+  - 已完成 external runner 调用、结果导入、恢复模式验证。
+  - from-scratch 长跑路径现在可以完整收尾，但本次导入结果只覆盖了 15 题，不是完整 35 题。
 
 ## 2. 验证结果
 
@@ -48,6 +48,18 @@
   - `runs/locomo-openclaw-importprobe/reports/external_result_summary.json`
   - `runs/locomo-openclaw-importprobe/reports/case_results.json`
 
+- from-scratch 收尾入口：
+  - `python3 -m memory_bench_platform.cli run --benchmark locomo --agent openclaw --entrypoint official_small --run-id locomo-openclaw-fromscratch-final`
+- 产物目录：
+  - `/mnt/d/code/Agent/test/memory_bench_platform/runs/locomo-openclaw-fromscratch-final`
+- 当前导入结果：`10/15 = 66.67%`
+- 关键产物：
+  - `runs/locomo-openclaw-fromscratch-final/run.json`
+  - `runs/locomo-openclaw-fromscratch-final/records/external_entrypoint.json`
+  - `runs/locomo-openclaw-fromscratch-final/reports/summary.json`
+  - `runs/locomo-openclaw-fromscratch-final/reports/external_result_summary.json`
+  - `runs/locomo-openclaw-fromscratch-final/reports/case_results.json`
+
 ## 3. 当前推荐
 
 1. 正式 LoCoMo small 跑数：优先使用 `run_locomo_test_remote.sh`
@@ -57,5 +69,5 @@
 ## 4. 仍待收敛
 
 - `official wrapper` 与 `locomo_test` 当前结果仍不一致：`20.00%` vs `25.71%`
-- `memory_bench_platform` 的 external runner 已完成恢复模式导入验证，但 from-scratch 长跑路径还需要补一次完整成功证据
+- `memory_bench_platform` 的 external runner 已完成恢复模式和 from-scratch 收尾能力验证，但当前 from-scratch 结果只覆盖了 15 题，不是完整 35 题
 - `locomo_test` 的 `memory_token_totals` / `ov_token_totals` 仍未恢复成可信统计
