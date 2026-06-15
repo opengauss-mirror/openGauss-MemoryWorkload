@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class VersionPolicy(BaseModel):
@@ -42,10 +42,20 @@ class BenchmarkManifest(BaseModel):
     id: str
     version: str
     entry: EntryPoints
-    version_policy: VersionPolicy = Field(default_factory=VersionPolicy)
+    version_policy: VersionPolicy
     dataset: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
     judging: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_version_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "version_policy" not in data:
+            raise ValueError(
+                "benchmark manifest must declare version_policy explicitly; "
+                "default software selection should stay machine-readable"
+            )
+        return data
 
 
 class AgentManifest(BaseModel):
@@ -53,8 +63,18 @@ class AgentManifest(BaseModel):
     id: str
     version: str
     entry: EntryPoints
-    version_policy: VersionPolicy = Field(default_factory=VersionPolicy)
+    version_policy: VersionPolicy
     runtime: dict[str, Any] = Field(default_factory=dict)
     io: dict[str, Any] = Field(default_factory=dict)
     lifecycle: dict[str, Any] = Field(default_factory=dict)
     collection: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_version_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "version_policy" not in data:
+            raise ValueError(
+                "agent manifest must declare version_policy explicitly; "
+                "default software selection should stay machine-readable"
+            )
+        return data

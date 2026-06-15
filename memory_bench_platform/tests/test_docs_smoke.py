@@ -15,3 +15,13 @@ def test_architecture_doc_mentions_version_policy():
     text = Path("../docs/memory-benchmark-platform-architecture.md").read_text(encoding="utf-8")
     assert "latest_official_release_tag" in text
     assert "version_policy" in text
+
+
+def test_ovtest_skill_docs_mention_latest_release_tag_policy():
+    for path in [
+        Path("skills/benchmarks/ovtest-memory/SKILL.md"),
+        Path("skills/benchmarks/ovtest-health/SKILL.md"),
+        Path("skills/benchmarks/ovtest-admin-memory/SKILL.md"),
+    ]:
+        text = path.read_text(encoding="utf-8")
+        assert "latest_official_release_tag" in text

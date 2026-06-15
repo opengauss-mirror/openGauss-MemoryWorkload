@@ -75,6 +75,7 @@ def test_enrich_phasea_meta_backfills_session_and_task(monkeypatch, tmp_path: Pa
 
     result = enrich_phasea_meta(
         meta_path=meta_path,
+        csv_path=None,
         master_log_path=master_log_path,
         base_url="http://127.0.0.1:1933",
         api_key="k",
@@ -90,3 +91,72 @@ def test_enrich_phasea_meta_backfills_session_and_task(monkeypatch, tmp_path: Pa
     assert detail["session_id"] == "22222222-2222-2222-2222-222222222222"
     assert detail["_ov_task"]["task_id"] == "11111111-1111-1111-1111-111111111111"
     assert detail["telemetry_summary"]["duration_ms"] == 1234.5
+
+
+def test_enrich_phasea_meta_creates_minimal_meta_when_missing(monkeypatch, tmp_path: Path):
+    meta_path = tmp_path / "phaseA_on_2sessions_demo_meta.json"
+    csv_path = tmp_path / "phaseA_on_2sessions_demo.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "sample_id,sample_idx,qi,question,expected,response,category,evidence,elapsed_seconds,rounds,input_tokens,output_tokens,cacheRead,cacheWrite,total_tokens,timestamp,jsonl_filename,result,reasoning",
+                'conv-26,0,2,Q1,E1,R1,1,"[D1:1]",4.5,1,100,20,30,0,150,2026-06-15 10:00:00,,CORRECT,ok',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    master_log_path = tmp_path / "run.master.log"
+    master_log_path.write_text(
+        "[phaseA][session 1/2][direct-ov] session_1 task=11111111-1111-1111-1111-111111111111 session_id=22222222-2222-2222-2222-222222222222 memories=3\n",
+        encoding="utf-8",
+    )
+
+    def fake_get(url: str, headers: dict[str, str], timeout: int):
+        if url.endswith("/api/v1/sessions/22222222-2222-2222-2222-222222222222"):
+            return _FakeResponse(
+                {
+                    "result": {
+                        "session_id": "22222222-2222-2222-2222-222222222222",
+                        "created_at": "2026-06-15T18:00:00Z",
+                        "updated_at": "2026-06-15T18:00:05Z",
+                    }
+                }
+            )
+        if url.endswith("/api/v1/tasks/11111111-1111-1111-1111-111111111111"):
+            return _FakeResponse(
+                {
+                    "result": {
+                        "task_id": "11111111-1111-1111-1111-111111111111",
+                        "status": "completed",
+                        "created_at_iso": "2026-06-15T18:00:00+00:00",
+                        "updated_at_iso": "2026-06-15T18:00:06+00:00",
+                        "telemetry_summary": {
+                            "operation": "session_commit_phase2",
+                            "duration_ms": 1500.0,
+                        },
+                    }
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr(MODULE.requests, "get", fake_get)
+
+    result = enrich_phasea_meta(
+        meta_path=meta_path,
+        csv_path=csv_path,
+        master_log_path=master_log_path,
+        base_url="http://127.0.0.1:1933",
+        api_key="k",
+        account_id="acct",
+        user_id="user",
+        agent_id="agent",
+    )
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert result["patched_sessions"] == 1
+    assert result["patched_tasks"] == 1
+    assert meta["run_id"] == "phaseA_on_2sessions_demo"
+    assert len(meta["qa_rows"]) == 1
+    assert meta["qa_rows"][0]["usage"]["total_tokens"] == 150
+    assert meta["ingest_sessions"][0]["compact_elapsed_seconds"] == 6.0
+    assert meta["ingest_sessions"][0]["telemetry_summary"]["duration_ms"] == 1500.0

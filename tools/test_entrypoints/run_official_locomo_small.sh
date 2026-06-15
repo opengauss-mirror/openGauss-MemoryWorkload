@@ -72,9 +72,14 @@ export GW_LOG="/tmp/${RUN_ID}.gw.log"
 bash ./run_clean_small_in_container.sh
 
 META_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*_meta.json' | head -1 || true)
-if [ -n "\${META_FILE}" ] && [ -f "\${MASTER_LOG}" ]; then
+CSV_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)
+if [ -z "\${META_FILE}" ] && [ -n "\${CSV_FILE}" ]; then
+  META_FILE="\${CSV_FILE%.csv}_meta.json"
+fi
+if [ -n "\${META_FILE}" ] && [ -f "\${MASTER_LOG}" ] && [ -n "\${CSV_FILE}" ]; then
   python3 "${WORKSPACE_ROOT}/tools/test_entrypoints/ov_phasea_enrich.py" \
     "\${META_FILE}" \
+    "\${CSV_FILE}" \
     "\${MASTER_LOG}" \
     "http://127.0.0.1:1933" \
     "${ROOT_KEY}" \
