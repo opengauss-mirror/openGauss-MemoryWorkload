@@ -3,6 +3,11 @@ id: hermes
 version: 0.1.0
 version_policy:
   default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
   allowed_overrides:
     - user_specified_official_version
     - verified_fallback_release_tag
@@ -11,6 +16,10 @@ version_policy:
     - dirty_worktree
     - dev_build
     - non_tag_commit
+  targets:
+    - name: hermes
+      scope: system_under_test
+      record_runtime_version: true
   record_runtime_version: true
   notes: Hermes runs should prefer the latest official CLI release tag when one exists.
 entry:

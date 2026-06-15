@@ -94,6 +94,9 @@ python3 -m memory_bench_platform.cli validate \
   - unpublished local commits
 - If a run uses a non-release build, record that explicitly in the run conclusion or analysis report.
 - Every benchmark skill and agent skill manifest should declare a `version_policy` block so the default is machine-readable, not only written in `SKILL.md`.
+- `version_policy` should not only say "use latest tag"; it should also declare:
+  - `resolution_order`: the concrete fallback order
+  - `targets`: which software components are governed by this policy
 
 Recommended priority:
 
@@ -106,6 +109,11 @@ Minimal manifest shape:
 ```yaml
 version_policy:
   default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
   allowed_overrides:
     - user_specified_official_version
     - verified_fallback_release_tag
@@ -114,5 +122,10 @@ version_policy:
     - dirty_worktree
     - dev_build
     - non_tag_commit
+  targets:
+    - name: openclaw
+      scope: system_under_test
+    - name: openviking
+      scope: memory_backend
   record_runtime_version: true
 ```

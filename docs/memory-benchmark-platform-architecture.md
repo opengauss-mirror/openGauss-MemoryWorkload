@@ -142,8 +142,10 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 所有 benchmark skill 与 agent skill 都必须在 `manifest.yaml` 中声明结构化 `version_policy`，至少包含：
 
 - `default_selection = latest_official_release_tag`
+- `resolution_order`
 - `allowed_overrides`
 - `disallowed_defaults`
+- `targets`
 - `record_runtime_version`
 
 这条规则的目的不是立即替平台自动解析最新 tag，而是先把“默认版本来源”沉淀为可校验、可审计的机器可读协议，避免版本约束只散落在 `README` 或 `SKILL.md` 中。
@@ -153,6 +155,19 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 - 优先用户指定的正式版本
 - 否则使用上游当前最新正式 release tag
 - 仅在已有验证结论时回退到旧正式 tag
+
+`targets` 用来明确“这条版本策略到底约束哪些软件组件”，避免只知道“要用最新 tag”，却不知道是：
+
+- benchmark 自身工具链
+- 被测 agent
+- memory backend
+- 运行时依赖
+
+例如：
+
+- `locomo` benchmark skill 应至少标记 `locomo-benchmark`
+- `openclaw` agent skill 应至少标记 `openclaw` 与其依赖的 `openviking`
+- `ovtest-*` benchmark skill 应至少标记其直接测试对象 `openviking`
 
 不允许平台默认选择：
 

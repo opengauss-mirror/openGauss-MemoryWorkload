@@ -5,8 +5,30 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+class VersionTarget(BaseModel):
+    name: str
+    scope: Literal[
+        "system_under_test",
+        "benchmark_tooling",
+        "runtime_dependency",
+        "memory_backend",
+    ]
+    upstream: str | None = None
+    required: bool = True
+    record_runtime_version: bool = True
+    notes: str | None = None
+
+
 class VersionPolicy(BaseModel):
     default_selection: Literal["latest_official_release_tag"] = "latest_official_release_tag"
+    resolution_order: list[str] = Field(
+        default_factory=lambda: [
+            "user_specified_official_version",
+            "latest_official_release_tag",
+            "verified_fallback_release_tag",
+            "historical_repro_release_tag",
+        ]
+    )
     allowed_overrides: list[str] = Field(
         default_factory=lambda: [
             "user_specified_official_version",
@@ -21,6 +43,7 @@ class VersionPolicy(BaseModel):
             "non_tag_commit",
         ]
     )
+    targets: list[VersionTarget] = Field(min_length=1)
     record_runtime_version: bool = True
     notes: str | None = None
 
