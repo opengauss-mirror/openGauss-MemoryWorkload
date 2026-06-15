@@ -19,6 +19,7 @@ version_policy:
   targets:
     - name: longmemeval-benchmark
       scope: benchmark_tooling
+      version_source: upstream_release_tag
       upstream: https://github.com/xiaowu0162/LongMemEval
       record_runtime_version: true
   record_runtime_version: true

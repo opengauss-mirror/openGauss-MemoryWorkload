@@ -19,6 +19,7 @@ version_policy:
   targets:
     - name: openviking
       scope: system_under_test
+      version_source: upstream_release_tag
       upstream: https://github.com/xforce-io/openviking
       record_runtime_version: true
   record_runtime_version: true

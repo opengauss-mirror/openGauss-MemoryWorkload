@@ -97,6 +97,7 @@ python3 -m memory_bench_platform.cli validate \
 - `version_policy` should not only say "use latest tag"; it should also declare:
   - `resolution_order`: the concrete fallback order
   - `targets`: which software components are governed by this policy
+  - `targets[].version_source`: whether the version is resolved from an upstream release/tag source or can only be recorded from runtime observation
   - `targets[].upstream`: where the platform should resolve the latest official tag for each governed component
   - `record_runtime_version`: whether the resolved runtime version must be archived
 
@@ -127,9 +128,16 @@ version_policy:
   targets:
     - name: openclaw
       scope: system_under_test
+      version_source: upstream_release_tag
       upstream: https://github.com/coding-guy/openclaw
     - name: openviking
       scope: memory_backend
+      version_source: upstream_release_tag
       upstream: https://github.com/xforce-io/openviking
   record_runtime_version: true
 ```
+
+Recommended target-level policy:
+
+- Real benchmark / agent integration skills should use `version_source: upstream_release_tag`.
+- Generic wrapper skills that do not own a concrete upstream mapping may use `version_source: runtime_observed_only`, but they should not be treated as authoritative official benchmark baselines.

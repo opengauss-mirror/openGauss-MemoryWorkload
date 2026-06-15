@@ -146,6 +146,7 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 - `allowed_overrides`
 - `disallowed_defaults`
 - `targets`
+- `targets[].version_source`
 - `targets[].upstream`
 - `record_runtime_version`
 
@@ -163,6 +164,15 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 - 被测 agent
 - memory backend
 - 运行时依赖
+
+`targets[].version_source` 用来明确“版本是怎么来的”：
+
+- `upstream_release_tag`
+  - 默认形式
+  - 表示该 skill 必须从声明的上游 release/tag 源解析版本
+- `runtime_observed_only`
+  - 仅适用于 generic wrapper 之类的脚手架 skill
+  - 表示平台只能记录运行时实际二进制/包版本，不能把它当作官方基线的默认版本解析来源
 
 `targets[].upstream` 用来明确“最新正式 tag 到底去哪里取”，避免 skill 只表达了策略，却没有表达解析来源。对接平台的 skill 应默认把上游 release/tag 源写清楚；如果没有标准 upstream，则必须在 run 记录里显式保存实际二进制、commit 或制品来源。
 

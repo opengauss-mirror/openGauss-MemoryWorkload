@@ -19,9 +19,11 @@ version_policy:
   targets:
     - name: generic-cli
       scope: system_under_test
+      version_source: runtime_observed_only
       record_runtime_version: true
+      notes: This scaffold skill can only record the observed binary/package version unless a concrete upstream-backed agent skill is created.
   record_runtime_version: true
-  notes: If the wrapped CLI has no official release tag concept, the run must record the concrete binary, package version, or commit source explicitly.
+  notes: For official benchmark baselines, prefer a concrete agent skill that resolves the latest upstream release tag explicitly instead of this generic wrapper.
 entry:
   runner: scripts/run_task.py
   healthcheck: scripts/healthcheck.py

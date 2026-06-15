@@ -13,10 +13,22 @@ class VersionTarget(BaseModel):
         "runtime_dependency",
         "memory_backend",
     ]
+    version_source: Literal[
+        "upstream_release_tag",
+        "runtime_observed_only",
+    ] = "upstream_release_tag"
     upstream: str | None = None
     required: bool = True
     record_runtime_version: bool = True
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def require_upstream_for_release_tag_resolution(self) -> "VersionTarget":
+        if self.version_source == "upstream_release_tag" and not self.upstream:
+            raise ValueError(
+                "targets using upstream_release_tag must declare upstream explicitly"
+            )
+        return self
 
 
 class VersionPolicy(BaseModel):
@@ -46,6 +58,14 @@ class VersionPolicy(BaseModel):
     targets: list[VersionTarget] = Field(min_length=1)
     record_runtime_version: bool = True
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def require_latest_tag_in_resolution_order(self) -> "VersionPolicy":
+        if "latest_official_release_tag" not in self.resolution_order:
+            raise ValueError(
+                "version_policy.resolution_order must include latest_official_release_tag"
+            )
+        return self
 
 
 class EntryPoints(BaseModel):

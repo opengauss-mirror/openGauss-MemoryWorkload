@@ -36,7 +36,7 @@
           "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["name", "scope"],
+            "required": ["name", "scope", "version_source"],
             "properties": {
               "name": { "type": "string" },
               "scope": {
@@ -46,6 +46,9 @@
                   "runtime_dependency",
                   "memory_backend"
                 ]
+              },
+              "version_source": {
+                "enum": ["upstream_release_tag", "runtime_observed_only"]
               },
               "upstream": { "type": "string" },
               "required": { "type": "boolean" },

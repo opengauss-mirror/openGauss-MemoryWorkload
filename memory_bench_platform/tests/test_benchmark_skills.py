@@ -13,6 +13,7 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     assert manifest["execution"]["requires_stateful_agent"] is True
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "locomo-benchmark"
+    assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/snap-research/locomo"
 
 
@@ -23,6 +24,7 @@ def test_longmemeval_manifest_declares_case_builder():
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "longmemeval-benchmark"
+    assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xiaowu0162/LongMemEval"
 
 
@@ -45,6 +47,7 @@ def test_ovtest_memory_manifest_declares_case_builder():
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "openviking"
+    assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xforce-io/openviking"
 
 
@@ -55,6 +58,7 @@ def test_ovtest_health_manifest_declares_case_builder():
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "openviking"
+    assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xforce-io/openviking"
 
 
@@ -65,4 +69,5 @@ def test_ovtest_admin_memory_manifest_declares_case_builder():
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "openviking"
+    assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xforce-io/openviking"

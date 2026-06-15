@@ -19,10 +19,12 @@ version_policy:
   targets:
     - name: openclaw
       scope: system_under_test
+      version_source: upstream_release_tag
       upstream: https://github.com/coding-guy/openclaw
       record_runtime_version: true
     - name: openviking
       scope: memory_backend
+      version_source: upstream_release_tag
       upstream: https://github.com/xforce-io/openviking
       record_runtime_version: true
   record_runtime_version: true

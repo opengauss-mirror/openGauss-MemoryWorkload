@@ -19,6 +19,7 @@ version_policy:
   targets:
     - name: locomo-benchmark
       scope: benchmark_tooling
+      version_source: upstream_release_tag
       upstream: https://github.com/snap-research/locomo
       record_runtime_version: true
   record_runtime_version: true

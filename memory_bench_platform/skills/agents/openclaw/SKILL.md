@@ -7,7 +7,7 @@
 - 默认使用正式发布版本，不默认跑脏工作树或本地开发快照。
 - 如果未特别说明，`OpenClaw` 与其依赖的 `OpenViking` 都应优先选择“当前最新正式 release tag”。
 - `manifest.yaml` 必须声明 `version_policy.default_selection=latest_official_release_tag`，不能只写在说明文档里。
-- `manifest.yaml.version_policy.targets` 应明确写出受该策略约束的软件组件，以及对应上游仓库位置。
+- `manifest.yaml.version_policy.targets` 应明确写出受该策略约束的软件组件、`version_source=upstream_release_tag`，以及对应上游仓库位置。
 - 只有在以下情况才允许偏离最新 tag：
   - 用户明确指定版本
   - 为了复现历史问题而需要固定旧版本

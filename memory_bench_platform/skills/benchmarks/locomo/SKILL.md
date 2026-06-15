@@ -7,7 +7,7 @@
 - `official_small` 这类 external runner 依赖真实 `OpenClaw/OpenViking` 环境。
 - 默认要求被测软件使用“当前最新正式 release tag”。
 - `manifest.yaml` 必须声明 `version_policy.default_selection=latest_official_release_tag`，让平台能结构化读取该约束。
-- `manifest.yaml.version_policy.targets` 应至少声明 benchmark 自身的上游仓库；被测 agent stack 的版本约束由 agent skill 单独声明。
+- `manifest.yaml.version_policy.targets` 应至少声明 benchmark 自身的 `version_source=upstream_release_tag` 与上游仓库；被测 agent stack 的版本约束由 agent skill 单独声明。
 - 如果使用非正式版本，必须在 run 记录或分析报告中显式写明原因。
 
 ## 版本优先级

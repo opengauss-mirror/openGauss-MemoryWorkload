@@ -17,6 +17,7 @@ def test_architecture_doc_mentions_version_policy():
     assert "version_policy" in text
     assert "resolution_order" in text
     assert "targets" in text
+    assert "targets[].version_source" in text
     assert "targets[].upstream" in text
 
 
@@ -28,6 +29,7 @@ def test_ovtest_skill_docs_mention_latest_release_tag_policy():
     ]:
         text = path.read_text(encoding="utf-8")
         assert "latest_official_release_tag" in text
+        assert "version_source" in text
         assert "上游仓库位置" in text
 
 
@@ -41,4 +43,5 @@ def test_agent_and_benchmark_skill_docs_require_upstream_for_latest_tag_policy()
     ]:
         text = path.read_text(encoding="utf-8")
         assert "latest_official_release_tag" in text
+        assert "version_source" in text
         assert "upstream" in text or "上游仓库" in text

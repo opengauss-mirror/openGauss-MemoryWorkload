@@ -19,6 +19,7 @@ version_policy:
   targets:
     - name: hermes
       scope: system_under_test
+      version_source: upstream_release_tag
       upstream: https://github.com/Integuru-AI/hermes-agent
       record_runtime_version: true
   record_runtime_version: true
