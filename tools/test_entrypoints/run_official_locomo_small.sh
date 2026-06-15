@@ -70,11 +70,24 @@ export OV_LOG="/tmp/${RUN_ID}.ov.log"
 export GW_LOG="/tmp/${RUN_ID}.gw.log"
 
 bash ./run_clean_small_in_container.sh
+
+META_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*_meta.json' | head -1 || true)
+if [ -n "\${META_FILE}" ] && [ -f "\${MASTER_LOG}" ]; then
+  python3 "${WORKSPACE_ROOT}/tools/test_entrypoints/ov_phasea_enrich.py" \
+    "\${META_FILE}" \
+    "\${MASTER_LOG}" \
+    "http://127.0.0.1:1933" \
+    "${ROOT_KEY}" \
+    "acct-${RUN_ID}" \
+    "user-${RUN_ID}" \
+    "acct-${RUN_ID}_locomo-eval" \
+    >/tmp/${RUN_ID}.enrich.json || true
+fi
 INNER
 
 TMP_PARENT="$(dirname "${LOCAL_OUTPUT_DIR}")"
 mkdir -p "${TMP_PARENT}"
-ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'tar czf - -C /tmp ${RUN_ID} ${RUN_ID}.master.log ${RUN_ID}.ov.log ${RUN_ID}.gw.log 2>/dev/null || tar czf - -C /tmp ${RUN_ID}'" \
+ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'tar czf - -C /tmp ${RUN_ID} ${RUN_ID}.master.log ${RUN_ID}.ov.log ${RUN_ID}.gw.log ${RUN_ID}.enrich.json 2>/dev/null || tar czf - -C /tmp ${RUN_ID}'" \
   | tar xzf - -C "${TMP_PARENT}"
 
 if [ -d "${TMP_PARENT}/${RUN_ID}" ] && [ "${TMP_PARENT}/${RUN_ID}" != "${LOCAL_OUTPUT_DIR}" ]; then
@@ -88,6 +101,9 @@ for log_name in "${RUN_ID}.master.log" "${RUN_ID}.ov.log" "${RUN_ID}.gw.log"; do
     mv "${TMP_PARENT}/${log_name}" "${LOCAL_OUTPUT_DIR}/remote_logs/${log_name}"
   fi
 done
+if [ -f "${TMP_PARENT}/${RUN_ID}.enrich.json" ]; then
+  mv "${TMP_PARENT}/${RUN_ID}.enrich.json" "${LOCAL_OUTPUT_DIR}/remote_logs/${RUN_ID}.enrich.json"
+fi
 
 fi
 
