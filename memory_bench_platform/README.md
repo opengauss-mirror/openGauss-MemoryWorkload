@@ -93,9 +93,26 @@ python3 -m memory_bench_platform.cli validate \
   - dev builds
   - unpublished local commits
 - If a run uses a non-release build, record that explicitly in the run conclusion or analysis report.
+- Every benchmark skill and agent skill manifest should declare a `version_policy` block so the default is machine-readable, not only written in `SKILL.md`.
 
 Recommended priority:
 
 1. User-specified official version
 2. Latest upstream official release tag
 3. Verified fallback release tag
+
+Minimal manifest shape:
+
+```yaml
+version_policy:
+  default_selection: latest_official_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  record_runtime_version: true
+```

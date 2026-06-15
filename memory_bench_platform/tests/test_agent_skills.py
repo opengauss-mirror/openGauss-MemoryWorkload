@@ -9,6 +9,7 @@ def test_openclaw_manifest_declares_service_runtime():
     )
     assert manifest["runtime"]["mode"] == "service"
     assert manifest["io"]["protocol_mode"] == "stateful_session"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
 
 
 def test_generic_cli_manifest_declares_process_runtime():
@@ -17,6 +18,7 @@ def test_generic_cli_manifest_declares_process_runtime():
     )
     assert manifest["runtime"]["mode"] == "process"
     assert manifest["io"]["protocol_mode"] == "stateless_cli"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
 
 
 def test_hermes_manifest_declares_process_runtime():
@@ -25,3 +27,4 @@ def test_hermes_manifest_declares_process_runtime():
     )
     assert manifest["runtime"]["mode"] == "process"
     assert manifest["io"]["protocol_mode"] == "stateless_cli"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"

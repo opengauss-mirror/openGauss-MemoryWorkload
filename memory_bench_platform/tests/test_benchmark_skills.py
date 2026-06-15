@@ -11,6 +11,7 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     )
     assert manifest["execution"]["mode"] == "multi_turn"
     assert manifest["execution"]["requires_stateful_agent"] is True
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
 
 
 def test_longmemeval_manifest_declares_case_builder():
@@ -18,6 +19,7 @@ def test_longmemeval_manifest_declares_case_builder():
         Path("skills/benchmarks/longmemeval/manifest.yaml").read_text(encoding="utf-8")
     )
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
 
 
 def test_longmemeval_builder_uses_case_source_shape():
@@ -37,6 +39,7 @@ def test_ovtest_memory_manifest_declares_case_builder():
         Path("skills/benchmarks/ovtest-memory/manifest.yaml").read_text(encoding="utf-8")
     )
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
 
 
 def test_ovtest_health_manifest_declares_case_builder():
@@ -44,6 +47,7 @@ def test_ovtest_health_manifest_declares_case_builder():
         Path("skills/benchmarks/ovtest-health/manifest.yaml").read_text(encoding="utf-8")
     )
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
 
 
 def test_ovtest_admin_memory_manifest_declares_case_builder():
@@ -51,3 +55,4 @@ def test_ovtest_admin_memory_manifest_declares_case_builder():
         Path("skills/benchmarks/ovtest-admin-memory/manifest.yaml").read_text(encoding="utf-8")
     )
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
+    assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"

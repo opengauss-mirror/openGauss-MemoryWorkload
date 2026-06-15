@@ -1,6 +1,18 @@
 kind: agent
 id: generic-cli
 version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  record_runtime_version: true
+  notes: If the wrapped CLI has no release tag concept, the run must record the concrete binary or commit source explicitly.
 entry:
   runner: scripts/run_task.py
   healthcheck: scripts/healthcheck.py

@@ -1,6 +1,18 @@
 kind: benchmark
 id: ovtest-memory
 version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  record_runtime_version: true
+  notes: OpenViking memory checks should target the latest official release tag by default.
 entry:
   case_builder: scripts/build_tasks.py
 dataset:

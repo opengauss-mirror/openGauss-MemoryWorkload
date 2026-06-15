@@ -137,6 +137,29 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 
 ## 5. 关键边界
 
+### 5.0 Skill manifest 的版本策略
+
+所有 benchmark skill 与 agent skill 都必须在 `manifest.yaml` 中声明结构化 `version_policy`，至少包含：
+
+- `default_selection = latest_official_release_tag`
+- `allowed_overrides`
+- `disallowed_defaults`
+- `record_runtime_version`
+
+这条规则的目的不是立即替平台自动解析最新 tag，而是先把“默认版本来源”沉淀为可校验、可审计的机器可读协议，避免版本约束只散落在 `README` 或 `SKILL.md` 中。
+
+默认策略：
+
+- 优先用户指定的正式版本
+- 否则使用上游当前最新正式 release tag
+- 仅在已有验证结论时回退到旧正式 tag
+
+不允许平台默认选择：
+
+- `dirty worktree`
+- `dev build`
+- `non-tag commit`
+
 ### 5.1 CaseSource 与 Workflow Core 的边界
 
 CaseSource 只负责“定义测试”：

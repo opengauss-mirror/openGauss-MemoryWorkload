@@ -8,6 +8,12 @@
 - Hermes 已完成基础模型配置
 - 若需要外部记忆，需先完成 `memory.provider` 配置并保证后端服务可用
 
+## 版本约束
+
+- 默认优先选择 Hermes 当前最新正式 release tag。
+- `manifest.yaml` 必须声明 `version_policy.default_selection=latest_official_release_tag`。
+- 如果使用非正式构建，必须在 run 记录中显式标记。
+
 ## 输入
 
 - `system_prompt`
