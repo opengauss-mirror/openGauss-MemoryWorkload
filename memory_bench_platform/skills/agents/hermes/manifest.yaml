@@ -19,9 +19,10 @@ version_policy:
   targets:
     - name: hermes
       scope: system_under_test
+      upstream: https://github.com/Integuru-AI/hermes-agent
       record_runtime_version: true
   record_runtime_version: true
-  notes: Hermes runs should prefer the latest official CLI release tag when one exists.
+  notes: Hermes runs should use the latest official release tag by default and record the concrete runtime version in the run archive.
 entry:
   runner: scripts/run_task.py
   healthcheck: scripts/healthcheck.py

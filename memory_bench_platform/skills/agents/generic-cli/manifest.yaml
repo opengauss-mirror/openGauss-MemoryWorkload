@@ -21,7 +21,7 @@ version_policy:
       scope: system_under_test
       record_runtime_version: true
   record_runtime_version: true
-  notes: If the wrapped CLI has no release tag concept, the run must record the concrete binary or commit source explicitly.
+  notes: If the wrapped CLI has no official release tag concept, the run must record the concrete binary, package version, or commit source explicitly.
 entry:
   runner: scripts/run_task.py
   healthcheck: scripts/healthcheck.py

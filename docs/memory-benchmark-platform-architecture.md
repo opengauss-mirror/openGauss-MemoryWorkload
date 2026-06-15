@@ -146,6 +146,7 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 - `allowed_overrides`
 - `disallowed_defaults`
 - `targets`
+- `targets[].upstream`
 - `record_runtime_version`
 
 这条规则的目的不是立即替平台自动解析最新 tag，而是先把“默认版本来源”沉淀为可校验、可审计的机器可读协议，避免版本约束只散落在 `README` 或 `SKILL.md` 中。
@@ -162,6 +163,8 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 - 被测 agent
 - memory backend
 - 运行时依赖
+
+`targets[].upstream` 用来明确“最新正式 tag 到底去哪里取”，避免 skill 只表达了策略，却没有表达解析来源。对接平台的 skill 应默认把上游 release/tag 源写清楚；如果没有标准 upstream，则必须在 run 记录里显式保存实际二进制、commit 或制品来源。
 
 例如：
 

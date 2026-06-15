@@ -19,9 +19,10 @@ version_policy:
   targets:
     - name: locomo-benchmark
       scope: benchmark_tooling
+      upstream: https://github.com/snap-research/locomo
       record_runtime_version: true
   record_runtime_version: true
-  notes: External LoCoMo runners should prefer latest official release tags for the tested agent stack.
+  notes: Resolve the latest official LoCoMo benchmark tag by default, and require the paired agent stack to follow its own latest-tag policy unless the run explicitly overrides it.
 entry:
   case_builder: scripts/build_tasks.py
   validator: scripts/validate.py

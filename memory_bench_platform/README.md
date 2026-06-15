@@ -97,6 +97,8 @@ python3 -m memory_bench_platform.cli validate \
 - `version_policy` should not only say "use latest tag"; it should also declare:
   - `resolution_order`: the concrete fallback order
   - `targets`: which software components are governed by this policy
+  - `targets[].upstream`: where the platform should resolve the latest official tag for each governed component
+  - `record_runtime_version`: whether the resolved runtime version must be archived
 
 Recommended priority:
 
@@ -125,7 +127,9 @@ version_policy:
   targets:
     - name: openclaw
       scope: system_under_test
+      upstream: https://github.com/coding-guy/openclaw
     - name: openviking
       scope: memory_backend
+      upstream: https://github.com/xforce-io/openviking
   record_runtime_version: true
 ```

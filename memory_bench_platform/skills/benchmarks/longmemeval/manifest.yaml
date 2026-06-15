@@ -19,9 +19,10 @@ version_policy:
   targets:
     - name: longmemeval-benchmark
       scope: benchmark_tooling
+      upstream: https://github.com/xiaowu0162/LongMemEval
       record_runtime_version: true
   record_runtime_version: true
-  notes: LongMemEval integrations should default to latest official release tags of the tested software stack.
+  notes: Resolve the latest official LongMemEval tag by default, and require the paired agent stack to follow its own latest-tag policy unless the run explicitly overrides it.
 entry:
   case_builder: scripts/build_tasks.py
   validator: scripts/validate.py

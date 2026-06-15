@@ -19,12 +19,14 @@ version_policy:
   targets:
     - name: openclaw
       scope: system_under_test
+      upstream: https://github.com/coding-guy/openclaw
       record_runtime_version: true
     - name: openviking
       scope: memory_backend
+      upstream: https://github.com/xforce-io/openviking
       record_runtime_version: true
   record_runtime_version: true
-  notes: OpenClaw skill should record both OpenClaw and dependent OpenViking runtime tags.
+  notes: Default to latest official release tags for both OpenClaw and OpenViking, and record the resolved runtime versions in every real run.
 entry:
   runner: scripts/run_task.py
   healthcheck: scripts/healthcheck.py

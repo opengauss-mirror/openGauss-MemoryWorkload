@@ -19,9 +19,10 @@ version_policy:
   targets:
     - name: openviking
       scope: system_under_test
+      upstream: https://github.com/xforce-io/openviking
       record_runtime_version: true
   record_runtime_version: true
-  notes: OpenViking admin-memory checks should run against the latest official release tag by default.
+  notes: OpenViking admin-memory checks should run against the latest official release tag by default and record the resolved runtime version in the run archive.
 entry:
   case_builder: scripts/build_tasks.py
 dataset:
