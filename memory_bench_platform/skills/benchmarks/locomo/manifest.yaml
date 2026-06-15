@@ -15,5 +15,7 @@ execution:
   entrypoints:
     official_small:
       external_runner: ../../../../tools/test_entrypoints/run_official_locomo_small.sh
+    official_sample0:
+      external_runner: ../../../../tools/test_entrypoints/run_official_locomo_sample.sh
 judging:
   mode: external

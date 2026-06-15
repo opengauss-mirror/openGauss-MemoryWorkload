@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAMPLE="${SAMPLE:?SAMPLE is required}"
+SAMPLE="${SAMPLE:-0}"
 SESSIONS="${SESSIONS:-1-19}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

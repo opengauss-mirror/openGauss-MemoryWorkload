@@ -23,6 +23,12 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
                         "updated_at": "2026-06-15T09:15:22.500Z",
                         "llm_token_usage": {"total_tokens": 100},
                         "embedding_token_usage": {"total_tokens": 20},
+                        "_ov_task": {
+                            "task_id": "task-1",
+                            "status": "completed",
+                            "created_at_iso": "2026-06-15T09:15:10+00:00",
+                            "updated_at_iso": "2026-06-15T09:15:21+00:00",
+                        },
                     }
                 },
                 "wm_preprocess": {
@@ -31,9 +37,11 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
                     "metrics": {"selected_span_count": 4, "selected_span_tokens_est": 120},
                 },
                 "telemetry_summary": {
+                    "duration_ms": 842.3,
+                    "operation": "session_commit_phase2",
+                    "status": "ok",
                     "memory": {
                         "extract": {
-                            "duration_ms": 842.3,
                             "stages": {
                                 "llm_extract_ms": 410.2,
                             },
@@ -59,9 +67,11 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
     assert report["ingest_session_count"] == 1
     assert report["question_count"] == 1
     assert "ov.session.commit.total_ms" in report["duration_distributions"]
+    assert "ov.commit.task.total_ms" in report["duration_distributions"]
+    assert "ov.commit.phase2.total_ms" in report["duration_distributions"]
     assert "ov.session.window_ms" in report["duration_distributions"]
     assert "agent.qa.total_ms" in report["duration_distributions"]
-    assert "ov.memory.extract.total_ms" in report["duration_distributions"]
+    assert "ov.memory.extract.stage.llm_extract_ms" in report["duration_distributions"]
     assert report["token_summary"]["ingest"]["ov_llm_total_tokens"] == 100
     assert report["wm_preprocess_summary"]["selected_span_count_total"] == 4
     html = render_official_small_timing_html(report)

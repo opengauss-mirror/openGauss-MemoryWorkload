@@ -9,6 +9,8 @@ from typing import Any
 
 
 EXPECTED_DURATION_LABELS = {
+    "ov.commit.task.total_ms",
+    "ov.commit.phase2.total_ms",
     "ov.session.commit.total_ms",
     "ov.session.window_ms",
     "ov.memory.extract.total_ms",
@@ -62,6 +64,21 @@ def _parse_iso8601(value: str | None) -> datetime | None:
         return None
 
 
+def _parse_task_timestamp(task: dict[str, Any], prefix: str) -> datetime | None:
+    iso_value = task.get(f"{prefix}_at_iso")
+    if isinstance(iso_value, str):
+        parsed = _parse_iso8601(iso_value)
+        if parsed:
+            return parsed
+    raw = task.get(prefix)
+    try:
+        if raw is not None:
+            return datetime.fromtimestamp(float(raw))
+    except (TypeError, ValueError, OSError):
+        return None
+    return None
+
+
 def _quantiles(values: list[float]) -> dict[str, float]:
     if not values:
         return {
@@ -94,7 +111,7 @@ def _walk_duration_values(value: Any, prefix: str = "") -> list[tuple[str, float
         return rows
     if value is None:
         return rows
-    if not prefix.endswith("duration_ms"):
+    if not (prefix.endswith("duration_ms") or prefix.endswith("_ms")):
         return rows
     try:
         rows.append((prefix, float(value)))
@@ -151,6 +168,24 @@ def _build_duration_events(meta: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
         ov_detail = ((row.get("ov_observation") or {}).get("detail") or {}) if isinstance(row.get("ov_observation"), dict) else {}
+        ov_task = ov_detail.get("_ov_task") if isinstance(ov_detail.get("_ov_task"), dict) else {}
+        task_created = _parse_task_timestamp(ov_task, "created")
+        task_updated = _parse_task_timestamp(ov_task, "updated")
+        if task_created and task_updated:
+            events.append(
+                {
+                    "label": "ov.commit.task.total_ms",
+                    "scope": "ingest_session",
+                    "entity_id": f"session_{session_idx}",
+                    "duration_ms": round((task_updated - task_created).total_seconds() * 1000.0, 3),
+                    "source": "phaseA_meta.ov_observation.detail._ov_task.created_at/updated_at",
+                    "metadata": {
+                        "session_index": session_idx,
+                        "task_id": ov_task.get("task_id", ""),
+                        "task_status": ov_task.get("status", ""),
+                    },
+                }
+            )
         created_at = _parse_iso8601(ov_detail.get("created_at"))
         updated_at = _parse_iso8601(ov_detail.get("updated_at"))
         if created_at and updated_at:
@@ -165,7 +200,28 @@ def _build_duration_events(meta: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
         telemetry_summary = _telemetry_summary_from_row(row)
+        root_duration = telemetry_summary.get("duration_ms") if isinstance(telemetry_summary, dict) else None
+        if root_duration is not None:
+            try:
+                events.append(
+                    {
+                        "label": "ov.commit.phase2.total_ms",
+                        "scope": "ingest_session",
+                        "entity_id": f"session_{session_idx}",
+                        "duration_ms": round(float(root_duration), 3),
+                        "source": "phaseA_meta.telemetry_summary.duration_ms",
+                        "metadata": {
+                            "session_index": session_idx,
+                            "operation": telemetry_summary.get("operation", ""),
+                            "status": telemetry_summary.get("status", ""),
+                        },
+                    }
+                )
+            except (TypeError, ValueError):
+                pass
         for key, duration in _walk_duration_values(telemetry_summary):
+            if key == "duration_ms":
+                continue
             public_label = _public_duration_label(key, "ov")
             events.append(
                 {
@@ -193,7 +249,28 @@ def _build_duration_events(meta: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
         telemetry_summary = _telemetry_summary_from_row(row)
+        root_duration = telemetry_summary.get("duration_ms") if isinstance(telemetry_summary, dict) else None
+        if root_duration is not None:
+            try:
+                events.append(
+                    {
+                        "label": "qa.operation.total_ms",
+                        "scope": "qa_question",
+                        "entity_id": f"q{qi}",
+                        "duration_ms": round(float(root_duration), 3),
+                        "source": "phaseA_meta.qa_rows.telemetry_summary.duration_ms",
+                        "metadata": {
+                            "qi": qi,
+                            "operation": telemetry_summary.get("operation", ""),
+                            "status": telemetry_summary.get("status", ""),
+                        },
+                    }
+                )
+            except (TypeError, ValueError):
+                pass
         for key, duration in _walk_duration_values(telemetry_summary):
+            if key == "duration_ms":
+                continue
             public_label = _public_duration_label(key, "qa")
             events.append(
                 {
