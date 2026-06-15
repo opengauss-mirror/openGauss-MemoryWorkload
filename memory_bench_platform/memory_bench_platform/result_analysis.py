@@ -59,7 +59,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "source_artifacts": _source_artifacts(run_dir, external_result),
         "analysis_notes": _build_notes(summary, external_result, buckets, _read_ingest_summary(run_dir)),
     }
-    if (run_dir / "external_artifacts" / "official_small").exists():
+    if list((run_dir / "external_artifacts").glob("official_*")):
         try:
             analysis["chain_diagnostics"] = diagnose_official_small_run(run_dir)
         except FileNotFoundError:

@@ -130,6 +130,80 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert (run_dir / "reports" / "timing_report.html").is_file()
 
 
+def test_analyze_run_writes_timing_report_for_official_sample0(tmp_path: Path):
+    run_dir = tmp_path / "run-sample0"
+    _build_minimal_run(run_dir)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "source_id": "locomo:official_sample0",
+                "source_kind": "external_benchmark_runner",
+                "agent_id": "openclaw",
+                "status": "passed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    remote_logs = run_dir / "external_artifacts" / "official_sample0" / "remote_logs"
+    remote_logs.mkdir(parents=True, exist_ok=True)
+    (remote_logs / "sample0.master.log").write_text(
+        "[phaseA][session 1/19][direct-ov] session_1 task=t1 session_id=s1 memories=3\n",
+        encoding="utf-8",
+    )
+    artifacts = run_dir / "external_artifacts" / "official_sample0"
+    (artifacts / "phaseA_on_19sessions_run-sample0_meta.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "plugin_namespace_config": {"final": {}},
+                "ingest_sessions": [
+                    {
+                        "index": 1,
+                        "compact_elapsed_seconds": 3.0,
+                        "ov_observation": {
+                            "detail": {
+                                "created_at": "2026-06-15T18:00:00.000Z",
+                                "updated_at": "2026-06-15T18:00:04.000Z",
+                                "llm_token_usage": {"total_tokens": 80},
+                                "_ov_task": {
+                                    "created_at": "2026-06-15T18:00:01.000Z",
+                                    "updated_at": "2026-06-15T18:00:03.000Z",
+                                    "result": {
+                                        "telemetry_summary": {
+                                            "operation": "session_commit_phase2",
+                                            "duration_ms": 2000,
+                                        }
+                                    },
+                                },
+                            }
+                        },
+                    }
+                ],
+                "qa_rows": [
+                    {
+                        "qi": 109,
+                        "question": "Q109",
+                        "response": "A109",
+                        "elapsed_seconds": 6.0,
+                        "usage": {"total_tokens": 120},
+                    }
+                ],
+                "ov_log_tail": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    analysis = analyze_run(run_dir)
+
+    assert analysis["timing_report"]["duration_label_count"] >= 1
+    assert (run_dir / "reports" / "timing_report.json").is_file()
+    assert (run_dir / "reports" / "timing_report.html").is_file()
+
+
 def test_analyze_run_tolerates_missing_cpu_monitor_file(tmp_path: Path):
     run_dir = tmp_path / "run-2"
     _build_minimal_run(run_dir)

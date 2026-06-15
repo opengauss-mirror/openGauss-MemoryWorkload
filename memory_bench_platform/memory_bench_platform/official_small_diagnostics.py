@@ -8,15 +8,24 @@ from pathlib import Path
 from typing import Any
 
 
-def _load_meta(run_dir: Path) -> dict[str, Any]:
-    candidates = sorted((run_dir / "external_artifacts" / "official_small").glob("phaseA*_meta.json"))
+def _official_artifacts_dir(run_dir: Path) -> Path:
+    root = run_dir / "external_artifacts"
+    candidates = []
+    for child in sorted(root.glob("official_*")):
+        if child.is_dir() and list(child.glob("phaseA*_meta.json")):
+            candidates.append(child)
     if not candidates:
         raise FileNotFoundError(f"phaseA meta not found under {run_dir}")
+    return candidates[0]
+
+
+def _load_meta(run_dir: Path) -> dict[str, Any]:
+    candidates = sorted(_official_artifacts_dir(run_dir).glob("phaseA*_meta.json"))
     return json.loads(candidates[0].read_text(encoding="utf-8"))
 
 
 def _load_master_log(run_dir: Path) -> str:
-    candidates = sorted((run_dir / "external_artifacts" / "official_small" / "remote_logs").glob("*.master.log"))
+    candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob("*.master.log"))
     return candidates[0].read_text(encoding="utf-8", errors="ignore") if candidates else ""
 
 
