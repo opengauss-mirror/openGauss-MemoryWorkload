@@ -53,6 +53,21 @@ Expected run artifacts:
 - `reports/summary.json`
 - `reports/case_results.json`
 - `reports/external_result_summary.json`
+- `reports/analysis.json`
+- `reports/analysis.md`
+
+## Result Analysis
+
+Analyze an existing run directory:
+
+```bash
+python3 -m memory_bench_platform.cli analyze-run --run-dir /path/to/run
+```
+
+Every successful `run` command also writes:
+
+- `reports/analysis.json`
+- `reports/analysis.md`
 
 ## External Integration Examples
 
@@ -69,3 +84,18 @@ python3 -m memory_bench_platform.cli validate \
   --vlm-model doubao-seed-2.0-pro \
   --embedding-model doubao-embedding-vision
 ```
+
+## Version Policy
+
+- For real benchmark integrations, default to the latest official release tag of the tested software.
+- Do not default to:
+  - dirty worktrees
+  - dev builds
+  - unpublished local commits
+- If a run uses a non-release build, record that explicitly in the run conclusion or analysis report.
+
+Recommended priority:
+
+1. User-specified official version
+2. Latest upstream official release tag
+3. Verified fallback release tag

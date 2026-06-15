@@ -13,6 +13,7 @@ from .integration import (
     build_cases_from_source,
     execute_external_runner,
     resolve_benchmark_entrypoint,
+    score_benchmark_run,
     validate_agent,
     validate_benchmark,
 )
@@ -20,6 +21,7 @@ from .loader import load_all_skills
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
 from .protocol import CaseRecord, ExecutionSpec, ReportSummary, RunRecord, StepRecord
+from .result_analysis import analyze_run
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .resource_monitor import ResourceMonitor
 from .storage import RunStorage
@@ -60,6 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate.add_argument("--vlm-model", default="doubao-seed-2.0-pro")
     p_validate.add_argument("--embedding-model", default="doubao-embedding-vision")
 
+    p_analyze = sub.add_parser("analyze-run")
+    p_analyze.add_argument("--run-dir", required=True)
+
+    p_score = sub.add_parser("score-run")
+    p_score.add_argument("--benchmark", required=True)
+    p_score.add_argument("--run-dir", required=True)
+    p_score.add_argument("--data-path")
+
     return parser
 
 
@@ -73,6 +83,41 @@ def _plan_from_args(args: argparse.Namespace):
         data_path=args.data_path,
     )
     return build_run_plan(request)
+
+
+def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step_results: list) -> list[dict]:
+    case_map = {case.case_id: case for case in cases}
+
+    rows: list[dict] = []
+    for judge in judge_results:
+        case = case_map.get(judge.case_id)
+        matched_results = [item for item in step_results if item.step_id.startswith(f"{judge.case_id}-")]
+        response = ""
+        if matched_results:
+            structured = matched_results[-1].structured_output
+            response = (
+                str(structured.get("agent_answer") or structured.get("text_output") or structured.get("stdout_text") or "")
+            )
+            raw = structured.get("raw", {}) if isinstance(structured, dict) else {}
+            raw_stderr = str(raw.get("stderr", "") or "") if isinstance(raw, dict) else ""
+        else:
+            raw_stderr = ""
+        reference = case.reference if case else {}
+        rows.append(
+            {
+                "case_id": judge.case_id,
+                "question": str(reference.get("question", "")),
+                "expected_answer": str(reference.get("expected_answer", "")),
+                "response": response,
+                "category": str(reference.get("category", "") or reference.get("question_type", "")),
+                "error_detail": raw_stderr or (matched_results[-1].gate_detail if matched_results else ""),
+                "label": judge.label,
+                "passed": judge.passed,
+                "score": judge.score,
+                "rationale": judge.rationale,
+            }
+        )
+    return rows
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -104,6 +149,17 @@ def main(argv: list[str] | None = None) -> None:
                 vlm_model=args.vlm_model,
                 embedding_model=args.embedding_model,
             )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "analyze-run":
+        run_dir = Path(args.run_dir)
+        analyze_run(run_dir)
+        print(str(run_dir))
+        return
+
+    if args.command == "score-run":
+        payload = score_benchmark_run(args.benchmark, Path(args.run_dir), args.data_path)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
@@ -193,10 +249,11 @@ def main(argv: list[str] | None = None) -> None:
                     status="passed" if runner_result["status"] == "passed" else "failed",
                     case_total=imported["summary"]["total_questions"],
                     case_passed=imported["summary"]["total_correct"],
-                    case_failed=imported["summary"]["total_graded"] - imported["summary"]["total_correct"],
+                    case_failed=imported["summary"]["total_questions"] - imported["summary"]["total_correct"],
                     resource_summary={
                         "token_totals": imported["summary"].get("token_totals", {}),
                         "memory_token_totals": imported["summary"].get("memory_token_totals", {}),
+                        "ungraded_count": imported["summary"].get("ungraded_count", 0),
                     },
                     category_summary=imported["summary"].get("accuracy_by_category", {}),
                 )
@@ -229,6 +286,7 @@ def main(argv: list[str] | None = None) -> None:
         storage.write_run_record(run_dir, run_record)
         write_summary(run_dir, summary_record.model_dump(mode="json"))
         write_case_results(run_dir, case_results)
+        analyze_run(run_dir)
         print(str(run_dir))
         return
 
@@ -306,8 +364,9 @@ def main(argv: list[str] | None = None) -> None:
     write_summary(run_dir, summary_record.model_dump(mode="json"))
     write_case_results(
         run_dir,
-        [item.model_dump(mode="json") for item in judge_results],
+        _extract_case_result_rows(cases, judge_results, workflow_output["step_results"]),
     )
+    analyze_run(run_dir)
     print(str(run_dir))
 
 

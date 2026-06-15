@@ -15,6 +15,9 @@ def test_locomo_task_builder_reads_workspace_dataset():
     assert "reference" in first_case
     assert "expected_answer" in first_case["reference"]
     assert first_step["case_id"] == first_case["case_id"]
+    assert first_step["inputs"]["system_prompt"]
+    assert len(first_step["inputs"]["messages"]) >= 2
+    assert "session_1" in first_step["inputs"]["messages"][0]["content"]
 
 
 def test_locomo_task_builder_reads_all_samples():

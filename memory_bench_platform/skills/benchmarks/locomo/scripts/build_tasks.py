@@ -5,6 +5,28 @@ import sys
 from pathlib import Path
 
 
+def _format_conversation(sample: dict) -> str:
+    conv = sample.get("conversation", {})
+    lines = [
+        "You are answering a LoCoMo memory question.",
+        f"Speaker A: {conv.get('speaker_a', '')}",
+        f"Speaker B: {conv.get('speaker_b', '')}",
+    ]
+    for idx in range(1, 5):
+        date_key = f"session_{idx}_date_time"
+        sess_key = f"session_{idx}"
+        session = conv.get(sess_key, [])
+        if not session:
+            continue
+        lines.append(f"{sess_key} @ {conv.get(date_key, '')}")
+        for turn in session:
+            speaker = str(turn.get("speaker", ""))
+            text = str(turn.get("text", ""))
+            dia_id = str(turn.get("dia_id", ""))
+            lines.append(f"[{dia_id}] {speaker}: {text}")
+    return "\n".join(lines)
+
+
 def build_tasks(data_path: Path) -> dict:
     raw = json.loads(data_path.read_text(encoding="utf-8"))
     cases = []
@@ -47,7 +69,11 @@ def build_tasks(data_path: Path) -> dict:
                     "timeout_seconds": 90,
                     "gate_policy": "hard",
                     "inputs": {
-                        "question": question,
+                        "system_prompt": "Answer the question using only the provided multi-session conversation history. If the history is insufficient, abstain conservatively.",
+                        "messages": [
+                            {"role": "user", "content": _format_conversation(sample)},
+                            {"role": "user", "content": question},
+                        ],
                         "metadata": {"sample_id": sample_id, "agent_id": "locomo-eval"},
                     },
                 }

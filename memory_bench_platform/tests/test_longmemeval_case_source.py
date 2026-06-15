@@ -28,6 +28,10 @@ def test_longmemeval_case_source_parses_official_shape(tmp_path: Path):
     assert payload["cases"][0]["case_id"] == "q-001"
     assert payload["cases"][0]["reference"]["expected_answer"] == "In March 2024."
     assert payload["steps"][0]["step_id"] == "q-001-agent-query"
+    assert payload["steps"][0]["inputs"]["system_prompt"]
+    assert len(payload["steps"][0]["inputs"]["messages"]) >= 2
+    assert "2024-03-01" in payload["steps"][0]["inputs"]["messages"][0]["content"]
+    assert payload["steps"][0]["inputs"]["messages"][-1]["content"] == "When did the user switch jobs?"
 
     validation = validate(data_path)
     assert validation["status"] == "ok"

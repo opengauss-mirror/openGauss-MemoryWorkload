@@ -1,0 +1,15 @@
+kind: agent
+id: hermes
+version: 0.1.0
+entry:
+  runner: scripts/run_task.py
+  healthcheck: scripts/healthcheck.py
+runtime:
+  mode: process
+io:
+  protocol_mode: stateless_cli
+lifecycle:
+  startup_required: false
+collection:
+  stdout: true
+  stderr: true

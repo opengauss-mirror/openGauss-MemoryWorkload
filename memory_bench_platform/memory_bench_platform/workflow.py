@@ -38,9 +38,16 @@ def _extract_text_answer(structured_output: dict[str, object]) -> str:
 
 def _execute_step_operator(step: StepRecord, agent_id: str) -> dict:
     if step.operator_kind == "agent":
+        messages = step.inputs.get("messages")
+        if not isinstance(messages, list) or not messages:
+            messages = [{"role": "user", "content": str(step.inputs.get("question", ""))}]
         rendered = RenderedTaskInput(
             task_id=step.step_id,
-            messages=[{"role": "user", "content": str(step.inputs.get("question", ""))}],
+            system_prompt=str(step.inputs.get("system_prompt")) if step.inputs.get("system_prompt") else None,
+            messages=messages,
+            attachments=[str(item) for item in step.inputs.get("attachments", [])]
+            if isinstance(step.inputs.get("attachments", []), list)
+            else [],
             metadata=step.inputs.get("metadata", {}),
         )
         return run_agent_task(agent_id, rendered)

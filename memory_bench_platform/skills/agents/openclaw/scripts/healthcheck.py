@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 
@@ -26,8 +27,15 @@ def version_gte(left: tuple[int, int, int] | None, right: tuple[int, int, int]) 
     return left >= right
 
 
+def resolve_openclaw_bin() -> str | None:
+    custom = os.environ.get("OPENCLAW_BIN")
+    if custom:
+        return custom
+    return shutil.which("openclaw")
+
+
 def main() -> None:
-    binary = shutil.which("openclaw")
+    binary = resolve_openclaw_bin()
     if not binary:
         print(json.dumps({"status": "missing", "binary": None}, ensure_ascii=False))
         return

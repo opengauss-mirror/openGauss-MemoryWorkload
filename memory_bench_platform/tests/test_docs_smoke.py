@@ -7,3 +7,4 @@ def test_readme_mentions_mvp_matrix():
     assert "LongMemEval" in text
     assert "OpenClaw" in text
     assert "Generic CLI Agent" in text
+    assert "Result Analysis" in text

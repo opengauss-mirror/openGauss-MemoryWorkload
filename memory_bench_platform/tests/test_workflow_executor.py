@@ -215,3 +215,61 @@ def test_builtin_judge_can_target_expected_step(monkeypatch, tmp_path: Path):
         run_dir=tmp_path,
     )
     assert output["judge_results"][0].passed is True
+
+
+def test_agent_operator_passes_full_rendered_input_contract(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_run_agent_task(skill_id: str, rendered_input):
+        captured["skill_id"] = skill_id
+        captured["task_id"] = rendered_input.task_id
+        captured["system_prompt"] = rendered_input.system_prompt
+        captured["messages"] = rendered_input.messages
+        captured["attachments"] = rendered_input.attachments
+        captured["metadata"] = rendered_input.metadata
+        return {"status": "ok", "turns": [{"text": "ok"}]}
+
+    monkeypatch.setattr("memory_bench_platform.workflow.run_agent_task", fake_run_agent_task)
+
+    case = CaseRecord(
+        case_id="case-rendered-input",
+        run_id="run-1",
+        title="rendered input",
+        goal="pass full rendered task input",
+        capability="memory/question-answering",
+        reference={"expected_answer": "ok"},
+    )
+    step = StepRecord(
+        step_id="step-rendered-input",
+        case_id="case-rendered-input",
+        name="agent_query",
+        operator_kind="agent",
+        gate_policy="hard",
+        inputs={
+            "system_prompt": "Use the provided history to answer.",
+            "messages": [
+                {"role": "user", "content": "history turn 1"},
+                {"role": "assistant", "content": "history turn 2"},
+                {"role": "user", "content": "final question"},
+            ],
+            "attachments": ["artifacts/history.json"],
+            "metadata": {"question_id": "q-1", "agent_id": "memory-eval"},
+        },
+    )
+    output = execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[case],
+        steps=[step],
+        execution_spec=ExecutionSpec(fail_fast=True),
+        run_dir=tmp_path,
+    )
+
+    assert captured["skill_id"] == "generic-cli"
+    assert captured["task_id"] == "step-rendered-input"
+    assert captured["system_prompt"] == "Use the provided history to answer."
+    assert captured["messages"][0]["content"] == "history turn 1"
+    assert captured["messages"][-1]["content"] == "final question"
+    assert captured["attachments"] == ["artifacts/history.json"]
+    assert captured["metadata"]["question_id"] == "q-1"
+    assert output["judge_results"][0].passed is True

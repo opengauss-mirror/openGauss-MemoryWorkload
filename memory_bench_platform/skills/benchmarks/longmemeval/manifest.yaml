@@ -4,6 +4,7 @@ version: 0.1.0
 entry:
   case_builder: scripts/build_tasks.py
   validator: scripts/validate.py
+  scorer: scripts/score_predictions.py
 dataset:
   default_split: dev
 execution:

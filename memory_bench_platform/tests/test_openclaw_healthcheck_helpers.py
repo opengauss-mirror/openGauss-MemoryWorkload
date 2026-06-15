@@ -1,4 +1,4 @@
-from skills.agents.openclaw.scripts.healthcheck import parse_version_tuple, version_gte
+from skills.agents.openclaw.scripts.healthcheck import parse_version_tuple, resolve_openclaw_bin, version_gte
 
 
 def test_parse_version_tuple_understands_openclaw_version_string():
@@ -8,3 +8,8 @@ def test_parse_version_tuple_understands_openclaw_version_string():
 def test_version_gte_handles_minimum_plugin_requirement():
     assert version_gte((2026, 4, 8), (2026, 4, 8)) is True
     assert version_gte((2026, 3, 12), (2026, 4, 8)) is False
+
+
+def test_resolve_openclaw_bin_prefers_env_override(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_BIN", "/tmp/remote-openclaw")
+    assert resolve_openclaw_bin() == "/tmp/remote-openclaw"

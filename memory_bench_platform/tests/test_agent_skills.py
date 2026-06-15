@@ -17,3 +17,11 @@ def test_generic_cli_manifest_declares_process_runtime():
     )
     assert manifest["runtime"]["mode"] == "process"
     assert manifest["io"]["protocol_mode"] == "stateless_cli"
+
+
+def test_hermes_manifest_declares_process_runtime():
+    manifest = yaml.safe_load(
+        Path("skills/agents/hermes/manifest.yaml").read_text(encoding="utf-8")
+    )
+    assert manifest["runtime"]["mode"] == "process"
+    assert manifest["io"]["protocol_mode"] == "stateless_cli"

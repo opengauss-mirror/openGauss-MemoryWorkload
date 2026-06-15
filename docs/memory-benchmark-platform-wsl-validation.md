@@ -408,6 +408,27 @@ python3 -m memory_bench_platform.cli run \
   - 可导入既有 `official_small` 产物并生成平台 `summary.json` / `case_results.json`
 - `memory_bench_platform` external runner from-scratch
   - 可从零发起 `official_small`，完整落回 `external_artifacts`，并生成平台 `summary.json` / `case_results.json`
+- 统一结果分析模块
+  - 已支持离线 `analyze-run`
+  - 已在 `run` 主流程结束后自动生成 `reports/analysis.json` / `reports/analysis.md`
+  - 已对真实 `locomo-openclaw-fromscratch-full` 产出分析结果：
+    - `overall_accuracy = 0.2`
+    - `retrieval_miss_count = 28`
+    - `judge_mismatch_candidate_count = 0`
+  - 已对本地 `ovtest-health-analysis-smoke` 产出自动分析结果，并提取 CPU 摘要
+- LongMemEval 最小集
+  - 已支持将完整 timestamped history 通过 benchmark skill 显式注入 agent
+  - 已通过 `openclaw + OpenViking` 跑通最小集：
+    - run: `runs/longmemeval-openclaw-min2-v2`
+    - `score-run --benchmark longmemeval` 可产出 `scoring_mode = llm`
+    - 当前最小集 LLM scorer 结果为 `2/2`
+- HermesAgent + OpenViking
+  - 已新增 `hermes` agent skill
+  - 已确认 `Hermes` 在 `minimax-cn` + OpenViking provider 条件下可返回非空回答
+  - 已通过 `LoCoMo` 最小集跑到真实回答阶段：
+    - run: `runs/locomo-hermes-min1-v6`
+    - `score-run --benchmark locomo` 可产出 `scoring_mode = llm`
+    - 当前最小集 LLM scorer 结果为 `1/1`
 
 ### 已验证失败 / 仍有限制
 

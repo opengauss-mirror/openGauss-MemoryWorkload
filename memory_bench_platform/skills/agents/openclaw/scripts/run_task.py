@@ -25,6 +25,29 @@ def _extract_message(request: dict) -> str:
     raise ValueError("RenderedTaskInput must contain at least one user message")
 
 
+def build_openclaw_message(request: dict) -> str:
+    system_prompt = str(request.get("system_prompt", "") or "").strip()
+    messages = request.get("messages", [])
+    attachments = request.get("attachments", [])
+    lines: list[str] = []
+    if system_prompt:
+        lines.append("System instructions:")
+        lines.append(system_prompt)
+        lines.append("")
+    lines.append("Conversation:")
+    for message in messages:
+        role = str(message.get("role", "user"))
+        content = str(message.get("content", ""))
+        lines.append(f"[{role}] {content}")
+    if attachments:
+        lines.append("")
+        lines.append("Attachments:")
+        for item in attachments:
+            lines.append(f"- {item}")
+    rendered = "\n".join(lines).strip()
+    return rendered or _extract_message(request)
+
+
 def build_openclaw_command(request: dict) -> list[str]:
     metadata = request.get("metadata", {})
     agent_id = metadata.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID")
@@ -34,7 +57,7 @@ def build_openclaw_command(request: dict) -> list[str]:
     if not any([agent_id, session_key, session_id, target]):
         raise ValueError("OpenClaw runner needs one of agent_id, session_key, session_id, or to")
 
-    cmd = [_resolve_openclaw_bin(), "agent", "--message", _extract_message(request), "--json"]
+    cmd = [_resolve_openclaw_bin(), "agent", "--message", build_openclaw_message(request), "--json"]
     if agent_id:
         cmd += ["--agent", str(agent_id)]
     if session_key:

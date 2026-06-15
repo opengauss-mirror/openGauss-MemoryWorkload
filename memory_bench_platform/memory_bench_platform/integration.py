@@ -92,6 +92,17 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
     )
 
 
+def score_benchmark_run(skill_id: str, run_dir: Path, source_path: str | None = None) -> dict:
+    manifest = get_benchmark_manifest(skill_id)
+    manifest_path = _manifest_path("benchmarks", skill_id)
+    if not manifest.entry.scorer:
+        raise ValueError(f"benchmark skill {skill_id} has no scorer")
+    args = [str(run_dir)]
+    if source_path:
+        args.append(source_path)
+    return run_json_script(_script_for_manifest(manifest_path, manifest.entry.scorer), args=args)
+
+
 def classify_entrypoint(entry: dict[str, Any]) -> str:
     if entry.get("external_runner"):
         return "external_runner"
