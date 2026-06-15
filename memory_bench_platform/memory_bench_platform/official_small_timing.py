@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,9 @@ EXPECTED_DURATION_LABELS = {
     "ov.commit.phase2.total_ms",
     "ov.session.commit.total_ms",
     "ov.session.window_ms",
+    "ov.embedding.async.wait_ms",
+    "ov.embedding.async.duration_ms",
+    "ov.session.commit.phase2.wait_for_request_ms",
     "ov.memory.extract.total_ms",
     "ov.memory.extract.stage.prepare_inputs_ms",
     "ov.memory.extract.stage.llm_extract_ms",
@@ -24,9 +28,23 @@ EXPECTED_DURATION_LABELS = {
     "ov.memory.extract.stage.create_relations_ms",
     "ov.memory.extract.stage.flush_semantic_ms",
     "ov.search.target_abstract_ms",
+    "ov.search.find.total_ms",
+    "ov.search.search.total_ms",
     "ov.search.intent_analysis_ms",
     "ov.search.embed_query_ms",
     "ov.search.vector_retrieval_ms",
+    "ov.storage.read_file.messages_jsonl_ms",
+    "ov.storage.read_file.session_meta_json_ms",
+    "ov.storage.read_file.archive_meta_json_ms",
+    "ov.storage.read_file.archive_abstract_md_ms",
+    "ov.storage.read_file.archive_overview_md_ms",
+    "ov.storage.write_file.messages_jsonl_ms",
+    "ov.storage.write_file.session_meta_json_ms",
+    "ov.storage.write_file.archive_meta_json_ms",
+    "ov.storage.write_file.archive_abstract_md_ms",
+    "ov.storage.write_file.archive_overview_md_ms",
+    "ov.storage.write_file.archive_done_ms",
+    "ov.storage.write_file.archive_failed_json_ms",
     "agent.qa.total_ms",
 }
 
@@ -45,6 +63,21 @@ RAW_DURATION_KEY_MAP = {
     "search.intent_analysis.duration_ms": "ov.search.intent_analysis_ms",
     "search.embed_query.duration_ms": "ov.search.embed_query_ms",
     "search.vector_retrieval.duration_ms": "ov.search.vector_retrieval_ms",
+    "embedding.async.wait_ms": "ov.embedding.async.wait_ms",
+    "embedding.async.duration_ms": "ov.embedding.async.duration_ms",
+    "session.commit.phase2.wait_for_request.duration_ms": "ov.session.commit.phase2.wait_for_request_ms",
+    "storage.read_file.messages_jsonl.duration_ms": "ov.storage.read_file.messages_jsonl_ms",
+    "storage.read_file.session_meta_json.duration_ms": "ov.storage.read_file.session_meta_json_ms",
+    "storage.read_file.archive_meta_json.duration_ms": "ov.storage.read_file.archive_meta_json_ms",
+    "storage.read_file.archive_abstract_md.duration_ms": "ov.storage.read_file.archive_abstract_md_ms",
+    "storage.read_file.archive_overview_md.duration_ms": "ov.storage.read_file.archive_overview_md_ms",
+    "storage.write_file.messages_jsonl.duration_ms": "ov.storage.write_file.messages_jsonl_ms",
+    "storage.write_file.session_meta_json.duration_ms": "ov.storage.write_file.session_meta_json_ms",
+    "storage.write_file.archive_meta_json.duration_ms": "ov.storage.write_file.archive_meta_json_ms",
+    "storage.write_file.archive_abstract_md.duration_ms": "ov.storage.write_file.archive_abstract_md_ms",
+    "storage.write_file.archive_overview_md.duration_ms": "ov.storage.write_file.archive_overview_md_ms",
+    "storage.write_file.archive_done.duration_ms": "ov.storage.write_file.archive_done_ms",
+    "storage.write_file.archive_failed_json.duration_ms": "ov.storage.write_file.archive_failed_json_ms",
 }
 
 
@@ -62,6 +95,14 @@ def _official_artifacts_dir(run_dir: Path) -> Path:
 def _load_meta(run_dir: Path) -> dict[str, Any]:
     candidates = sorted(_official_artifacts_dir(run_dir).glob("phaseA*_meta.json"))
     return json.loads(candidates[0].read_text(encoding="utf-8"))
+
+
+_OV_LOG_TELEMETRY_RE = re.compile(r"OV_TELEMETRY_SUMMARY\s+(\{.*\})")
+
+
+def _ov_log_paths(run_dir: Path) -> list[Path]:
+    root = run_dir / "external_artifacts"
+    return sorted(path for path in root.glob("**/remote_logs/*.ov.log") if path.is_file())
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -294,6 +335,65 @@ def _build_duration_events(meta: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+def _search_root_duration_label(operation: str) -> str | None:
+    if operation == "search.find":
+        return "ov.search.find.total_ms"
+    if operation == "search.search":
+        return "ov.search.search.total_ms"
+    return None
+
+
+def _build_ov_log_duration_events(run_dir: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for log_path in _ov_log_paths(run_dir):
+        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            match = _OV_LOG_TELEMETRY_RE.search(line)
+            if not match:
+                continue
+            try:
+                payload = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            summary = payload.get("summary")
+            if not isinstance(summary, dict):
+                continue
+            operation = str(payload.get("operation") or summary.get("operation") or "")
+            if not operation.startswith("search."):
+                continue
+            telemetry_id = str(payload.get("telemetry_id") or "")
+            root_label = _search_root_duration_label(operation)
+            if root_label and summary.get("duration_ms") is not None:
+                try:
+                    events.append(
+                        {
+                            "label": root_label,
+                            "scope": "qa_search_request",
+                            "entity_id": telemetry_id or operation,
+                            "duration_ms": round(float(summary.get("duration_ms")), 3),
+                            "source": f"{log_path.name}:OV_TELEMETRY_SUMMARY",
+                            "metadata": {"operation": operation},
+                        }
+                    )
+                except (TypeError, ValueError):
+                    pass
+            for key, duration in _walk_duration_values(summary):
+                if key == "duration_ms":
+                    continue
+                events.append(
+                    {
+                        "label": _public_duration_label(key, "ov"),
+                        "scope": "qa_search_request",
+                        "entity_id": telemetry_id or operation,
+                        "duration_ms": round(duration, 3),
+                        "source": f"{log_path.name}:OV_TELEMETRY_SUMMARY",
+                        "metadata": {"operation": operation},
+                    }
+                )
+    return events
+
+
 def _build_token_summary(meta: dict[str, Any]) -> dict[str, Any]:
     ingest_llm_total = 0
     ingest_embedding_total = 0
@@ -352,6 +452,7 @@ def _build_wm_preprocess_summary(meta: dict[str, Any]) -> dict[str, Any]:
 def build_official_small_timing_report(run_dir: Path) -> dict[str, Any]:
     meta = _load_meta(run_dir)
     events = _build_duration_events(meta)
+    events.extend(_build_ov_log_duration_events(run_dir))
     by_label: dict[str, list[float]] = {}
     for event in events:
         by_label.setdefault(event["label"], []).append(float(event["duration_ms"]))

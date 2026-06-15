@@ -10,7 +10,9 @@ from memory_bench_platform.official_small_timing import (
 def test_build_official_small_timing_report_extracts_duration_events(tmp_path: Path):
     run_dir = tmp_path / "run"
     artifacts = run_dir / "external_artifacts" / "official_small"
+    remote_logs = artifacts / "remote_logs"
     artifacts.mkdir(parents=True)
+    remote_logs.mkdir(parents=True)
     meta = {
         "run_id": "demo-run",
         "ingest_sessions": [
@@ -40,13 +42,29 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
                     "duration_ms": 842.3,
                     "operation": "session_commit_phase2",
                     "status": "ok",
+                    "embedding": {
+                        "async": {
+                            "wait_ms": 6.0,
+                            "duration_ms": 18.5,
+                            "max_concurrent": 8,
+                        }
+                    },
                     "memory": {
                         "extract": {
                             "stages": {
                                 "llm_extract_ms": 410.2,
                             },
                         }
-                    }
+                    },
+                    "storage": {
+                        "read_file": {"messages_jsonl": {"duration_ms": 4.0}},
+                        "write_file": {"archive_done": {"duration_ms": 1.5}},
+                    },
+                    "session": {
+                        "commit": {
+                            "phase2": {"wait_for_request": {"duration_ms": 120.0}}
+                        }
+                    },
                 },
             }
         ],
@@ -60,6 +78,30 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
         ],
     }
     (artifacts / "phaseA_demo_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    (remote_logs / "demo.ov.log").write_text(
+        '\n'.join(
+            [
+                '2026-06-16 07:00:00 INFO openviking.telemetry.execution OV_TELEMETRY_SUMMARY '
+                + json.dumps(
+                    {
+                        "telemetry_id": "tele-1",
+                        "operation": "search.find",
+                        "summary": {
+                            "operation": "search.find",
+                            "duration_ms": 91.2,
+                            "search": {
+                                "embed_query": {"duration_ms": 11.3},
+                                "vector_retrieval": {"duration_ms": 55.4},
+                            },
+                            "embedding": {"async": {"wait_ms": 2.5, "duration_ms": 7.5}},
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     report = build_official_small_timing_report(run_dir)
 
@@ -72,6 +114,12 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
     assert "ov.session.window_ms" in report["duration_distributions"]
     assert "agent.qa.total_ms" in report["duration_distributions"]
     assert "ov.memory.extract.stage.llm_extract_ms" in report["duration_distributions"]
+    assert "ov.embedding.async.wait_ms" in report["duration_distributions"]
+    assert "ov.embedding.async.duration_ms" in report["duration_distributions"]
+    assert "ov.storage.read_file.messages_jsonl_ms" in report["duration_distributions"]
+    assert "ov.storage.write_file.archive_done_ms" in report["duration_distributions"]
+    assert "ov.session.commit.phase2.wait_for_request_ms" in report["duration_distributions"]
+    assert "ov.search.find.total_ms" in report["duration_distributions"]
     assert report["token_summary"]["ingest"]["ov_llm_total_tokens"] == 100
     assert report["wm_preprocess_summary"]["selected_span_count_total"] == 4
     html = render_official_small_timing_html(report)
