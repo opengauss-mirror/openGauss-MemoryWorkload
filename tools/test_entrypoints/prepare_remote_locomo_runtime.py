@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -14,6 +15,16 @@ def _run(cmd: list[str]) -> None:
 
 def _encode_file(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _remove_redundant_reindex_injection(phase_text: str) -> str:
+    """Keep only one reindex_memory_root shim and one wait_for_search_visibility signature."""
+
+    pattern = re.compile(
+        r"\ndef reindex_memory_root\([^\n]*\n(?:    .*?\n)+?\n(?=def wait_for_search_visibility\()",
+        re.MULTILINE,
+    )
+    return pattern.sub("\n", phase_text)
 
 
 def main() -> None:
@@ -47,6 +58,7 @@ def main() -> None:
 
         phase_path = benchmark_dir / "phase_a_off.py"
         phase_text = phase_path.read_text(encoding="utf-8")
+        phase_text = _remove_redundant_reindex_injection(phase_text)
         phase_text = phase_text.replace(
             '    updates: dict[str, Any] = {{\\n'
             '        "userId": user,\\n'
@@ -227,11 +239,13 @@ def main() -> None:
         )
         phase_text = phase_text.replace(
             '    qa_rows: list[dict[str, Any]] = load_existing_qa_rows(paths.csv_path)\\n'
-            '    completed_qis = {int(row.get("qi") or 0) for row in qa_rows}\\n'
+            '    completed_qis = {{int(row.get("qi") or 0) for row in qa_rows}}\\n'
             '    pending_questions = [qa.get("question", "") for qi, qa in qa_items if qi not in completed_qis]\\n'
             '    settle_result: dict[str, Any] | None = None\\n',
             '    qa_rows: list[dict[str, Any]] = load_existing_qa_rows(paths.csv_path)\\n'
-            '    completed_qis = {int(row.get("qi") or 0) for row in qa_rows}\\n'
+            '    completed_qis = set()\\n'
+            '    for row in qa_rows:\\n'
+            '        completed_qis.add(int(row.get("qi") or 0))\\n'
             '    pending_questions = [qa.get("question", "") for qi, qa in qa_items if qi not in completed_qis]\\n'
             '    reindex_result: dict[str, Any] | None = None\\n'
             '    if not args.skip_ingest and args.ov_api_key:\\n'

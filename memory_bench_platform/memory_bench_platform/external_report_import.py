@@ -8,17 +8,29 @@ from typing import Any
 
 def import_external_result(run_dir: Path) -> dict[str, Any]:
     meta_path = run_dir / "meta.json"
+    csv_path = _pick_csv(run_dir)
+    phase_meta_rows = _load_phase_meta_rows(run_dir)
+
+    case_results = _load_case_results_from_csv(csv_path)
+    case_results = _merge_with_phase_meta(case_results, phase_meta_rows)
+
     if meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        case_results = _load_case_results_from_csv(_pick_csv(run_dir))
+        # Keep question count aligned with meta when possible.
+        total_questions = int(meta.get("total_questions", 0) or 0)
+        if total_questions <= 0 and phase_meta_rows:
+            total_questions = len(phase_meta_rows)
+        if not total_questions:
+            total_questions = len(case_results)
+        total_graded = int(meta.get("total_graded", 0) or 0)
         return {
             "source": "locomo_test",
             "summary": {
                 "overall_accuracy": meta.get("overall_accuracy", 0.0),
                 "total_correct": meta.get("total_correct", 0),
-                "total_graded": meta.get("total_graded", 0),
-                "total_questions": meta.get("total_questions", meta.get("total_graded", 0)),
-                "ungraded_count": max(0, len(case_results) - int(meta.get("total_graded", 0) or 0)),
+                "total_graded": total_graded,
+                "total_questions": total_questions,
+                "ungraded_count": max(0, total_questions - total_graded),
                 "accuracy_by_category": meta.get("accuracy_by_category", {}),
                 "token_totals": meta.get("token_totals", {}),
                 "memory_token_totals": meta.get("memory_token_totals", {}),
@@ -72,9 +84,107 @@ def _load_case_results_from_csv(csv_path: Path) -> list[dict[str, Any]]:
                 "response": row.get("response", ""),
                 "category": row.get("category", ""),
                 "reasoning": row.get("reasoning", "") or ("missing judge result in external csv" if not result else ""),
+                "sample_id": row.get("sample_id"),
+                "qi": row.get("qi"),
             }
         )
     return results
+
+
+def _normalize_case_key(sample_id: Any, qi: Any) -> str:
+    return f"{sample_id or 'sample'}-q{qi if qi is not None and qi != '' else '?'}"
+
+
+def _row_index_key(row: dict[str, Any]) -> str:
+    qi = row.get("qi")
+    sample_id = row.get("sample_id")
+    case_id = row.get("case_id")
+    if qi is not None and qi != "":
+        return _normalize_case_key(sample_id, qi)
+    if isinstance(case_id, str) and "-q" in case_id:
+        return case_id
+    return str(case_id or _normalize_case_key(sample_id, "?"))
+
+
+def _load_phase_meta_rows(run_dir: Path) -> list[dict[str, Any]]:
+    phase_meta_path = _pick_phase_meta_file(run_dir)
+    if phase_meta_path is None:
+        return []
+    try:
+        payload = json.loads(phase_meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    qa_rows = payload.get("qa_rows")
+    if not isinstance(qa_rows, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for row in qa_rows:
+        if not isinstance(row, dict):
+            continue
+        result = str(row.get("result") or "").strip().upper()
+        rows.append(
+            {
+                "case_id": _normalize_case_key(row.get("sample_id") or row.get("sample"), row.get("qi")),
+                "passed": result == "CORRECT",
+                "label": result.lower() if result else "ungraded",
+                "question": row.get("question", ""),
+                "expected": row.get("expected", ""),
+                "response": row.get("response", ""),
+                "category": row.get("category", ""),
+                "reasoning": row.get("reasoning", "") or ("missing judge result in phaseA qa_rows" if not result else ""),
+                "sample_id": row.get("sample_id") or row.get("sample"),
+                "qi": row.get("qi"),
+            }
+        )
+    return rows
+
+
+def _pick_phase_meta_file(run_dir: Path) -> Path | None:
+    candidates = sorted((run_dir / "external_artifacts").glob("*/phaseA*.json"))
+    if not candidates:
+        candidates = sorted(run_dir.glob("**/phaseA*.json"))
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("qa_rows"), list):
+            return path
+    return None
+
+
+def _merge_with_phase_meta(
+    case_results: list[dict[str, Any]],
+    phase_meta_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not phase_meta_rows:
+        return case_results
+
+    csv_rows_by_key: dict[str, dict[str, Any]] = {
+        _row_index_key(item): item for item in case_results
+    }
+    merged: list[dict[str, Any]] = []
+    used_csv_keys: set[str] = set()
+
+    for row in phase_meta_rows:
+        case_id = row["case_id"]
+        if case_id in csv_rows_by_key:
+            merged.append(csv_rows_by_key[case_id])
+            used_csv_keys.add(case_id)
+        else:
+            merged.append(row)
+
+    for row in case_results:
+        case_id = row["case_id"]
+        if case_id not in used_csv_keys:
+            merged.append(row)
+
+    # Keep key-based canonical ids and ensure stable values for fallback rows.
+    for item in merged:
+        item["case_id"] = item["case_id"] or _normalize_case_key(item.get("sample_id"), item.get("qi"))
+
+    return merged
 
 
 def _build_category_summary(case_results: list[dict[str, Any]]) -> dict[str, Any]:

@@ -60,3 +60,52 @@ def test_import_external_result_keeps_ungraded_rows_visible(tmp_path: Path):
     assert len(result["case_results"]) == 2
     assert result["case_results"][1]["label"] == "ungraded"
     assert result["case_results"][1]["passed"] is False
+
+
+def test_import_external_result_fills_missing_csv_row_from_phase_meta(tmp_path: Path):
+    phase_meta_rows = [
+        {
+            "sample_id": "conv-1",
+            "qi": "1",
+            "question": "Q1",
+            "expected": "A1",
+            "response": "R1",
+            "category": "1",
+        },
+        {
+            "sample_id": "conv-1",
+            "qi": "2",
+            "question": "Q2",
+            "expected": "A2",
+            "response": "R2",
+            "category": "2",
+        },
+    ]
+    (tmp_path / "phaseA_meta.json").write_text(
+        json.dumps({"qa_rows": phase_meta_rows}),
+        encoding="utf-8",
+    )
+    (tmp_path / "qa_results.csv").write_text(
+        "sample_id,qi,question,expected,response,category,result,reasoning\n"
+        "conv-1,1,Q1,A1,R1,1,CORRECT,ok\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.5,
+                "total_correct": 1,
+                "total_graded": 1,
+                "total_questions": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = import_external_result(tmp_path)
+
+    assert len(result["case_results"]) == 2
+    assert result["summary"]["total_questions"] == 2
+    assert result["summary"]["ungraded_count"] == 1
+    assert result["case_results"][1]["label"] == "ungraded"
+    assert result["case_results"][1]["case_id"] == "conv-1-q2"
