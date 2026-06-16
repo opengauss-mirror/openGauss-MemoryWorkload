@@ -11,6 +11,7 @@ def test_readme_mentions_mvp_matrix():
     assert "latest official release tag" in text
     assert "explicitly requests an allowed override" in text
     assert "concrete runtime version" in text
+    assert "records/version_selection.json" in text
 
 
 def test_architecture_doc_mentions_version_policy():
@@ -23,6 +24,7 @@ def test_architecture_doc_mentions_version_policy():
     assert "targets[].upstream" in text
     assert "显式指定允许的 override" in text
     assert "实际运行版本" in text
+    assert "records/version_selection.json" in text
 
 
 def test_ovtest_skill_docs_mention_latest_release_tag_policy():

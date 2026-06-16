@@ -11,11 +11,16 @@ class RunRecord(BaseModel):
     source_id: str
     source_kind: Literal["benchmark_case_source", "native_workflow", "external_benchmark_runner"]
     operator_targets: list[str] = Field(default_factory=list)
+    benchmark_skill_version: str | None = None
     benchmark_version: str | None = None
     agent_id: str | None = None
+    agent_skill_version: str | None = None
     agent_version: str | None = None
     memory_backend: str | None = None
     hardware_profile: str | None = None
+    benchmark_version_policy: dict[str, Any] = Field(default_factory=dict)
+    agent_version_policy: dict[str, Any] = Field(default_factory=dict)
+    version_selection: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     environment: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None

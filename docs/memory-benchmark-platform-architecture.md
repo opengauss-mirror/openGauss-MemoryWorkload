@@ -181,6 +181,10 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 - 默认选择就是 `latest_official_release_tag`
 - 只有 run 配置或用户输入显式指定允许的 override，skill 才能偏离默认版本
 - 一旦发生 override，run archive 与 analysis report 必须同时记录“声明策略”和“实际运行版本”
+- 即使本轮还没解析出最终 tag 字符串，`run.json` 与 `records/version_selection.json` 也必须先保存：
+  - 选中的 skill version policy
+  - 本轮是默认 latest-tag 选择，还是显式 override
+  - 受该选择约束的 targets 列表
 
 例如：
 

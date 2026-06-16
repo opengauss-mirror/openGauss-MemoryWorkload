@@ -15,10 +15,13 @@ def test_run_record_requires_core_identifiers():
         run_id="run-001",
         source_id="locomo",
         source_kind="benchmark_case_source",
+        benchmark_version_policy={"default_selection": "latest_official_release_tag"},
+        version_selection={"benchmark": {"selection_mode": "latest_official_release_tag", "overridden": False}},
         status="pending",
     )
     assert record.run_id == "run-001"
     assert record.source_id == "locomo"
+    assert record.benchmark_version_policy["default_selection"] == "latest_official_release_tag"
 
 
 def test_case_and_step_records_bind_together():

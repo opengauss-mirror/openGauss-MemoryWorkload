@@ -17,7 +17,7 @@ from .integration import (
     validate_agent,
     validate_benchmark,
 )
-from .loader import load_all_skills
+from .loader import load_agent_skill, load_all_skills, load_benchmark_skill
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
 from .protocol import CaseRecord, ExecutionSpec, ReportSummary, RunRecord, StepRecord
@@ -83,6 +83,21 @@ def _plan_from_args(args: argparse.Namespace):
         data_path=args.data_path,
     )
     return build_run_plan(request)
+
+
+def _build_version_selection(benchmark_manifest, agent_manifest) -> dict[str, dict]:
+    return {
+        "benchmark": {
+            "selection_mode": benchmark_manifest.version_policy.default_selection,
+            "overridden": False,
+            "targets": [target.model_dump(mode="json") for target in benchmark_manifest.version_policy.targets],
+        },
+        "agent": {
+            "selection_mode": agent_manifest.version_policy.default_selection,
+            "overridden": False,
+            "targets": [target.model_dump(mode="json") for target in agent_manifest.version_policy.targets],
+        },
+    }
 
 
 def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step_results: list) -> list[dict]:
@@ -170,6 +185,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     storage = RunStorage(Path.cwd() / "runs")
+    benchmark_manifest = load_benchmark_skill(SKILLS_ROOT, args.benchmark)
+    agent_manifest = load_agent_skill(SKILLS_ROOT, args.agent)
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
     source_kind = "external_benchmark_runner" if entrypoint.entrypoint_kind == "external_runner" else "benchmark_case_source"
     run_record = RunRecord(
@@ -177,17 +194,27 @@ def main(argv: list[str] | None = None) -> None:
         source_id=f"{plan.benchmark_id}:{entrypoint.entrypoint_id}" if args.entrypoint else plan.benchmark_id,
         source_kind=source_kind,
         operator_targets=[args.agent],
+        benchmark_skill_version=benchmark_manifest.version,
         benchmark_version=plan.benchmark_version,
         agent_id=plan.agent_id,
+        agent_skill_version=agent_manifest.version,
         agent_version=plan.agent_version,
         memory_backend=plan.memory_backend,
         hardware_profile=plan.hardware_profile,
+        benchmark_version_policy=benchmark_manifest.version_policy.model_dump(mode="json"),
+        agent_version_policy=agent_manifest.version_policy.model_dump(mode="json"),
+        version_selection=_build_version_selection(benchmark_manifest, agent_manifest),
         config={"data_path": args.data_path} if args.data_path else {},
         status="pending",
     )
     run_record.status = "running"
     run_record.started_at = datetime.now()
     run_dir = storage.init_run(run_record)
+    storage.write_json_record(
+        run_dir,
+        "records/version_selection.json",
+        run_record.version_selection,
+    )
 
     if entrypoint.entrypoint_kind == "external_runner":
         output_dir = run_dir / "external_artifacts" / entrypoint.entrypoint_id

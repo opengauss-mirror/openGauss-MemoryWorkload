@@ -185,6 +185,19 @@ def main() -> None:
                 container.pop("agent_prefix", None)
                 container.pop("isolateUserScopeByAgent", None)
                 container.pop("isolateAgentScopeByUser", None)
+        defaults = data.get("agents", {{}}).get("defaults", {{}})
+        default_model = (
+            defaults.get("model", {{}}).get("primary")
+            if isinstance(defaults.get("model"), dict)
+            else None
+        ) or "volcengine/doubao-seed-2.0-pro"
+        for agent in (data.get("agents", {{}}).get("list") or []):
+            if not isinstance(agent, dict):
+                continue
+            if agent.get("id") != "locomo-eval":
+                continue
+            agent["model"] = default_model
+            agent["workspace"] = "/root/.openclaw/workspace/locomo-eval"
         config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
         print("remote locomo runtime prepared")
         """

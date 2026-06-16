@@ -47,6 +47,8 @@ python3 -m memory_bench_platform.cli run \
 Expected run artifacts:
 
 - `run.json` with `source_kind = "external_benchmark_runner"`
+- `run.json.benchmark_version_policy` / `run.json.agent_version_policy`
+- `records/version_selection.json`
 - `records/external_entrypoint.json`
 - `logs/external_runner.stdout.log`
 - `logs/external_runner.stderr.log`
@@ -91,6 +93,7 @@ python3 -m memory_bench_platform.cli validate \
 - A benchmark/agent run may deviate from the latest official tag only when the run config or operator input explicitly requests an allowed override.
 - Every real run should archive both:
   - the version policy declared by the selected skill
+  - the default-or-override selection outcome derived from that skill
   - the concrete runtime version that was actually observed/resolved
 - For real benchmark integrations, default to the latest official release tag of the tested software.
 - Do not default to:
