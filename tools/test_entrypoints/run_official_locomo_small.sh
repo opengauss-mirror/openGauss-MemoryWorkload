@@ -19,6 +19,12 @@ REMOTE_OUTPUT_DIR="/tmp/${RUN_ID}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+python3 "${SCRIPT_DIR}/prepare_remote_locomo_runtime.py" \
+  --ssh-host "${SSH_HOST}" \
+  --ssh-port "${SSH_PORT}" \
+  --remote-container "${REMOTE_CONTAINER}" \
+  --benchmark-dir "${REMOTE_BENCH_DIR}"
+
 REMOTE_CFG_JSON="$(
   ssh -p "${SSH_PORT}" "${SSH_HOST}" \
     "docker exec ${REMOTE_CONTAINER} python3 -c 'import json; cfg=json.load(open(\"/root/.openviking/ov.conf\")); print(json.dumps({\"root_key\": cfg[\"server\"][\"root_api_key\"], \"seed_key\": cfg[\"vlm\"][\"api_key\"], \"base_url\": cfg[\"vlm\"][\"api_base\"], \"model\": cfg[\"vlm\"][\"model\"]}))'"
