@@ -6,6 +6,7 @@
 
 - 默认使用正式发布版本，不默认跑脏工作树或本地开发快照。
 - 如果未特别说明，`OpenClaw` 与其依赖的 `OpenViking` 都应优先选择“当前最新正式 release tag”。
+- 只有 run 配置显式声明允许的 override，才可以偏离默认最新 tag 选择。
 - `manifest.yaml` 必须声明 `version_policy.default_selection=latest_official_release_tag`，不能只写在说明文档里。
 - `manifest.yaml.version_policy.targets` 应明确写出受该策略约束的软件组件、`version_source=upstream_release_tag`，以及对应上游仓库位置。
 - 只有在以下情况才允许偏离最新 tag：
@@ -18,6 +19,7 @@
 - 每次对接真实环境时，至少记录：
   - `OpenClaw` 版本
   - `OpenViking` 版本
+  - 本次运行是否使用默认最新 tag，还是使用了显式 override
   - 两者各自的上游来源
   - 是否为正式 tag / release
 - 若实际运行的不是正式 tag，需要在 run 结论里显式标记：

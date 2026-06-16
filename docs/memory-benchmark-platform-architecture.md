@@ -176,6 +176,12 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 
 `targets[].upstream` 用来明确“最新正式 tag 到底去哪里取”，避免 skill 只表达了策略，却没有表达解析来源。对接平台的 skill 应默认把上游 release/tag 源写清楚；如果没有标准 upstream，则必须在 run 记录里显式保存实际二进制、commit 或制品来源。
 
+这条规则还应落实到 skill 的执行语义上：
+
+- 默认选择就是 `latest_official_release_tag`
+- 只有 run 配置或用户输入显式指定允许的 override，skill 才能偏离默认版本
+- 一旦发生 override，run archive 与 analysis report 必须同时记录“声明策略”和“实际运行版本”
+
 例如：
 
 - `locomo` benchmark skill 应至少标记 `locomo-benchmark`

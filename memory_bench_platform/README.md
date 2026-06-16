@@ -87,6 +87,11 @@ python3 -m memory_bench_platform.cli validate \
 
 ## Version Policy
 
+- Platform integration skills must treat `latest_official_release_tag` as the default software selection policy.
+- A benchmark/agent run may deviate from the latest official tag only when the run config or operator input explicitly requests an allowed override.
+- Every real run should archive both:
+  - the version policy declared by the selected skill
+  - the concrete runtime version that was actually observed/resolved
 - For real benchmark integrations, default to the latest official release tag of the tested software.
 - Do not default to:
   - dirty worktrees
