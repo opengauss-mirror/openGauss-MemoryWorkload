@@ -191,15 +191,41 @@ def main() -> None:
             if isinstance(defaults.get("model"), dict)
             else None
         ) or "volcengine/doubao-seed-2.0-pro"
+        expected_workspace = "/root/.openclaw/workspace/locomo-eval"
+        locomo_eval_found = False
         for agent in (data.get("agents", {{}}).get("list") or []):
             if not isinstance(agent, dict):
                 continue
             if agent.get("id") != "locomo-eval":
                 continue
+            locomo_eval_found = True
             agent["model"] = default_model
-            agent["workspace"] = "/root/.openclaw/workspace/locomo-eval"
+            agent["workspace"] = expected_workspace
+        if not locomo_eval_found:
+            raise RuntimeError("locomo-eval agent entry not found in /root/.openclaw/openclaw.json")
         config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
-        print("remote locomo runtime prepared")
+        verified = json.loads(config_path.read_text(encoding="utf-8"))
+        verified_agent = None
+        for agent in (verified.get("agents", {{}}).get("list") or []):
+            if isinstance(agent, dict) and agent.get("id") == "locomo-eval":
+                verified_agent = agent
+                break
+        if not isinstance(verified_agent, dict):
+            raise RuntimeError("locomo-eval agent entry disappeared after writing /root/.openclaw/openclaw.json")
+        if verified_agent.get("model") != default_model:
+            raise RuntimeError(
+                f"locomo-eval model mismatch after prepare: expected {{default_model}}, got {{verified_agent.get('model')}}"
+            )
+        if verified_agent.get("workspace") != expected_workspace:
+            raise RuntimeError(
+                f"locomo-eval workspace mismatch after prepare: expected {{expected_workspace}}, got {{verified_agent.get('workspace')}}"
+            )
+        print(json.dumps({{
+            "status": "remote locomo runtime prepared",
+            "locomo_eval_model": verified_agent.get("model"),
+            "locomo_eval_workspace": verified_agent.get("workspace"),
+            "default_model": default_model,
+        }}, ensure_ascii=False))
         """
     ).strip()
 
