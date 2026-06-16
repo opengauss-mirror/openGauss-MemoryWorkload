@@ -176,7 +176,7 @@ def main() -> None:
             '    timeout: float = 120.0,\\n'
             '    retry_interval: float = 2.0,\\n'
             ') -> dict[str, Any]:\\n'
-            '    target_uri = f"viking://user/{user_id}/memories"\\n'
+            '    target_uri = f"viking://user/{{user_id}}/memories"\\n'
             '    headers = {{\\n'
             '        "Content-Type": "application/json",\\n'
             '        "X-API-Key": api_key,\\n'
