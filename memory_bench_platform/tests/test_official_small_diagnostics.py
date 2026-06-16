@@ -26,6 +26,10 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
                 "compact_elapsed_seconds": 10.0,
                 "ov_session_id": "s1",
                 "compact_status": {"commit_status": "completed"},
+                "extraction_signals": {
+                    "memory_count": 0,
+                    "durable_memory_file_count": 3,
+                },
                 "ov_observation": {
                     "poll_ok": True,
                     "detail": {
@@ -41,6 +45,10 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
                 "compact_elapsed_seconds": 12.0,
                 "ov_session_id": "s2",
                 "compact_status": {"commit_status": "completed"},
+                "extraction_signals": {
+                    "memory_count": 3,
+                    "durable_memory_file_count": 5,
+                },
                 "ov_observation": {
                     "poll_ok": True,
                     "detail": {
@@ -91,8 +99,11 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert result["nodes"]["session_construction"]["session_total"] == 2
     assert result["nodes"]["namespace_isolation"]["isolateUserScopeByAgent"] is False
     assert result["nodes"]["memory_capture"]["zero_memory_sessions"] == 1
+    assert result["nodes"]["memory_capture"]["durable_growth_sessions"] == 2
+    assert result["nodes"]["memory_capture"]["durable_growth_with_zero_memory"] == 1
     assert result["nodes"]["recall_query"]["search_find_calls"] == 1
     assert result["nodes"]["answer_generation"]["qa_total"] == 2
     assert result["timing"]["ingest"]["p50_seconds"] == 11.0
     assert result["timing"]["qa"]["max_seconds"] == 7.0
+    assert any("平台观测口径与真实落盘结果不一致" in item for item in result["findings"])
     assert result["findings"]
