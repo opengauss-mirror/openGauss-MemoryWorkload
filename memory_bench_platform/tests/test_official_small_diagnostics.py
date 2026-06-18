@@ -96,8 +96,31 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
         "[phaseA][session 2/4][direct-ov] session_2 task=t2 session_id=s2 memories=3\n",
         encoding="utf-8",
     )
+    (logs / "demo-run.ov.log").write_text(
+        "\n".join(
+            [
+                "2026-06-18 03:33:53,457 - openviking.session.compressor_v2 - ERROR - Failed to extract memories with v2: SessionExtractContextProvider.__init__() got an unexpected keyword argument 'latest_archive_session_time'",
+                "2026-06-18 03:34:06,474 - openviking.session.session - ERROR - Agent memory extraction failed: SessionCompressorV2.extract_agent_memories() got an unexpected keyword argument 'latest_archive_overview'",
+            ]
+        ),
+        encoding="utf-8",
+    )
     (logs / "demo-run.preflight.json").write_text(
-        json.dumps({"openviking_git_describe": "v0.3.24", "observer_system": {"status_code": 200}}),
+        json.dumps(
+            {
+                "openviking_git_describe": "v0.3.24",
+                "observer_system": {"status_code": 200},
+                "extract_compatibility": {
+                    "session_extract_context_provider": {
+                        "accepts_latest_archive_session_time": False,
+                    },
+                    "extract_agent_memories": {
+                        "accepts_latest_archive_overview": False,
+                        "accepts_latest_archive_session_time": False,
+                    },
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (logs / "demo-run.postrun.json").write_text(
@@ -136,10 +159,16 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert result["timing"]["ingest"]["p50_seconds"] == 11.0
     assert result["timing"]["qa"]["max_seconds"] == 7.0
     assert result["runtime"]["preflight"]["openviking_git_describe"] == "v0.3.24"
+    assert result["runtime"]["extract_compatibility"]["session_extract_context_provider"]["accepts_latest_archive_session_time"] is False
     assert result["runtime"]["postrun"]["observer_models"]["status_code"] == 200
     assert result["runtime"]["post_ingest_reindex"]["ok"] is False
     assert "Embedding Pending 58" in result["runtime"]["queue_status_text"]
+    assert "latest_archive_session_time" in result["runtime"]["signature_mismatch_errors"]
+    assert "latest_archive_overview" in result["runtime"]["signature_mismatch_errors"]
+    assert len(result["runtime"]["extract_runtime_errors"]) == 2
     assert any("平台观测口径与真实落盘结果不一致" in item for item in result["findings"])
     assert any("未产生 llm/embedding token" in item for item in result["findings"])
     assert any("post_ingest_reindex 未成功完成" in item for item in result["findings"])
+    assert any("preflight 运行时接口自检失败" in item for item in result["findings"])
+    assert any("接口签名错配" in item for item in result["findings"])
     assert result["findings"]

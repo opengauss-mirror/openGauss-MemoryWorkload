@@ -29,6 +29,11 @@ def _load_master_log(run_dir: Path) -> str:
     return candidates[0].read_text(encoding="utf-8", errors="ignore") if candidates else ""
 
 
+def _load_ov_log(run_dir: Path) -> str:
+    candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob("*.ov.log"))
+    return candidates[0].read_text(encoding="utf-8", errors="ignore") if candidates else ""
+
+
 def _load_remote_snapshot(run_dir: Path, suffix: str) -> dict[str, Any] | None:
     candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob(f"*.{suffix}.json"))
     if not candidates:
@@ -58,6 +63,7 @@ def _quantiles(values: list[float]) -> dict[str, float]:
 def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
     meta = _load_meta(run_dir)
     master_log = _load_master_log(run_dir)
+    ov_log = _load_ov_log(run_dir)
     preflight = _load_remote_snapshot(run_dir, "preflight")
     postrun = _load_remote_snapshot(run_dir, "postrun")
     ingest_sessions = meta.get("ingest_sessions", [])
@@ -105,6 +111,22 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
     reindex_result = meta.get("post_ingest_reindex") or {}
     observer_system = ((postrun or {}).get("observer_system") or {}).get("body", {}).get("result", {})
     queue_status = ((observer_system.get("components") or {}).get("queue") or {}).get("status", "")
+    extract_compatibility = (preflight or {}).get("extract_compatibility") or {}
+    signature_mismatch_errors = sorted(
+        {
+            match.group(1).strip()
+            for match in re.finditer(
+                r"unexpected keyword argument '([^']+)'",
+                ov_log,
+            )
+        }
+    )
+    extract_runtime_errors = [
+        line.strip()
+        for line in ov_log.splitlines()
+        if "Failed to extract memories with v2:" in line
+        or "Agent memory extraction failed:" in line
+    ]
 
     result = {
         "run_id": meta.get("run_id", run_dir.name),
@@ -157,6 +179,9 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
             "postrun": postrun,
             "post_ingest_reindex": reindex_result,
             "queue_status_text": queue_status,
+            "extract_compatibility": extract_compatibility,
+            "extract_runtime_errors": extract_runtime_errors[:20],
+            "signature_mismatch_errors": signature_mismatch_errors,
         },
     }
     findings: list[str] = []
@@ -178,6 +203,24 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
         findings.append("post_ingest_reindex 未成功完成，QA 前的向量重建或索引可见性存在异常。")
     if "Embedding" in queue_status and "Requeued" in queue_status:
         findings.append("observer queue 显示 embedding 队列存在 pending/requeue 积压，索引或向量化链路可能阻塞后续可见性。")
+    if isinstance(extract_compatibility, dict) and extract_compatibility:
+        provider_ok = bool(
+            ((extract_compatibility.get("session_extract_context_provider") or {}).get("accepts_latest_archive_session_time"))
+        )
+        agent_ok = bool(
+            ((extract_compatibility.get("extract_agent_memories") or {}).get("accepts_latest_archive_overview"))
+            and ((extract_compatibility.get("extract_agent_memories") or {}).get("accepts_latest_archive_session_time"))
+        )
+        if not provider_ok or not agent_ok:
+            findings.append(
+                "preflight 运行时接口自检失败：OpenViking extraction 相关函数签名与当前 session 调用路径不兼容。"
+            )
+    if signature_mismatch_errors:
+        findings.append(
+            "OpenViking 运行时出现 memory extraction 接口签名错配，关键异常参数为："
+            + ", ".join(signature_mismatch_errors)
+            + "。这说明当前运行时代码版本内部不自洽，extraction 在真正进入 LLM 前就已失败。"
+        )
     if result["timing"]["ingest"]["count"] >= 2:
         ingest = result["timing"]["ingest"]
         if ingest["max_seconds"] >= ingest["p50_seconds"] * 2:

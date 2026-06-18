@@ -69,6 +69,37 @@ payload = {
     "observer_system": fetch("/api/v1/observer/system"),
     "observer_models": fetch("/api/v1/observer/models"),
 }
+try:
+    import inspect
+    from openviking.session.compressor_v2 import SessionCompressorV2
+    from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
+
+    provider_params = list(inspect.signature(SessionExtractContextProvider.__init__).parameters.keys())
+    long_term_params = list(inspect.signature(SessionCompressorV2.extract_long_term_memories).parameters.keys())
+    agent_params = list(inspect.signature(SessionCompressorV2.extract_agent_memories).parameters.keys())
+    payload["extract_compatibility"] = {
+        "session_extract_context_provider": {
+            "file": inspect.getsourcefile(SessionExtractContextProvider),
+            "params": provider_params,
+            "accepts_latest_archive_session_time": "latest_archive_session_time" in provider_params,
+        },
+        "extract_long_term_memories": {
+            "file": inspect.getsourcefile(SessionCompressorV2.extract_long_term_memories),
+            "params": long_term_params,
+            "accepts_latest_archive_overview": "latest_archive_overview" in long_term_params,
+            "accepts_latest_archive_session_time": "latest_archive_session_time" in long_term_params,
+        },
+        "extract_agent_memories": {
+            "file": inspect.getsourcefile(SessionCompressorV2.extract_agent_memories),
+            "params": agent_params,
+            "accepts_latest_archive_overview": "latest_archive_overview" in agent_params,
+            "accepts_latest_archive_session_time": "latest_archive_session_time" in agent_params,
+        },
+    }
+except Exception as exc:
+    payload["extract_compatibility"] = {
+        "error": str(exc),
+    }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY' >/dev/null"
 }
