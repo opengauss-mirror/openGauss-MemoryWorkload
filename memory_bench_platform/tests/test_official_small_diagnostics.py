@@ -35,8 +35,11 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
                     "detail": {
                         "commit_count": 1,
                         "memories_extracted": {"total": 0},
-                        "llm_token_usage": {"total_tokens": 100},
-                        "embedding_token_usage": {"total_tokens": 20},
+                        "llm_token_usage": {"total_tokens": 0},
+                        "embedding_token_usage": {"total_tokens": 0},
+                        "telemetry_summary": {
+                            "memory": {"extract": {"stages": {"prepare_inputs_ms": 1.2}}}
+                        },
                     },
                 },
             },
@@ -54,8 +57,8 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
                     "detail": {
                         "commit_count": 1,
                         "memories_extracted": {"total": 3},
-                        "llm_token_usage": {"total_tokens": 120},
-                        "embedding_token_usage": {"total_tokens": 30},
+                        "llm_token_usage": {"total_tokens": 0},
+                        "embedding_token_usage": {"total_tokens": 0},
                     },
                 },
             },
@@ -98,15 +101,34 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
         encoding="utf-8",
     )
     (logs / "demo-run.postrun.json").write_text(
-        json.dumps({"observer_models": {"status_code": 200}}),
+        json.dumps(
+            {
+                "observer_models": {"status_code": 200},
+                "observer_system": {
+                    "body": {
+                        "result": {
+                            "components": {
+                                "queue": {
+                                    "status": "Embedding Pending 58 Requeued 444"
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        ),
         encoding="utf-8",
     )
+    meta["post_ingest_reindex"] = {"ok": False, "last_error": "timeout"}
+    (artifacts / "phaseA_demo_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     result = diagnose_official_small_run(run_dir)
 
     assert result["nodes"]["session_construction"]["session_total"] == 2
     assert result["nodes"]["namespace_isolation"]["isolateUserScopeByAgent"] is False
     assert result["nodes"]["memory_capture"]["zero_memory_sessions"] == 1
+    assert result["nodes"]["memory_capture"]["phase2_zero_token_sessions"] == 2
+    assert result["nodes"]["memory_capture"]["phase2_llm_extract_present_sessions"] == 0
     assert result["nodes"]["memory_capture"]["durable_growth_sessions"] == 2
     assert result["nodes"]["memory_capture"]["durable_growth_with_zero_memory"] == 1
     assert result["nodes"]["recall_query"]["search_find_calls"] == 1
@@ -115,5 +137,9 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert result["timing"]["qa"]["max_seconds"] == 7.0
     assert result["runtime"]["preflight"]["openviking_git_describe"] == "v0.3.24"
     assert result["runtime"]["postrun"]["observer_models"]["status_code"] == 200
+    assert result["runtime"]["post_ingest_reindex"]["ok"] is False
+    assert "Embedding Pending 58" in result["runtime"]["queue_status_text"]
     assert any("平台观测口径与真实落盘结果不一致" in item for item in result["findings"])
+    assert any("未产生 llm/embedding token" in item for item in result["findings"])
+    assert any("post_ingest_reindex 未成功完成" in item for item in result["findings"])
     assert result["findings"]

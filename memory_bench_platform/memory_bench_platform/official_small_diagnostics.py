@@ -79,17 +79,32 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
     ingest_times = [float(item.get("compact_elapsed_seconds", 0.0) or 0.0) for item in ingest_sessions]
     qa_times = [float(item.get("elapsed_seconds", 0.0) or 0.0) for item in qa_rows]
     qa_tokens = [int((item.get("usage") or {}).get("total_tokens", 0) or 0) for item in qa_rows]
+    phase2_zero_token_sessions = 0
+    phase2_llm_extract_present_sessions = 0
     durable_growth_sessions = 0
     durable_growth_with_zero_memory = 0
     durable_file_counts: list[int] = []
     for item in ingest_sessions:
         signals = item.get("extraction_signals", {}) or {}
+        ov_detail = ((item.get("ov_observation") or {}).get("detail") or {}) if isinstance(item.get("ov_observation"), dict) else {}
+        llm_total = int((ov_detail.get("llm_token_usage") or {}).get("total_tokens", 0) or 0)
+        embedding_total = int((ov_detail.get("embedding_token_usage") or {}).get("total_tokens", 0) or 0)
+        telemetry_summary = item.get("telemetry_summary") or ov_detail.get("telemetry_summary") or {}
+        llm_extract_ms = (((telemetry_summary.get("memory") or {}).get("extract") or {}).get("stages") or {}).get("llm_extract_ms")
+        if llm_total == 0 and embedding_total == 0:
+            phase2_zero_token_sessions += 1
+        if llm_extract_ms is not None:
+            phase2_llm_extract_present_sessions += 1
         durable_file_count = int(signals.get("durable_memory_file_count", 0) or 0)
         durable_file_counts.append(durable_file_count)
         if durable_file_count > 0:
             durable_growth_sessions += 1
             if int(signals.get("memory_count", 0) or 0) == 0:
                 durable_growth_with_zero_memory += 1
+
+    reindex_result = meta.get("post_ingest_reindex") or {}
+    observer_system = ((postrun or {}).get("observer_system") or {}).get("body", {}).get("result", {})
+    queue_status = ((observer_system.get("components") or {}).get("queue") or {}).get("status", "")
 
     result = {
         "run_id": meta.get("run_id", run_dir.name),
@@ -110,6 +125,8 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
                 "memory_counts": memory_counts,
                 "zero_memory_sessions": sum(1 for item in memory_counts if item == 0),
                 "sessions_with_extracted_memories": sum(1 for item in memory_counts if item > 0),
+                "phase2_zero_token_sessions": phase2_zero_token_sessions,
+                "phase2_llm_extract_present_sessions": phase2_llm_extract_present_sessions,
                 "durable_memory_file_counts": durable_file_counts,
                 "durable_growth_sessions": durable_growth_sessions,
                 "durable_growth_with_zero_memory": durable_growth_with_zero_memory,
@@ -138,6 +155,8 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
         "runtime": {
             "preflight": preflight,
             "postrun": postrun,
+            "post_ingest_reindex": reindex_result,
+            "queue_status_text": queue_status,
         },
     }
     findings: list[str] = []
@@ -145,12 +164,20 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
         findings.append("多数 session 已 commit 但未抽取到任何 memory，主异常位于 capture/extraction。")
     if durable_growth_with_zero_memory > 0:
         findings.append("durable memory 文件持续增长，但 session memory_count 仍为 0，说明平台观测口径与真实落盘结果不一致。")
+    if phase2_zero_token_sessions == len(ingest_sessions) and ingest_sessions:
+        findings.append("所有 phase2 commit task 都未产生 llm/embedding token，memory extraction 很可能在 prepare_inputs 之后提前空返回。")
+    if phase2_llm_extract_present_sessions == 0 and ingest_sessions:
+        findings.append("phase2 telemetry 中完全没有 llm_extract_ms，说明 memory extractor 没有真正进入 LLM 提取阶段。")
     if result["nodes"]["namespace_isolation"]["isolateUserScopeByAgent"] is False or result["nodes"]["namespace_isolation"]["isolateAgentScopeByUser"] is False:
         findings.append("namespace 隔离配置偏弱，可能放大 dedup / 跨 session 污染 / recall 不稳定。")
     if result["nodes"]["recall_query"]["search_find_calls"] > 0 and result["nodes"]["answer_generation"]["retrieval_miss_like_rows"] > 0:
         findings.append("recall 查询已发生，但大量回答仍是无信息模式，说明 recall 命中内容质量或可见性异常。")
     if result["nodes"]["recall_query"]["ledger_missing_rows"] > 0:
         findings.append("OpenClaw session ledger 大量缺失，session 侧可观测性不足，不能只依赖最终回答判断链路健康。")
+    if isinstance(reindex_result, dict) and reindex_result and not reindex_result.get("ok", True):
+        findings.append("post_ingest_reindex 未成功完成，QA 前的向量重建或索引可见性存在异常。")
+    if "Embedding" in queue_status and "Requeued" in queue_status:
+        findings.append("observer queue 显示 embedding 队列存在 pending/requeue 积压，索引或向量化链路可能阻塞后续可见性。")
     if result["timing"]["ingest"]["count"] >= 2:
         ingest = result["timing"]["ingest"]
         if ingest["max_seconds"] >= ingest["p50_seconds"] * 2:
