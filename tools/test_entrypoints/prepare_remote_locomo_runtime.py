@@ -49,6 +49,18 @@ def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
     return repeated.sub('\n        "post_ingest_reindex": reindex_result,', phase_text)
 
 
+def _enable_benchmark_plugin_diagnostics(shell_text: str) -> str:
+    if 'cfg["emitStandardDiagnostics"] = True\n' in shell_text:
+        return shell_text
+    anchor = 'cfg["accountId"] = account_id\n'
+    replacement = (
+        'cfg["accountId"] = account_id\n'
+        'cfg["emitStandardDiagnostics"] = True\n'
+        'cfg["logFindRequests"] = True\n'
+    )
+    return shell_text.replace(anchor, replacement)
+
+
 def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
     if kind == "session_extract_context_provider":
         marker = "latest_archive_session_time: str = \"\","
@@ -121,8 +133,14 @@ def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_pr
     models = config_data.setdefault("models", {})
     providers = models.setdefault("providers", {})
     provider_cfg = providers.get(provider_name)
-    if isinstance(provider_cfg, dict) and str(provider_cfg.get("apiKey") or "").strip():
-        return
+    existing_api_key = (
+        str(provider_cfg.get("apiKey") or "").strip()
+        if isinstance(provider_cfg, dict)
+        else ""
+    )
+    if existing_api_key:
+        if provider_name != "minimax" or provider_cfg.get("models"):
+            return
 
     auth_profiles = auth_profiles or {}
     candidate_keys = [
@@ -137,6 +155,8 @@ def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_pr
         if isinstance(profile, dict) and str(profile.get("key") or profile.get("access") or "").strip():
             selected = profile
             break
+    if selected is None and existing_api_key:
+        selected = {"key": existing_api_key}
     if selected is None:
         return
 
@@ -149,9 +169,28 @@ def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_pr
             {
                 "baseUrl": "https://api.minimaxi.com/v1",
                 "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "MiniMax-M3",
+                        "name": "MiniMax M3",
+                        "reasoning": True,
+                        "input": ["text"],
+                        "cost": {
+                            "input": 0,
+                            "output": 0,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                        },
+                        "contextWindow": 196608,
+                        "maxTokens": 8192,
+                    }
+                ],
             }
         )
-    providers[provider_name] = {**template, **(provider_cfg or {})}
+    merged = {**template, **(provider_cfg or {})}
+    if provider_name == "minimax" and not merged.get("models"):
+        merged["models"] = template["models"]
+    providers[provider_name] = merged
 
 
 def main() -> None:
@@ -204,6 +243,17 @@ def main() -> None:
         def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
             repeated = re.compile(r'(\\n        \"post_ingest_reindex\": reindex_result,){{2,}}', re.MULTILINE)
             return repeated.sub('\\n        \"post_ingest_reindex\": reindex_result,', phase_text)
+
+        def _enable_benchmark_plugin_diagnostics(shell_text: str) -> str:
+            if 'cfg["emitStandardDiagnostics"] = True\\n' in shell_text:
+                return shell_text
+            anchor = 'cfg["accountId"] = account_id\\n'
+            replacement = (
+                'cfg["accountId"] = account_id\\n'
+                'cfg["emitStandardDiagnostics"] = True\\n'
+                'cfg["logFindRequests"] = True\\n'
+            )
+            return shell_text.replace(anchor, replacement)
 
         def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
             if kind == "session_extract_context_provider":
@@ -275,8 +325,14 @@ def main() -> None:
             models = config_data.setdefault("models", {{}})
             providers = models.setdefault("providers", {{}})
             provider_cfg = providers.get(provider_name)
-            if isinstance(provider_cfg, dict) and str(provider_cfg.get("apiKey") or "").strip():
-                return
+            existing_api_key = (
+                str(provider_cfg.get("apiKey") or "").strip()
+                if isinstance(provider_cfg, dict)
+                else ""
+            )
+            if existing_api_key:
+                if provider_name != "minimax" or provider_cfg.get("models"):
+                    return
 
             auth_profiles = auth_profiles or {{}}
             candidate_keys = [
@@ -291,6 +347,8 @@ def main() -> None:
                 if isinstance(profile, dict) and str(profile.get("key") or profile.get("access") or "").strip():
                     selected = profile
                     break
+            if selected is None and existing_api_key:
+                selected = {{"key": existing_api_key}}
             if selected is None:
                 return
 
@@ -303,12 +361,32 @@ def main() -> None:
                     {{
                         "baseUrl": "https://api.minimaxi.com/v1",
                         "api": "openai-completions",
+                        "models": [
+                            {{
+                                "id": "MiniMax-M3",
+                                "name": "MiniMax M3",
+                                "reasoning": True,
+                                "input": ["text"],
+                                "cost": {{
+                                    "input": 0,
+                                    "output": 0,
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                }},
+                                "contextWindow": 196608,
+                                "maxTokens": 8192,
+                            }}
+                        ],
                     }}
                 )
-            providers[provider_name] = {{**template, **(provider_cfg or {{}})}}
+            merged = {{**template, **(provider_cfg or {{}})}}
+            if provider_name == "minimax" and not merged.get("models"):
+                merged["models"] = template["models"]
+            providers[provider_name] = merged
 
         shell_path = benchmark_dir / "run_clean_small_in_container.sh"
         shell_text = shell_path.read_text(encoding="utf-8")
+        shell_text = _enable_benchmark_plugin_diagnostics(shell_text)
         shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\\n', '')
         shell_text = shell_text.replace('cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\\n', '')
         shell_text = shell_text.replace('cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\\n', '')
