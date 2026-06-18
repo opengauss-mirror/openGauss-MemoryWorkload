@@ -42,6 +42,17 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
                     "duration_ms": 842.3,
                     "operation": "session_commit_phase2",
                     "status": "ok",
+                    "tokens": {
+                        "stages": {
+                            "vlm": {
+                                "llm": {
+                                    "input": 70,
+                                    "output": 30,
+                                    "total": 100,
+                                }
+                            }
+                        }
+                    },
                     "embedding": {
                         "async": {
                             "wait_ms": 6.0,
@@ -121,7 +132,37 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
     assert "ov.session.commit.phase2.wait_for_request_ms" in report["duration_distributions"]
     assert "ov.search.find.total_ms" in report["duration_distributions"]
     assert report["token_summary"]["ingest"]["ov_llm_total_tokens"] == 100
+    assert report["token_summary"]["ingest"]["stage_tokens"]["vlm"]["llm"]["total"] == 100
     assert report["wm_preprocess_summary"]["selected_span_count_total"] == 4
     html = render_official_small_timing_html(report)
     assert "Timing Report" in html
     assert "ov.session.commit.total_ms" in html
+
+
+def test_build_official_small_timing_report_maps_flat_duration_aliases(tmp_path: Path):
+    run_dir = tmp_path / "run-flat"
+    artifacts = run_dir / "external_artifacts" / "official_small"
+    artifacts.mkdir(parents=True)
+    meta = {
+        "run_id": "demo-flat",
+        "ingest_sessions": [
+            {
+                "index": 1,
+                "telemetry_summary": {
+                    "operation": "session_commit_phase2",
+                    "duration_ms": 10.0,
+                    "session_commit_phase2_wait_for_request_ms": 0.5,
+                    "storage_read_file_other_ms": 1.2,
+                    "storage_write_file_archive_meta_json_ms": 1.8,
+                },
+            }
+        ],
+        "qa_rows": [],
+    }
+    (artifacts / "phaseA_demo_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report = build_official_small_timing_report(run_dir)
+
+    assert "ov.session.commit.phase2.wait_for_request_ms" in report["duration_distributions"]
+    assert "ov.storage.read_file.other_ms" in report["duration_distributions"]
+    assert "ov.storage.write_file.archive_meta_json_ms" in report["duration_distributions"]

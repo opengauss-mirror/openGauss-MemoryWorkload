@@ -46,8 +46,16 @@ def main() -> None:
         f"""
         import base64
         from pathlib import Path
+        import re
 
         benchmark_dir = Path({args.benchmark_dir!r})
+
+        def _remove_redundant_reindex_injection(phase_text: str) -> str:
+            pattern = re.compile(
+                r"\\ndef reindex_memory_root\\([^\\n]*\\n(?:    .*?\\n)+?\\n(?=def wait_for_search_visibility\\()",
+                re.MULTILINE,
+            )
+            return pattern.sub("\\n", phase_text)
 
         shell_path = benchmark_dir / "run_clean_small_in_container.sh"
         shell_text = shell_path.read_text(encoding="utf-8")

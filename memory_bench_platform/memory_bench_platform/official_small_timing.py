@@ -80,6 +80,43 @@ RAW_DURATION_KEY_MAP = {
     "storage.write_file.archive_failed_json.duration_ms": "ov.storage.write_file.archive_failed_json_ms",
 }
 
+FLAT_DURATION_KEY_MAP = {
+    "memory_extract_duration_ms": "ov.memory.extract.total_ms",
+    "memory_extract_stage_prepare_inputs_ms": "ov.memory.extract.stage.prepare_inputs_ms",
+    "memory_extract_stage_llm_extract_ms": "ov.memory.extract.stage.llm_extract_ms",
+    "memory_extract_stage_normalize_candidates_ms": "ov.memory.extract.stage.normalize_candidates_ms",
+    "memory_extract_stage_tool_skill_stats_ms": "ov.memory.extract.stage.tool_skill_stats_ms",
+    "memory_extract_stage_profile_create_ms": "ov.memory.extract.stage.profile_create_ms",
+    "memory_extract_stage_tool_skill_merge_ms": "ov.memory.extract.stage.tool_skill_merge_ms",
+    "memory_extract_stage_dedup_ms": "ov.memory.extract.stage.dedup_ms",
+    "memory_extract_stage_create_memory_ms": "ov.memory.extract.stage.create_memory_ms",
+    "memory_extract_stage_merge_existing_ms": "ov.memory.extract.stage.merge_existing_ms",
+    "memory_extract_stage_delete_existing_ms": "ov.memory.extract.stage.delete_existing_ms",
+    "memory_extract_stage_create_relations_ms": "ov.memory.extract.stage.create_relations_ms",
+    "memory_extract_stage_flush_semantic_ms": "ov.memory.extract.stage.flush_semantic_ms",
+    "search_target_abstract_ms": "ov.search.target_abstract_ms",
+    "search_intent_analysis_ms": "ov.search.intent_analysis_ms",
+    "search_embed_query_ms": "ov.search.embed_query_ms",
+    "search_vector_retrieval_ms": "ov.search.vector_retrieval_ms",
+    "embedding_async_wait_ms": "ov.embedding.async.wait_ms",
+    "embedding_async_duration_ms": "ov.embedding.async.duration_ms",
+    "session_commit_phase2_wait_for_request_ms": "ov.session.commit.phase2.wait_for_request_ms",
+    "storage_read_file_messages_jsonl_ms": "ov.storage.read_file.messages_jsonl_ms",
+    "storage_read_file_session_meta_json_ms": "ov.storage.read_file.session_meta_json_ms",
+    "storage_read_file_archive_meta_json_ms": "ov.storage.read_file.archive_meta_json_ms",
+    "storage_read_file_archive_abstract_md_ms": "ov.storage.read_file.archive_abstract_md_ms",
+    "storage_read_file_archive_overview_md_ms": "ov.storage.read_file.archive_overview_md_ms",
+    "storage_read_file_other_ms": "ov.storage.read_file.other_ms",
+    "storage_write_file_messages_jsonl_ms": "ov.storage.write_file.messages_jsonl_ms",
+    "storage_write_file_session_meta_json_ms": "ov.storage.write_file.session_meta_json_ms",
+    "storage_write_file_archive_meta_json_ms": "ov.storage.write_file.archive_meta_json_ms",
+    "storage_write_file_archive_abstract_md_ms": "ov.storage.write_file.archive_abstract_md_ms",
+    "storage_write_file_archive_overview_md_ms": "ov.storage.write_file.archive_overview_md_ms",
+    "storage_write_file_archive_done_ms": "ov.storage.write_file.archive_done_ms",
+    "storage_write_file_archive_failed_json_ms": "ov.storage.write_file.archive_failed_json_ms",
+    "storage_write_file_other_ms": "ov.storage.write_file.other_ms",
+}
+
 
 def _official_artifacts_dir(run_dir: Path) -> Path:
     root = run_dir / "external_artifacts"
@@ -171,9 +208,43 @@ def _walk_duration_values(value: Any, prefix: str = "") -> list[tuple[str, float
 
 
 def _public_duration_label(raw_key: str, scope_prefix: str) -> str:
+    structured_prefixes = (
+        "storage.read_file.",
+        "storage.write_file.",
+        "session.commit.phase2.",
+        "memory.extract.",
+        "embedding.async.",
+        "search.",
+    )
     if raw_key in RAW_DURATION_KEY_MAP:
         return RAW_DURATION_KEY_MAP[raw_key]
+    if raw_key in FLAT_DURATION_KEY_MAP:
+        return FLAT_DURATION_KEY_MAP[raw_key]
+    if raw_key.startswith(structured_prefixes) and raw_key.endswith(".duration_ms"):
+        return f"ov.{raw_key.removesuffix('.duration_ms')}_ms"
+    if raw_key.startswith(structured_prefixes) and raw_key.endswith("_ms"):
+        return f"ov.{raw_key}"
     return f"{scope_prefix}.{raw_key.removesuffix('.duration_ms').replace('.', '_')}_ms"
+
+
+def _merge_stage_token_usage(into: dict[str, dict[str, dict[str, int]]], tokens_payload: dict[str, Any]) -> None:
+    stages = tokens_payload.get("stages") if isinstance(tokens_payload, dict) else None
+    if not isinstance(stages, dict):
+        return
+    for stage_name, source_payload in stages.items():
+        if not isinstance(source_payload, dict):
+            continue
+        stage_bucket = into.setdefault(str(stage_name), {})
+        for source_name, token_payload in source_payload.items():
+            if not isinstance(token_payload, dict):
+                continue
+            source_bucket = stage_bucket.setdefault(str(source_name), {})
+            for key, value in token_payload.items():
+                try:
+                    normalized = int(value)
+                except (TypeError, ValueError):
+                    continue
+                source_bucket[key] = source_bucket.get(key, 0) + normalized
 
 
 def _telemetry_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -397,34 +468,44 @@ def _build_ov_log_duration_events(run_dir: Path) -> list[dict[str, Any]]:
 def _build_token_summary(meta: dict[str, Any]) -> dict[str, Any]:
     ingest_llm_total = 0
     ingest_embedding_total = 0
+    ingest_stage_tokens: dict[str, dict[str, dict[str, int]]] = {}
     for row in meta.get("ingest_sessions", []):
         ov_detail = ((row.get("ov_observation") or {}).get("detail") or {}) if isinstance(row.get("ov_observation"), dict) else {}
         llm_usage = row.get("ov_llm_token_usage") or ov_detail.get("llm_token_usage") or {}
         embedding_usage = ov_detail.get("embedding_token_usage") or {}
         ingest_llm_total += int((llm_usage or {}).get("total_tokens", 0) or 0)
         ingest_embedding_total += int((embedding_usage or {}).get("total_tokens", 0) or 0)
+        telemetry_summary = _telemetry_summary_from_row(row)
+        if isinstance(telemetry_summary, dict):
+            _merge_stage_token_usage(ingest_stage_tokens, telemetry_summary.get("tokens") or {})
 
     qa_total = 0
     qa_input = 0
     qa_output = 0
     qa_cache_read = 0
+    qa_stage_tokens: dict[str, dict[str, dict[str, int]]] = {}
     for row in meta.get("qa_rows", []):
         usage = row.get("usage") or {}
         qa_total += int(usage.get("total_tokens", 0) or 0)
         qa_input += int(usage.get("input_tokens", 0) or 0)
         qa_output += int(usage.get("output_tokens", 0) or 0)
         qa_cache_read += int(usage.get("cacheRead", 0) or 0)
+        telemetry_summary = _telemetry_summary_from_row(row)
+        if isinstance(telemetry_summary, dict):
+            _merge_stage_token_usage(qa_stage_tokens, telemetry_summary.get("tokens") or {})
 
     return {
         "ingest": {
             "ov_llm_total_tokens": ingest_llm_total,
             "ov_embedding_total_tokens": ingest_embedding_total,
+            "stage_tokens": ingest_stage_tokens,
         },
         "qa": {
             "total_tokens": qa_total,
             "input_tokens": qa_input,
             "output_tokens": qa_output,
             "cache_read_tokens": qa_cache_read,
+            "stage_tokens": qa_stage_tokens,
         },
     }
 
