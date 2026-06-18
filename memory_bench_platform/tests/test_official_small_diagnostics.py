@@ -93,6 +93,14 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
         "[phaseA][session 2/4][direct-ov] session_2 task=t2 session_id=s2 memories=3\n",
         encoding="utf-8",
     )
+    (logs / "demo-run.preflight.json").write_text(
+        json.dumps({"openviking_git_describe": "v0.3.24", "observer_system": {"status_code": 200}}),
+        encoding="utf-8",
+    )
+    (logs / "demo-run.postrun.json").write_text(
+        json.dumps({"observer_models": {"status_code": 200}}),
+        encoding="utf-8",
+    )
 
     result = diagnose_official_small_run(run_dir)
 
@@ -105,5 +113,7 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert result["nodes"]["answer_generation"]["qa_total"] == 2
     assert result["timing"]["ingest"]["p50_seconds"] == 11.0
     assert result["timing"]["qa"]["max_seconds"] == 7.0
+    assert result["runtime"]["preflight"]["openviking_git_describe"] == "v0.3.24"
+    assert result["runtime"]["postrun"]["observer_models"]["status_code"] == 200
     assert any("平台观测口径与真实落盘结果不一致" in item for item in result["findings"])
     assert result["findings"]

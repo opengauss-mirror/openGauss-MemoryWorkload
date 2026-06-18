@@ -36,6 +36,43 @@ SEED_KEY="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["seed_key
 BASE_URL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["base_url"])' "${REMOTE_CFG_JSON}")"
 JUDGE_MODEL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["model"])' "${REMOTE_CFG_JSON}")"
 
+capture_remote_snapshot() {
+  local snapshot_name="$1"
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'python3 - <<\"PY\" > /tmp/${RUN_ID}.${snapshot_name}.json
+import json
+import requests
+import subprocess
+
+headers = {"X-API-Key": "${ROOT_KEY}"}
+base = "http://127.0.0.1:1933"
+
+def fetch(path):
+    try:
+        resp = requests.get(base + path, headers=headers, timeout=20)
+        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+        return {"status_code": resp.status_code, "body": body}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+payload = {
+    "run_id": "${RUN_ID}",
+    "snapshot": "${snapshot_name}",
+    "openviking_git_describe": run_cmd(["bash", "-lc", "cd ${REMOTE_BENCH_DIR%/benchmark/locomo/openclaw} && git describe --tags --always --dirty 2>/dev/null || true"]),
+    "openviking_head": run_cmd(["bash", "-lc", "cd ${REMOTE_BENCH_DIR%/benchmark/locomo/openclaw} && git rev-parse --short HEAD 2>/dev/null || true"]),
+    "health": fetch("/health"),
+    "observer_system": fetch("/api/v1/observer/system"),
+    "observer_models": fetch("/api/v1/observer/models"),
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY' >/dev/null"
+}
+
 mkdir -p "${LOCAL_OUTPUT_DIR}"
 
 EXISTING_PHASE_CSV="$(find "${LOCAL_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)"
@@ -77,7 +114,11 @@ export MASTER_LOG="/tmp/${RUN_ID}.master.log"
 export OV_LOG="/tmp/${RUN_ID}.ov.log"
 export GW_LOG="/tmp/${RUN_ID}.gw.log"
 
+capture_remote_snapshot preflight
+
 bash ./run_clean_small_in_container.sh
+
+capture_remote_snapshot postrun
 
 META_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*_meta.json' | head -1 || true)
 CSV_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)
@@ -100,7 +141,7 @@ INNER
 
 TMP_PARENT="$(dirname "${LOCAL_OUTPUT_DIR}")"
 mkdir -p "${TMP_PARENT}"
-ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'tar czf - -C /tmp ${RUN_ID} ${RUN_ID}.master.log ${RUN_ID}.ov.log ${RUN_ID}.gw.log ${RUN_ID}.enrich.json 2>/dev/null || tar czf - -C /tmp ${RUN_ID}'" \
+ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'tar czf - -C /tmp ${RUN_ID} ${RUN_ID}.master.log ${RUN_ID}.ov.log ${RUN_ID}.gw.log ${RUN_ID}.enrich.json ${RUN_ID}.preflight.json ${RUN_ID}.postrun.json 2>/dev/null || tar czf - -C /tmp ${RUN_ID}'" \
   | tar xzf - -C "${TMP_PARENT}"
 
 if [ -d "${TMP_PARENT}/${RUN_ID}" ] && [ "${TMP_PARENT}/${RUN_ID}" != "${LOCAL_OUTPUT_DIR}" ]; then
@@ -112,6 +153,11 @@ mkdir -p "${LOCAL_OUTPUT_DIR}/remote_logs"
 for log_name in "${RUN_ID}.master.log" "${RUN_ID}.ov.log" "${RUN_ID}.gw.log"; do
   if [ -f "${TMP_PARENT}/${log_name}" ]; then
     mv "${TMP_PARENT}/${log_name}" "${LOCAL_OUTPUT_DIR}/remote_logs/${log_name}"
+  fi
+done
+for snapshot_name in "${RUN_ID}.preflight.json" "${RUN_ID}.postrun.json"; do
+  if [ -f "${TMP_PARENT}/${snapshot_name}" ]; then
+    mv "${TMP_PARENT}/${snapshot_name}" "${LOCAL_OUTPUT_DIR}/remote_logs/${snapshot_name}"
   fi
 done
 if [ -f "${TMP_PARENT}/${RUN_ID}.enrich.json" ]; then

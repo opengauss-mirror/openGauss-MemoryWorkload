@@ -29,6 +29,16 @@ def _load_master_log(run_dir: Path) -> str:
     return candidates[0].read_text(encoding="utf-8", errors="ignore") if candidates else ""
 
 
+def _load_remote_snapshot(run_dir: Path, suffix: str) -> dict[str, Any] | None:
+    candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob(f"*.{suffix}.json"))
+    if not candidates:
+        return None
+    try:
+        return json.loads(candidates[0].read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def _quantiles(values: list[float]) -> dict[str, float]:
     if not values:
         return {"count": 0, "min_seconds": 0.0, "max_seconds": 0.0, "mean_seconds": 0.0, "p50_seconds": 0.0, "p90_seconds": 0.0}
@@ -48,6 +58,8 @@ def _quantiles(values: list[float]) -> dict[str, float]:
 def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
     meta = _load_meta(run_dir)
     master_log = _load_master_log(run_dir)
+    preflight = _load_remote_snapshot(run_dir, "preflight")
+    postrun = _load_remote_snapshot(run_dir, "postrun")
     ingest_sessions = meta.get("ingest_sessions", [])
     qa_rows = meta.get("qa_rows", [])
     namespace = meta.get("plugin_namespace_config", {}).get("final", {})
@@ -122,6 +134,10 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
                 "max_tokens": max(qa_tokens) if qa_tokens else 0,
                 "mean_tokens": round(sum(qa_tokens) / len(qa_tokens), 2) if qa_tokens else 0.0,
             },
+        },
+        "runtime": {
+            "preflight": preflight,
+            "postrun": postrun,
         },
     }
     findings: list[str] = []
