@@ -14,6 +14,7 @@ JUDGE_PARALLEL="${JUDGE_PARALLEL:-5}"
 SKIP_JUDGE="${SKIP_JUDGE:-false}"
 QA_DISABLE_AUTOCAPTURE="${QA_DISABLE_AUTOCAPTURE:-}"
 FAIL_ON_OV_INCOMPATIBLE_EXTRACTION="${FAIL_ON_OV_INCOMPATIBLE_EXTRACTION:-true}"
+LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"
 RUN_ID="${RUN_ID:-official_${MODE}_sample${SAMPLE}_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/${RUN_ID}}"
 LOCAL_OUTPUT_DIR="${OUTPUT_DIR}"
@@ -21,11 +22,16 @@ REMOTE_OUTPUT_DIR="/tmp/${RUN_ID}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-python3 "${SCRIPT_DIR}/prepare_remote_locomo_runtime.py" \
-  --ssh-host "${SSH_HOST}" \
-  --ssh-port "${SSH_PORT}" \
-  --remote-container "${REMOTE_CONTAINER}" \
+PREPARE_ARGS=(
+  --ssh-host "${SSH_HOST}"
+  --ssh-port "${SSH_PORT}"
+  --remote-container "${REMOTE_CONTAINER}"
   --benchmark-dir "${REMOTE_BENCH_DIR}"
+)
+if [ -n "${LOCOMO_EVAL_MODEL}" ]; then
+  PREPARE_ARGS+=(--locomo-model "${LOCOMO_EVAL_MODEL}")
+fi
+python3 "${SCRIPT_DIR}/prepare_remote_locomo_runtime.py" "${PREPARE_ARGS[@]}"
 
 REMOTE_CFG_JSON="$(
   ssh -p "${SSH_PORT}" "${SSH_HOST}" \

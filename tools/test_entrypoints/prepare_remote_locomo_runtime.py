@@ -114,6 +114,46 @@ def _ensure_openclaw_openviking_plugin_compat(source_text: str) -> str:
     return updated
 
 
+def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_profiles: dict | None) -> None:
+    provider_name = str(model_name or "").split("/", 1)[0].strip()
+    if not provider_name:
+        return
+    models = config_data.setdefault("models", {})
+    providers = models.setdefault("providers", {})
+    provider_cfg = providers.get(provider_name)
+    if isinstance(provider_cfg, dict) and str(provider_cfg.get("apiKey") or "").strip():
+        return
+
+    auth_profiles = auth_profiles or {}
+    candidate_keys = [
+        f"{provider_name}:default",
+        f"{provider_name}:cn",
+        f"{provider_name}-cn:default",
+        f"{provider_name}-portal:default",
+    ]
+    selected = None
+    for profile_id in candidate_keys:
+        profile = auth_profiles.get(profile_id)
+        if isinstance(profile, dict) and str(profile.get("key") or profile.get("access") or "").strip():
+            selected = profile
+            break
+    if selected is None:
+        return
+
+    api_key = str(selected.get("key") or selected.get("access") or "").strip()
+    template = {
+        "apiKey": api_key,
+    }
+    if provider_name == "minimax":
+        template.update(
+            {
+                "baseUrl": "https://api.minimaxi.com/v1",
+                "api": "openai-completions",
+            }
+        )
+    providers[provider_name] = {**template, **(provider_cfg or {})}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Patch remote LoCoMo/OpenClaw runtime for benchmark runs.")
     parser.add_argument("--ssh-host", default="jcp@123.60.114.206")
@@ -123,6 +163,7 @@ def main() -> None:
         "--benchmark-dir",
         default="/home/jcp/agent/code/OpenViking/benchmark/locomo/openclaw",
     )
+    parser.add_argument("--locomo-model", default=None)
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -226,6 +267,45 @@ def main() -> None:
                 '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\\n',
             )
             return updated
+
+        def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_profiles: dict | None) -> None:
+            provider_name = str(model_name or "").split("/", 1)[0].strip()
+            if not provider_name:
+                return
+            models = config_data.setdefault("models", {{}})
+            providers = models.setdefault("providers", {{}})
+            provider_cfg = providers.get(provider_name)
+            if isinstance(provider_cfg, dict) and str(provider_cfg.get("apiKey") or "").strip():
+                return
+
+            auth_profiles = auth_profiles or {{}}
+            candidate_keys = [
+                f"{{provider_name}}:default",
+                f"{{provider_name}}:cn",
+                f"{{provider_name}}-cn:default",
+                f"{{provider_name}}-portal:default",
+            ]
+            selected = None
+            for profile_id in candidate_keys:
+                profile = auth_profiles.get(profile_id)
+                if isinstance(profile, dict) and str(profile.get("key") or profile.get("access") or "").strip():
+                    selected = profile
+                    break
+            if selected is None:
+                return
+
+            api_key = str(selected.get("key") or selected.get("access") or "").strip()
+            template = {{
+                "apiKey": api_key,
+            }}
+            if provider_name == "minimax":
+                template.update(
+                    {{
+                        "baseUrl": "https://api.minimaxi.com/v1",
+                        "api": "openai-completions",
+                    }}
+                )
+            providers[provider_name] = {{**template, **(provider_cfg or {{}})}}
 
         shell_path = benchmark_dir / "run_clean_small_in_container.sh"
         shell_text = shell_path.read_text(encoding="utf-8")
@@ -510,8 +590,10 @@ def main() -> None:
         agents_path.write_text(base64.b64decode({agents_b64!r}).decode("utf-8"), encoding="utf-8")
 
         config_path = Path("/root/.openclaw/openclaw.json")
+        auth_path = Path("/root/.openclaw/agents/main/agent/auth-profiles.json")
         import json
         data = json.loads(config_path.read_text(encoding="utf-8"))
+        auth_payload = json.loads(auth_path.read_text(encoding="utf-8")) if auth_path.exists() else {{"profiles": {{}}}}
         for container in [
             data.get("plugins", {{}}).get("entries", {{}}).get("openviking", {{}}).get("config", {{}}),
             data.get("plugins", {{}}).get("openviking", {{}}),
@@ -520,12 +602,21 @@ def main() -> None:
                 container.pop("agent_prefix", None)
                 container.pop("isolateUserScopeByAgent", None)
                 container.pop("isolateAgentScopeByUser", None)
-        defaults = data.get("agents", {{}}).get("defaults", {{}})
-        default_model = (
+        agents_root = data.setdefault("agents", {{}})
+        defaults = agents_root.setdefault("defaults", {{}})
+        default_model = {args.locomo_model!r} or (
             defaults.get("model", {{}}).get("primary")
             if isinstance(defaults.get("model"), dict)
             else None
         ) or "volcengine/doubao-seed-2.0-pro"
+        if not isinstance(defaults.get("model"), dict):
+            defaults["model"] = {{}}
+        defaults["model"]["primary"] = default_model
+        _inject_openclaw_provider_config(
+            data,
+            default_model,
+            auth_payload.get("profiles", {{}}) if isinstance(auth_payload, dict) else {{}},
+        )
         expected_workspace = "/root/.openclaw/workspace/locomo-eval"
         locomo_eval_found = False
         for agent in (data.get("agents", {{}}).get("list") or []):
