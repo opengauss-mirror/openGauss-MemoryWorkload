@@ -89,72 +89,31 @@ print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY'"
 }
 
-capture_remote_snapshot() {
-  local snapshot_name="$1"
-  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'python3 - <<\"PY\" > /tmp/${RUN_ID}.${snapshot_name}.json
+capture_remote_postrun_local() {
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '/root/.openviking/venv-0.3.24/bin/python - <<\"PY\"
 import json
 import requests
-import subprocess
 
-headers = {"X-API-Key": "${ROOT_KEY}"}
-base = "http://127.0.0.1:1933"
+headers = {\"X-API-Key\": \"${ROOT_KEY}\"}
+base = \"http://127.0.0.1:1933\"
 
 def fetch(path):
     try:
         resp = requests.get(base + path, headers=headers, timeout=20)
-        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
-        return {"status_code": resp.status_code, "body": body}
+        body = resp.json() if resp.headers.get(\"content-type\", \"\").startswith(\"application/json\") else resp.text
+        return {\"status_code\": resp.status_code, \"body\": body}
     except Exception as exc:
-        return {"error": str(exc)}
-
-def run_cmd(cmd):
-    try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
-    except Exception as exc:
-        return f"ERROR: {exc}"
+        return {\"error\": str(exc)}
 
 payload = {
-    "run_id": "${RUN_ID}",
-    "snapshot": "${snapshot_name}",
-    "openviking_git_describe": run_cmd(["bash", "-lc", "cd ${REMOTE_BENCH_DIR%/benchmark/locomo/openclaw} && git describe --tags --always --dirty 2>/dev/null || true"]),
-    "openviking_head": run_cmd(["bash", "-lc", "cd ${REMOTE_BENCH_DIR%/benchmark/locomo/openclaw} && git rev-parse --short HEAD 2>/dev/null || true"]),
-    "health": fetch("/health"),
-    "observer_system": fetch("/api/v1/observer/system"),
-    "observer_models": fetch("/api/v1/observer/models"),
+    \"run_id\": \"${RUN_ID}\",
+    \"snapshot\": \"postrun\",
+    \"health\": fetch(\"/health\"),
+    \"observer_system\": fetch(\"/api/v1/observer/system\"),
+    \"observer_models\": fetch(\"/api/v1/observer/models\"),
 }
-try:
-    import inspect
-    from openviking.session.compressor_v2 import SessionCompressorV2
-    from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
-
-    provider_params = list(inspect.signature(SessionExtractContextProvider.__init__).parameters.keys())
-    long_term_params = list(inspect.signature(SessionCompressorV2.extract_long_term_memories).parameters.keys())
-    agent_params = list(inspect.signature(SessionCompressorV2.extract_agent_memories).parameters.keys())
-    payload["extract_compatibility"] = {
-        "session_extract_context_provider": {
-            "file": inspect.getsourcefile(SessionExtractContextProvider),
-            "params": provider_params,
-            "accepts_latest_archive_session_time": "latest_archive_session_time" in provider_params,
-        },
-        "extract_long_term_memories": {
-            "file": inspect.getsourcefile(SessionCompressorV2.extract_long_term_memories),
-            "params": long_term_params,
-            "accepts_latest_archive_overview": "latest_archive_overview" in long_term_params,
-            "accepts_latest_archive_session_time": "latest_archive_session_time" in long_term_params,
-        },
-        "extract_agent_memories": {
-            "file": inspect.getsourcefile(SessionCompressorV2.extract_agent_memories),
-            "params": agent_params,
-            "accepts_latest_archive_overview": "latest_archive_overview" in agent_params,
-            "accepts_latest_archive_session_time": "latest_archive_session_time" in agent_params,
-        },
-    }
-except Exception as exc:
-    payload["extract_compatibility"] = {
-        "error": str(exc),
-    }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
-PY' >/dev/null"
+PY'"
 }
 
 mkdir -p "${LOCAL_OUTPUT_DIR}"
@@ -196,6 +155,7 @@ fi
 EXISTING_PHASE_CSV="$(find "${LOCAL_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)"
 if [ -z "${EXISTING_PHASE_CSV}" ]; then
 
+set +e
 ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -s" <<INNER
 set -euo pipefail
 
@@ -232,11 +192,7 @@ export MASTER_LOG="/tmp/${RUN_ID}.master.log"
 export OV_LOG="/tmp/${RUN_ID}.ov.log"
 export GW_LOG="/tmp/${RUN_ID}.gw.log"
 
-capture_remote_snapshot preflight
-
 bash ./run_clean_small_in_container.sh
-
-capture_remote_snapshot postrun
 
 META_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*_meta.json' | head -1 || true)
 CSV_FILE=\$(find "${REMOTE_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)
@@ -256,10 +212,14 @@ if [ -n "\${META_FILE}" ] && [ -f "\${MASTER_LOG}" ] && [ -n "\${CSV_FILE}" ]; t
     >/tmp/${RUN_ID}.enrich.json || true
 fi
 INNER
+REMOTE_RUN_EXIT_CODE=$?
+set -e
+
+capture_remote_postrun_local > "${LOCAL_OUTPUT_DIR}/remote_logs/${RUN_ID}.postrun.json"
 
 TMP_PARENT="$(dirname "${LOCAL_OUTPUT_DIR}")"
 mkdir -p "${TMP_PARENT}"
-ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'tar czf - -C /tmp ${RUN_ID} ${RUN_ID}.master.log ${RUN_ID}.ov.log ${RUN_ID}.gw.log ${RUN_ID}.enrich.json ${RUN_ID}.preflight.json ${RUN_ID}.postrun.json 2>/dev/null || tar czf - -C /tmp ${RUN_ID}'" \
+ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'tar czf - -C /tmp ${RUN_ID} ${RUN_ID}.master.log ${RUN_ID}.ov.log ${RUN_ID}.gw.log ${RUN_ID}.enrich.json ${RUN_ID}.preflight.json 2>/dev/null || tar czf - -C /tmp ${RUN_ID}'" \
   | tar xzf - -C "${TMP_PARENT}"
 
 if [ -d "${TMP_PARENT}/${RUN_ID}" ] && [ "${TMP_PARENT}/${RUN_ID}" != "${LOCAL_OUTPUT_DIR}" ]; then
@@ -272,13 +232,17 @@ for log_name in "${RUN_ID}.master.log" "${RUN_ID}.ov.log" "${RUN_ID}.gw.log"; do
     mv "${TMP_PARENT}/${log_name}" "${LOCAL_OUTPUT_DIR}/remote_logs/${log_name}"
   fi
 done
-for snapshot_name in "${RUN_ID}.preflight.json" "${RUN_ID}.postrun.json"; do
+for snapshot_name in "${RUN_ID}.preflight.json"; do
   if [ -f "${TMP_PARENT}/${snapshot_name}" ]; then
     mv "${TMP_PARENT}/${snapshot_name}" "${LOCAL_OUTPUT_DIR}/remote_logs/${snapshot_name}"
   fi
 done
 if [ -f "${TMP_PARENT}/${RUN_ID}.enrich.json" ]; then
   mv "${TMP_PARENT}/${RUN_ID}.enrich.json" "${LOCAL_OUTPUT_DIR}/remote_logs/${RUN_ID}.enrich.json"
+fi
+
+if [ "${REMOTE_RUN_EXIT_CODE}" -ne 0 ]; then
+  exit "${REMOTE_RUN_EXIT_CODE}"
 fi
 
 fi

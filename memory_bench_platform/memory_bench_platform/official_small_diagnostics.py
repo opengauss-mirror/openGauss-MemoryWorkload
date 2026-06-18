@@ -204,6 +204,7 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
     if "Embedding" in queue_status and "Requeued" in queue_status:
         findings.append("observer queue 显示 embedding 队列存在 pending/requeue 积压，索引或向量化链路可能阻塞后续可见性。")
     if isinstance(extract_compatibility, dict) and extract_compatibility:
+        compat_error = extract_compatibility.get("error")
         provider_ok = bool(
             ((extract_compatibility.get("session_extract_context_provider") or {}).get("accepts_latest_archive_session_time"))
         )
@@ -211,7 +212,13 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
             ((extract_compatibility.get("extract_agent_memories") or {}).get("accepts_latest_archive_overview"))
             and ((extract_compatibility.get("extract_agent_memories") or {}).get("accepts_latest_archive_session_time"))
         )
-        if not provider_ok or not agent_ok:
+        if compat_error:
+            findings.append(
+                "preflight 运行时接口自检无法完成："
+                + str(compat_error)
+                + "。当前 OpenViking 运行时可能缺模块或混装，不能视为可信评测环境。"
+            )
+        elif not provider_ok or not agent_ok:
             findings.append(
                 "preflight 运行时接口自检失败：OpenViking extraction 相关函数签名与当前 session 调用路径不兼容。"
             )

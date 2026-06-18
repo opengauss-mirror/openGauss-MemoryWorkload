@@ -172,3 +172,36 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert any("preflight 运行时接口自检失败" in item for item in result["findings"])
     assert any("接口签名错配" in item for item in result["findings"])
     assert result["findings"]
+
+
+def test_diagnose_official_small_surfaces_extract_compatibility_import_error(tmp_path: Path):
+    run_dir = tmp_path / "run-import-error"
+    artifacts = run_dir / "external_artifacts" / "official_small"
+    logs = artifacts / "remote_logs"
+    logs.mkdir(parents=True)
+    meta = {
+        "run_id": "demo-import-error",
+        "plugin_namespace_config": {"final": {}},
+        "ingest_sessions": [],
+        "qa_rows": [],
+        "ov_log_tail": [],
+    }
+    (artifacts / "phaseA_demo_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    (logs / "demo-import-error.preflight.json").write_text(
+        json.dumps(
+            {
+                "extract_compatibility": {
+                    "error": "No module named 'openviking.session.memory.constants'",
+                    "error_type": "ModuleNotFoundError",
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    result = diagnose_official_small_run(run_dir)
+
+    assert result["runtime"]["extract_compatibility"]["error_type"] == "ModuleNotFoundError"
+    assert any("不能视为可信评测环境" in item for item in result["findings"])

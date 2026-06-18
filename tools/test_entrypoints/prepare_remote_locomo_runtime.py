@@ -49,6 +49,71 @@ def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
     return repeated.sub('\n        "post_ingest_reindex": reindex_result,', phase_text)
 
 
+def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
+    if kind == "session_extract_context_provider":
+        marker = "latest_archive_session_time: str = \"\","
+        if marker in source_text:
+            return source_text
+        return source_text.replace(
+            "        latest_archive_overview: str = \"\",\n"
+            "        isolation_handler: MemoryIsolationHandler = None,\n",
+            "        latest_archive_overview: str = \"\",\n"
+            "        latest_archive_session_time: str = \"\",\n"
+            "        isolation_handler: MemoryIsolationHandler = None,\n",
+        )
+    if kind == "extract_agent_memories":
+        if (
+            "    async def extract_agent_memories(\n"
+            "        self,\n"
+            "        messages: List[Message],\n"
+            "        ctx: Optional[RequestContext] = None,\n"
+            "        strict_extract_errors: bool = False,\n"
+            "        latest_archive_overview: str = \"\",\n"
+            "        latest_archive_session_time: str = \"\",\n"
+            "    ) -> List[Context]:\n"
+        ) in source_text:
+            return source_text
+        return source_text.replace(
+            "    async def extract_agent_memories(\n"
+            "        self,\n"
+            "        messages: List[Message],\n"
+            "        ctx: Optional[RequestContext] = None,\n"
+            "        strict_extract_errors: bool = False,\n"
+            "    ) -> List[Context]:\n",
+            "    async def extract_agent_memories(\n"
+            "        self,\n"
+            "        messages: List[Message],\n"
+            "        ctx: Optional[RequestContext] = None,\n"
+            "        strict_extract_errors: bool = False,\n"
+            "        latest_archive_overview: str = \"\",\n"
+            "        latest_archive_session_time: str = \"\",\n"
+            "    ) -> List[Context]:\n",
+        )
+    raise ValueError(f"unsupported compatibility patch kind: {kind}")
+
+
+def _ensure_openclaw_openviking_plugin_compat(source_text: str) -> str:
+    updated = re.sub(
+        r'export function createSessionAgentResolver\(configAgentId: string\) \{\n'
+        r'\s*const configAgentPrefix = configAgentId\.trim\(\) === "default" \? "" : configAgentId\.trim\(\);\n',
+        'export function createSessionAgentResolver(configAgentId?: string | null) {\n'
+        '  const normalizedConfigAgentId = typeof configAgentId === "string" ? configAgentId.trim() : "";\n'
+        '  const configAgentPrefix = normalizedConfigAgentId === "default" ? "" : normalizedConfigAgentId;\n',
+        source_text,
+    )
+    updated = updated.replace(
+        "        cfg.agent_prefix,\n"
+        "        cfg.timeoutMs,\n",
+        '        cfg.agent_prefix ?? "",\n'
+        "        cfg.timeoutMs,\n",
+    )
+    updated = updated.replace(
+        "    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix);\n",
+        '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\n',
+    )
+    return updated
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Patch remote LoCoMo/OpenClaw runtime for benchmark runs.")
     parser.add_argument("--ssh-host", default="jcp@123.60.114.206")
@@ -98,6 +163,69 @@ def main() -> None:
         def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
             repeated = re.compile(r'(\\n        \"post_ingest_reindex\": reindex_result,){{2,}}', re.MULTILINE)
             return repeated.sub('\\n        \"post_ingest_reindex\": reindex_result,', phase_text)
+
+        def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
+            if kind == "session_extract_context_provider":
+                marker = "latest_archive_session_time: str = \\"\\","
+                if marker in source_text:
+                    return source_text
+                return source_text.replace(
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        isolation_handler: MemoryIsolationHandler = None,\\n",
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        latest_archive_session_time: str = \\"\\",\\n"
+                    "        isolation_handler: MemoryIsolationHandler = None,\\n",
+                )
+            if kind == "extract_agent_memories":
+                if (
+                    "    async def extract_agent_memories(\\n"
+                    "        self,\\n"
+                    "        messages: List[Message],\\n"
+                    "        ctx: Optional[RequestContext] = None,\\n"
+                    "        strict_extract_errors: bool = False,\\n"
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        latest_archive_session_time: str = \\"\\",\\n"
+                    "    ) -> List[Context]:\\n"
+                ) in source_text:
+                    return source_text
+                return source_text.replace(
+                    "    async def extract_agent_memories(\\n"
+                    "        self,\\n"
+                    "        messages: List[Message],\\n"
+                    "        ctx: Optional[RequestContext] = None,\\n"
+                    "        strict_extract_errors: bool = False,\\n"
+                    "    ) -> List[Context]:\\n",
+                    "    async def extract_agent_memories(\\n"
+                    "        self,\\n"
+                    "        messages: List[Message],\\n"
+                    "        ctx: Optional[RequestContext] = None,\\n"
+                    "        strict_extract_errors: bool = False,\\n"
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        latest_archive_session_time: str = \\"\\",\\n"
+                    "    ) -> List[Context]:\\n",
+                )
+            raise ValueError(f"unsupported compatibility patch kind: {{kind}}")
+
+        def _ensure_openclaw_openviking_plugin_compat(source_text: str) -> str:
+            updated = re.sub(
+                r'export function createSessionAgentResolver\\(configAgentId: string\\) \\{{\\n'
+                r'\\s*const configAgentPrefix = configAgentId\\.trim\\(\\) === "default" \\? "" : configAgentId\\.trim\\(\\);\\n',
+                'export function createSessionAgentResolver(configAgentId?: string | null) {{\\n'
+                '  const normalizedConfigAgentId = typeof configAgentId === "string" ? configAgentId.trim() : "";\\n'
+                '  const configAgentPrefix = normalizedConfigAgentId === "default" ? "" : normalizedConfigAgentId;\\n',
+                source_text,
+            )
+            updated = updated.replace(
+                "        cfg.agent_prefix,\\n"
+                "        cfg.timeoutMs,\\n",
+                '        cfg.agent_prefix ?? "",\\n'
+                "        cfg.timeoutMs,\\n",
+            )
+            updated = updated.replace(
+                "    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix);\\n",
+                '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\\n',
+            )
+            return updated
 
         shell_path = benchmark_dir / "run_clean_small_in_container.sh"
         shell_text = shell_path.read_text(encoding="utf-8")
@@ -329,6 +457,51 @@ def main() -> None:
         )
         phase_path.write_text(phase_text, encoding="utf-8")
 
+        plugin_index_path = Path("/root/.openclaw/extensions/openviking/index.ts")
+        if plugin_index_path.exists():
+            plugin_index_text = plugin_index_path.read_text(encoding="utf-8")
+            plugin_index_text = _ensure_openclaw_openviking_plugin_compat(plugin_index_text)
+            plugin_index_path.write_text(plugin_index_text, encoding="utf-8")
+
+        compat_targets = [
+            (
+                Path("/home/jcp/agent/code/OpenViking/openviking/session/memory/session_extract_context_provider.py"),
+                "session_extract_context_provider",
+            ),
+            (
+                Path("/home/jcp/agent/code/OpenViking/openviking/session/compressor_v2.py"),
+                "extract_agent_memories",
+            ),
+            (
+                Path("/root/.openviking/venv-0.3.24/lib/python3.11/site-packages/openviking/session/memory/session_extract_context_provider.py"),
+                "session_extract_context_provider",
+            ),
+            (
+                Path("/root/.openviking/venv-0.3.24/lib64/python3.11/site-packages/openviking/session/memory/session_extract_context_provider.py"),
+                "session_extract_context_provider",
+            ),
+            (
+                Path("/root/.openviking/venv-0.3.24/lib/python3.11/site-packages/openviking/session/compressor_v2.py"),
+                "extract_agent_memories",
+            ),
+            (
+                Path("/root/.openviking/venv-0.3.24/lib64/python3.11/site-packages/openviking/session/compressor_v2.py"),
+                "extract_agent_memories",
+            ),
+        ]
+        compat_results = []
+        for compat_path, compat_kind in compat_targets:
+            if not compat_path.exists():
+                compat_results.append({{"path": str(compat_path), "status": "missing"}})
+                continue
+            original = compat_path.read_text(encoding="utf-8")
+            updated = _ensure_openviking_signature_compat(original, compat_kind)
+            if updated != original:
+                compat_path.write_text(updated, encoding="utf-8")
+                compat_results.append({{"path": str(compat_path), "status": "patched", "kind": compat_kind}})
+            else:
+                compat_results.append({{"path": str(compat_path), "status": "unchanged", "kind": compat_kind}})
+
         agents_path = Path("/root/.openclaw/workspace/locomo-eval/AGENTS.md")
         agents_path.parent.mkdir(parents=True, exist_ok=True)
         if agents_path.exists():
@@ -387,6 +560,7 @@ def main() -> None:
             "locomo_eval_model": verified_agent.get("model"),
             "locomo_eval_workspace": verified_agent.get("workspace"),
             "default_model": default_model,
+            "openviking_signature_compat": compat_results,
         }}, ensure_ascii=False))
         """
     ).strip()
