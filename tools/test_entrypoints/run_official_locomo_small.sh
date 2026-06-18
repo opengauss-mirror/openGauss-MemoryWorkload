@@ -13,6 +13,7 @@ SESSIONS="${SESSIONS:-1-4}"
 JUDGE_PARALLEL="${JUDGE_PARALLEL:-5}"
 SKIP_JUDGE="${SKIP_JUDGE:-false}"
 QA_DISABLE_AUTOCAPTURE="${QA_DISABLE_AUTOCAPTURE:-}"
+FAIL_ON_OV_INCOMPATIBLE_EXTRACTION="${FAIL_ON_OV_INCOMPATIBLE_EXTRACTION:-true}"
 RUN_ID="${RUN_ID:-official_${MODE}_sample${SAMPLE}_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/${RUN_ID}}"
 LOCAL_OUTPUT_DIR="${OUTPUT_DIR}"
@@ -35,6 +36,58 @@ ROOT_KEY="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["root_key
 SEED_KEY="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["seed_key"])' "${REMOTE_CFG_JSON}")"
 BASE_URL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["base_url"])' "${REMOTE_CFG_JSON}")"
 JUDGE_MODEL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["model"])' "${REMOTE_CFG_JSON}")"
+
+capture_remote_preflight_local() {
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '/root/.openviking/venv-0.3.24/bin/python - <<\"PY\"
+import inspect
+import json
+import requests
+from openviking.session.compressor_v2 import SessionCompressorV2
+from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
+
+headers = {\"X-API-Key\": \"${ROOT_KEY}\"}
+base = \"http://127.0.0.1:1933\"
+
+def fetch(path):
+    try:
+        resp = requests.get(base + path, headers=headers, timeout=20)
+        body = resp.json() if resp.headers.get(\"content-type\", \"\").startswith(\"application/json\") else resp.text
+        return {\"status_code\": resp.status_code, \"body\": body}
+    except Exception as exc:
+        return {\"error\": str(exc)}
+
+provider_sig = inspect.signature(SessionExtractContextProvider.__init__)
+long_sig = inspect.signature(SessionCompressorV2.extract_long_term_memories)
+agent_attr = getattr(SessionCompressorV2, \"extract_agent_memories\", None)
+agent_sig = inspect.signature(agent_attr) if agent_attr else None
+payload = {
+    \"run_id\": \"${RUN_ID}\",
+    \"snapshot\": \"preflight\",
+    \"health\": fetch(\"/health\"),
+    \"extract_compatibility\": {
+        \"session_extract_context_provider\": {
+            \"file\": inspect.getsourcefile(SessionExtractContextProvider),
+            \"params\": list(provider_sig.parameters.keys()),
+            \"accepts_latest_archive_session_time\": \"latest_archive_session_time\" in provider_sig.parameters,
+        },
+        \"extract_long_term_memories\": {
+            \"file\": inspect.getsourcefile(SessionCompressorV2.extract_long_term_memories),
+            \"params\": list(long_sig.parameters.keys()),
+            \"accepts_latest_archive_overview\": \"latest_archive_overview\" in long_sig.parameters,
+            \"accepts_latest_archive_session_time\": \"latest_archive_session_time\" in long_sig.parameters,
+        },
+        \"extract_agent_memories\": {
+            \"exists\": agent_attr is not None,
+            \"file\": inspect.getsourcefile(agent_attr) if agent_attr else None,
+            \"params\": list(agent_sig.parameters.keys()) if agent_sig else [],
+            \"accepts_latest_archive_overview\": (\"latest_archive_overview\" in agent_sig.parameters) if agent_sig else False,
+            \"accepts_latest_archive_session_time\": (\"latest_archive_session_time\" in agent_sig.parameters) if agent_sig else False,
+        },
+    },
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY'"
+}
 
 capture_remote_snapshot() {
   local snapshot_name="$1"
@@ -105,6 +158,40 @@ PY' >/dev/null"
 }
 
 mkdir -p "${LOCAL_OUTPUT_DIR}"
+mkdir -p "${LOCAL_OUTPUT_DIR}/remote_logs"
+
+LOCAL_PREFLIGHT_JSON="${LOCAL_OUTPUT_DIR}/remote_logs/${RUN_ID}.preflight.json"
+capture_remote_preflight_local > "${LOCAL_PREFLIGHT_JSON}"
+
+if [ "${FAIL_ON_OV_INCOMPATIBLE_EXTRACTION}" = "true" ]; then
+  python3 - "${LOCAL_PREFLIGHT_JSON}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = raw.find("{")
+if start < 0:
+    print("Preflight snapshot JSON payload not found.", file=sys.stderr)
+    sys.exit(2)
+payload = json.loads(raw[start:])
+compat = payload.get("extract_compatibility") or {}
+provider_ok = bool(
+    ((compat.get("session_extract_context_provider") or {}).get("accepts_latest_archive_session_time"))
+)
+agent_ok = bool(
+    ((compat.get("extract_agent_memories") or {}).get("accepts_latest_archive_overview"))
+    and ((compat.get("extract_agent_memories") or {}).get("accepts_latest_archive_session_time"))
+)
+if not provider_ok or not agent_ok:
+    print(
+        "OpenViking extraction compatibility check failed before benchmark run. "
+        "See preflight snapshot for details.",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+PY
+fi
 
 EXISTING_PHASE_CSV="$(find "${LOCAL_OUTPUT_DIR}" -maxdepth 1 -name 'phaseA*.csv' | head -1 || true)"
 if [ -z "${EXISTING_PHASE_CSV}" ]; then
@@ -180,7 +267,6 @@ if [ -d "${TMP_PARENT}/${RUN_ID}" ] && [ "${TMP_PARENT}/${RUN_ID}" != "${LOCAL_O
   mv "${TMP_PARENT}/${RUN_ID}" "${LOCAL_OUTPUT_DIR}"
 fi
 
-mkdir -p "${LOCAL_OUTPUT_DIR}/remote_logs"
 for log_name in "${RUN_ID}.master.log" "${RUN_ID}.ov.log" "${RUN_ID}.gw.log"; do
   if [ -f "${TMP_PARENT}/${log_name}" ]; then
     mv "${TMP_PARENT}/${log_name}" "${LOCAL_OUTPUT_DIR}/remote_logs/${log_name}"
