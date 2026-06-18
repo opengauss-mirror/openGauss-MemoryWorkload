@@ -27,6 +27,28 @@ def _remove_redundant_reindex_injection(phase_text: str) -> str:
     return pattern.sub("\n", phase_text)
 
 
+def _remove_redundant_plugin_config_cleanup(phase_text: str) -> str:
+    repeated = re.compile(
+        r"(\n    changed\.update\(\n        \{\n            key: None\n            for key in legacy_keys\n            if key in current\n        \}\n    \)\n){2,}",
+        re.MULTILINE,
+    )
+    single = (
+        "\n    changed.update(\n"
+        "        {\n"
+        "            key: None\n"
+        "            for key in legacy_keys\n"
+        "            if key in current\n"
+        "        }\n"
+        "    )\n"
+    )
+    return repeated.sub(single, phase_text)
+
+
+def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
+    repeated = re.compile(r'(\n        "post_ingest_reindex": reindex_result,){2,}', re.MULTILINE)
+    return repeated.sub('\n        "post_ingest_reindex": reindex_result,', phase_text)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Patch remote LoCoMo/OpenClaw runtime for benchmark runs.")
     parser.add_argument("--ssh-host", default="jcp@123.60.114.206")
@@ -57,16 +79,42 @@ def main() -> None:
             )
             return pattern.sub("\\n", phase_text)
 
+        def _remove_redundant_plugin_config_cleanup(phase_text: str) -> str:
+            repeated = re.compile(
+                r"(\\n    changed\\.update\\(\\n        \\{{\\n            key: None\\n            for key in legacy_keys\\n            if key in current\\n        \\}}\\n    \\)\\n){{2,}}",
+                re.MULTILINE,
+            )
+            single = (
+                "\\n    changed.update(\\n"
+                "        {{\\n"
+                "            key: None\\n"
+                "            for key in legacy_keys\\n"
+                "            if key in current\\n"
+                "        }}\\n"
+                "    )\\n"
+            )
+            return repeated.sub(single, phase_text)
+
+        def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
+            repeated = re.compile(r'(\\n        \"post_ingest_reindex\": reindex_result,){{2,}}', re.MULTILINE)
+            return repeated.sub('\\n        \"post_ingest_reindex\": reindex_result,', phase_text)
+
         shell_path = benchmark_dir / "run_clean_small_in_container.sh"
         shell_text = shell_path.read_text(encoding="utf-8")
         shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\\n', '')
         shell_text = shell_text.replace('cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\\n', '')
         shell_text = shell_text.replace('cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\\n', '')
+        shell_text = shell_text.replace(
+            '    --qa-disable-autocapture\\n',
+            '    ${{QA_DISABLE_AUTOCAPTURE:+--qa-disable-autocapture}}\\n',
+        )
         shell_path.write_text(shell_text, encoding="utf-8")
 
         phase_path = benchmark_dir / "phase_a_off.py"
         phase_text = phase_path.read_text(encoding="utf-8")
         phase_text = _remove_redundant_reindex_injection(phase_text)
+        phase_text = _remove_redundant_plugin_config_cleanup(phase_text)
+        phase_text = _remove_redundant_post_ingest_meta(phase_text)
         phase_text = phase_text.replace(
             '    updates: dict[str, Any] = {{\\n'
             '        "userId": user,\\n'
