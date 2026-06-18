@@ -11,7 +11,9 @@ from .official_small_timing import (
     build_official_small_timing_report,
     render_official_small_timing_html,
 )
+from .external_report_import import import_external_result
 from .reporter import write_analysis_json, write_analysis_markdown
+from .reporter import write_case_results, write_external_result_summary, write_summary
 from .reporter import write_timing_report_html, write_timing_report_json
 
 RETRIEVAL_MISS_PATTERNS = (
@@ -38,6 +40,9 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     summary = _load_json(run_dir / "reports" / "summary.json")
     case_results = _load_json(run_dir / "reports" / "case_results.json")
     external_result = _load_optional_json(run_dir / "reports" / "external_result_summary.json")
+    refreshed = _refresh_external_reports(run_dir, run_record)
+    if refreshed is not None:
+        summary, case_results, external_result = refreshed
 
     failures = [item for item in case_results if not bool(item.get("passed"))]
     buckets = _bucket_failures(failures)
@@ -79,6 +84,81 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     write_analysis_json(run_dir, analysis)
     write_analysis_markdown(run_dir, _render_analysis_markdown(analysis))
     return analysis
+
+
+def _refresh_external_reports(
+    run_dir: Path,
+    run_record: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]] | None:
+    if run_record.get("source_kind") != "external_benchmark_runner":
+        return None
+    external_output_dir = _resolve_external_output_dir(run_dir)
+    if external_output_dir is None:
+        return None
+    try:
+        imported = import_external_result(external_output_dir)
+    except FileNotFoundError:
+        return None
+
+    case_results = imported["case_results"]
+    summary = _summary_from_external_result(run_dir.name, imported)
+    write_external_result_summary(run_dir, imported)
+    write_case_results(run_dir, case_results)
+    write_summary(run_dir, summary)
+    return summary, case_results, imported
+
+
+def _resolve_external_output_dir(run_dir: Path) -> Path | None:
+    record_path = run_dir / "records" / "external_entrypoint.json"
+    if record_path.exists():
+        try:
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        entrypoint_id = payload.get("entrypoint_id")
+        if isinstance(entrypoint_id, str) and entrypoint_id:
+            candidate = run_dir / "external_artifacts" / entrypoint_id
+            if candidate.exists():
+                return candidate
+
+    artifacts_root = run_dir / "external_artifacts"
+    if not artifacts_root.exists():
+        return None
+    for candidate in sorted(path for path in artifacts_root.iterdir() if path.is_dir()):
+        if (candidate / "qa_results.csv").exists():
+            return candidate
+        if list(candidate.glob("phaseA*.csv")):
+            return candidate
+    return None
+
+
+def _summary_from_external_result(run_id: str, imported: dict[str, Any]) -> dict[str, Any]:
+    summary = imported.get("summary", {})
+    total_questions = int(summary.get("total_questions", 0) or 0)
+    total_correct = int(summary.get("total_correct", 0) or 0)
+    total_graded = int(summary.get("total_graded", 0) or 0)
+    ungraded_count = int(summary.get("ungraded_count", max(0, total_questions - total_graded)) or 0)
+    if total_questions <= 0:
+        status = "failed"
+    elif ungraded_count > 0:
+        status = "partial"
+    elif total_correct == total_questions:
+        status = "passed"
+    else:
+        status = "failed"
+    return {
+        "run_id": run_id,
+        "status": status,
+        "case_total": total_questions,
+        "case_passed": total_correct,
+        "case_failed": total_graded - total_correct if ungraded_count <= 0 else total_questions - total_correct,
+        "category_summary": summary.get("accuracy_by_category", {}),
+        "resource_summary": {
+            "token_totals": summary.get("token_totals", {}),
+            "memory_token_totals": summary.get("memory_token_totals", {}),
+            "ungraded_count": ungraded_count,
+        },
+    }
 
 
 def classify_failure(case_result: dict[str, Any]) -> tuple[str, str]:

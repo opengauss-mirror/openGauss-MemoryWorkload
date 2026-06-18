@@ -130,6 +130,45 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert (run_dir / "reports" / "timing_report.html").is_file()
 
 
+def test_analyze_run_refreshes_external_result_and_summary_from_external_artifacts(tmp_path: Path):
+    run_dir = tmp_path / "run-refresh"
+    _build_minimal_run(run_dir)
+    (run_dir / "records").mkdir(parents=True, exist_ok=True)
+    (run_dir / "records" / "external_entrypoint.json").write_text(
+        json.dumps({"entrypoint_id": "official_small", "benchmark_id": "locomo", "agent_id": "openclaw"}),
+        encoding="utf-8",
+    )
+    artifacts = run_dir / "external_artifacts" / "official_small"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "qa_results.csv").write_text(
+        "\n".join(
+            [
+                "sample_id,qi,question,expected,response,category,result,reasoning",
+                "conv-1,1,Q1,A1,R1,1,CORRECT,ok",
+                "conv-1,2,Q2,A2,R2,1,WRONG,bad",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "reports" / "external_result_summary.json").write_text(
+        json.dumps({"source": "csv_result", "summary": {"total_questions": 2, "total_graded": 0, "total_correct": 0}, "case_results": []}),
+        encoding="utf-8",
+    )
+
+    analysis = analyze_run(run_dir)
+    summary = json.loads((run_dir / "reports" / "summary.json").read_text(encoding="utf-8"))
+    external = json.loads((run_dir / "reports" / "external_result_summary.json").read_text(encoding="utf-8"))
+    case_results = json.loads((run_dir / "reports" / "case_results.json").read_text(encoding="utf-8"))
+
+    assert analysis["overall_accuracy"] == 0.5
+    assert summary["status"] == "failed"
+    assert summary["case_total"] == 2
+    assert summary["case_passed"] == 1
+    assert summary["case_failed"] == 1
+    assert external["summary"]["total_graded"] == 2
+    assert len(case_results) == 2
+
+
 def test_analyze_run_writes_timing_report_for_official_sample0(tmp_path: Path):
     run_dir = tmp_path / "run-sample0"
     _build_minimal_run(run_dir)
