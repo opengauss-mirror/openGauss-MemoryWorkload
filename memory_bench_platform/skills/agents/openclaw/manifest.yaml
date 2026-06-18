@@ -20,12 +20,12 @@ version_policy:
     - name: openclaw
       scope: system_under_test
       version_source: upstream_release_tag
-      upstream: https://github.com/coding-guy/openclaw
+      upstream: https://github.com/openclaw/openclaw
       record_runtime_version: true
     - name: openviking
       scope: memory_backend
       version_source: upstream_release_tag
-      upstream: https://github.com/xforce-io/openviking
+      upstream: https://github.com/volcengine/OpenViking
       record_runtime_version: true
   record_runtime_version: true
   notes: Default to latest official release tags for both OpenClaw and OpenViking, and record the resolved runtime versions in every real run.

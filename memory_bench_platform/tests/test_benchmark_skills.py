@@ -48,7 +48,7 @@ def test_ovtest_memory_manifest_declares_case_builder():
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "openviking"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
-    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xforce-io/openviking"
+    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/volcengine/OpenViking"
 
 
 def test_ovtest_health_manifest_declares_case_builder():
@@ -59,7 +59,7 @@ def test_ovtest_health_manifest_declares_case_builder():
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "openviking"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
-    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xforce-io/openviking"
+    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/volcengine/OpenViking"
 
 
 def test_ovtest_admin_memory_manifest_declares_case_builder():
@@ -70,4 +70,4 @@ def test_ovtest_admin_memory_manifest_declares_case_builder():
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "openviking"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
-    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/xforce-io/openviking"
+    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/volcengine/OpenViking"

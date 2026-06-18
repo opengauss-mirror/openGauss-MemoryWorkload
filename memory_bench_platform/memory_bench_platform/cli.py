@@ -25,6 +25,7 @@ from .result_analysis import analyze_run
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .resource_monitor import ResourceMonitor
 from .storage import RunStorage
+from .versioning import build_version_selection
 from .workflow import execute_cases
 
 
@@ -87,16 +88,8 @@ def _plan_from_args(args: argparse.Namespace):
 
 def _build_version_selection(benchmark_manifest, agent_manifest) -> dict[str, dict]:
     return {
-        "benchmark": {
-            "selection_mode": benchmark_manifest.version_policy.default_selection,
-            "overridden": False,
-            "targets": [target.model_dump(mode="json") for target in benchmark_manifest.version_policy.targets],
-        },
-        "agent": {
-            "selection_mode": agent_manifest.version_policy.default_selection,
-            "overridden": False,
-            "targets": [target.model_dump(mode="json") for target in agent_manifest.version_policy.targets],
-        },
+        "benchmark": build_version_selection(benchmark_manifest),
+        "agent": build_version_selection(agent_manifest),
     }
 
 

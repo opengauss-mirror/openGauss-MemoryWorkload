@@ -95,6 +95,7 @@ python3 -m memory_bench_platform.cli validate \
   - the version policy declared by the selected skill
   - the default-or-override selection outcome derived from that skill
   - the concrete runtime version that was actually observed/resolved
+- `records/version_selection.json` should include per-target default resolution results, for example the latest upstream release tag resolved from `targets[].upstream`.
 - For real benchmark integrations, default to the latest official release tag of the tested software.
 - Do not default to:
   - dirty worktrees
@@ -137,11 +138,11 @@ version_policy:
     - name: openclaw
       scope: system_under_test
       version_source: upstream_release_tag
-      upstream: https://github.com/coding-guy/openclaw
+      upstream: https://github.com/openclaw/openclaw
     - name: openviking
       scope: memory_backend
       version_source: upstream_release_tag
-      upstream: https://github.com/xforce-io/openviking
+      upstream: https://github.com/volcengine/OpenViking
   record_runtime_version: true
 ```
 

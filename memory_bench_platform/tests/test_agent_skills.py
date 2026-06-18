@@ -15,8 +15,8 @@ def test_openclaw_manifest_declares_service_runtime():
     assert manifest["version_policy"]["targets"][1]["name"] == "openviking"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][1]["version_source"] == "upstream_release_tag"
-    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/coding-guy/openclaw"
-    assert manifest["version_policy"]["targets"][1]["upstream"] == "https://github.com/xforce-io/openviking"
+    assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/openclaw/openclaw"
+    assert manifest["version_policy"]["targets"][1]["upstream"] == "https://github.com/volcengine/OpenViking"
 
 
 def test_generic_cli_manifest_declares_process_runtime():

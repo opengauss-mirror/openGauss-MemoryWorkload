@@ -20,7 +20,7 @@ version_policy:
     - name: openviking
       scope: system_under_test
       version_source: upstream_release_tag
-      upstream: https://github.com/xforce-io/openviking
+      upstream: https://github.com/volcengine/OpenViking
       record_runtime_version: true
   record_runtime_version: true
   notes: OpenViking memory checks should target the latest official release tag by default and record the resolved runtime version in the run archive.
