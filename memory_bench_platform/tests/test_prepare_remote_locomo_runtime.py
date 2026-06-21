@@ -37,7 +37,6 @@ def test_enable_benchmark_plugin_diagnostics_is_idempotent():
     shell_text = (
         'cfg["userId"] = user_id\n'
         'cfg["accountId"] = account_id\n'
-        'cfg["agent_prefix"] = account_id\n'
     )
 
     updated = MODULE._enable_benchmark_plugin_diagnostics(shell_text)
@@ -86,6 +85,14 @@ def test_enable_dedicated_gateway_port_is_idempotent():
 
 def test_openclaw_openviking_client_diag_injects_request_error_and_identity_fastpath():
     source_text = (
+        '  private resolveEffectiveAgentId(agentId?: string): string {\n'
+        '    const explicit = agentId?.trim();\n'
+        '    if (explicit) {\n'
+        '      return explicit;\n'
+        '    }\n'
+        '    const prefix = this.defaultAgentId.trim();\n'
+        '    return prefix ? `${prefix}_main` : "main";\n'
+        '  }\n'
         '      if (!response.ok || payload.status === "error") {\n'
         '        const code = payload.error?.code ? ` [${payload.error.code}]` : "";\n'
         '        const message = payload.error?.message ?? `HTTP ${response.status}`;\n'
@@ -101,6 +108,8 @@ def test_openclaw_openviking_client_diag_injects_request_error_and_identity_fast
 
     assert "openviking: request error ${path}" in updated
     assert "hasApiKey: Boolean(tenantHeaders.apiKey)" in updated
+    assert "this.isolateUserScopeByAgent" in updated
+    assert 'return `${accountId}_${explicit}`;' in updated
     assert 'const configuredUserId = this.userId.trim();' in updated
     assert 'const identity: RuntimeIdentity = { userId: configuredUserId, agentId: effectiveAgentId };' in updated
     assert updated == updated_twice
@@ -160,6 +169,8 @@ def test_enable_isolated_runtime_injects_state_dir_and_openviking_isolation():
     assert 'ln -s "${OPENCLAW_STATE_DIR}" "${OPENCLAW_HOME_DIR}/.openclaw"' in updated
     assert 'base_config.pop("stateDir", None)' in updated
     assert 'config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")' in updated
+    assert 'plugin_manifest = extensions_dst / "openclaw.plugin.json"' in updated
+    assert 'properties.setdefault("agent_prefix", {"type": "string"})' in updated
     assert 'cfg.setdefault("storage", {}).setdefault("agfs", {})["port"] = agfs_port' in updated
     assert 'target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")' in updated
     assert 'base_config["stateDir"] = str(state_dir)' not in updated
@@ -169,7 +180,8 @@ def test_enable_isolated_runtime_injects_state_dir_and_openviking_isolation():
     assert 'nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &' in updated
     assert "__OVTEST_PLUGIN_USERKEY__" in updated
     assert 'cfg["apiKey"] = str(cfg.get("apiKey") or user_key or "")' in updated
-    assert 'cfg["agent_prefix"] = account_id' in updated
+    assert 'cfg["agent_prefix"] = account_id' not in updated
+    assert 'cfg.pop("agent_prefix", None)' in updated
     assert 'cfg.pop("accountId", None)' not in updated
     assert 'cfg.pop("userId", None)' not in updated
     assert 'cfg.pop("isolateUserScopeByAgent", None)' not in updated

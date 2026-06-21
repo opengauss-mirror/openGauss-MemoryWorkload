@@ -39,10 +39,11 @@
 - 当 `OpenClaw` 以 `OpenViking` 远端 context-engine 运行时，默认应显式写入：
   - `accountId`
   - `userId`
-  - `agent_prefix=accountId`
   - `isolateUserScopeByAgent=true`
   - `isolateAgentScopeByUser=true`
-- 若缺少 `agent_prefix=accountId`，可能出现：
+- 并保证插件实际发出的 `X-OpenViking-Agent` 与 canonical namespace 对齐：
+  - 推荐效果等价于 `accountId + "_" + sessionAgentId`
+- 若这层 account-scoped agent id 未对齐，可能出现：
   - 手工 direct probe 能命中
   - 平台自动 recall 仍落到错误 agent scope
   - `official_small` 回答大量表现为 `retrieval_miss`

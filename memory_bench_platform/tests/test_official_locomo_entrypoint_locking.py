@@ -36,7 +36,8 @@ def test_official_locomo_small_uses_shared_remote_lock_and_process_guard():
     assert 'isolate_user_scope_by_agent\\\\\\":true' in text
     assert 'isolate_agent_scope_by_user\\\\\\":true' in text
     assert 'keeping root API key with explicit tenant headers' in text
-    assert 'cfg["agent_prefix"] = account_id' in text
+    assert 'cfg["agent_prefix"] = account_id' not in text
+    assert 'cfg.pop("agent_prefix", None)' in text
     assert 'cfg["apiKey"] = str(cfg.get("apiKey") or user_key or "")' in text
     assert '"plugin_api_key": "preserved"' in text
     assert 'call_pattern = re.compile(' in text

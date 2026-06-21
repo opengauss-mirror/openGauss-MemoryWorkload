@@ -226,7 +226,7 @@ sync_block = textwrap.dedent(
     cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user
     cfg["emitStandardDiagnostics"] = True
     cfg["logFindRequests"] = True
-    cfg["agent_prefix"] = account_id
+    cfg.pop("agent_prefix", None)
 
     slots = plugins.setdefault("slots", {})
     slots["contextEngine"] = "openviking"

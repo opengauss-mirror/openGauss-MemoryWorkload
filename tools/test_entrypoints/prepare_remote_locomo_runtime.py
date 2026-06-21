@@ -254,6 +254,16 @@ if extensions_src.exists():
         shutil.rmtree(extensions_dst)
     extensions_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(extensions_src, extensions_dst)
+    plugin_manifest = extensions_dst / "openclaw.plugin.json"
+    if plugin_manifest.exists():
+        manifest_data = json.loads(plugin_manifest.read_text(encoding="utf-8"))
+        config_schema = manifest_data.setdefault("configSchema", {})
+        properties = config_schema.setdefault("properties", {})
+        properties.setdefault("agent_prefix", {"type": "string"})
+        plugin_manifest.write_text(
+            json.dumps(manifest_data, ensure_ascii=False, indent=2) + chr(10),
+            encoding="utf-8",
+        )
 PY
 
   python3 - "${BASE_OV_CONF_PATH}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" "${OPENVIKING_AGFS_PORT}" <<'PY'
@@ -391,15 +401,22 @@ backup_and_reset() {\n""",
         shell_text = shell_text.replace(
             'cfg["userId"] = user_id\n',
             'cfg["accountId"] = account_id\n'
-            'cfg["agent_prefix"] = account_id\n'
             'cfg["userId"] = user_id\n',
         )
-    elif 'cfg["agent_prefix"] = account_id\n' not in shell_text:
-        shell_text = shell_text.replace(
-            'cfg["accountId"] = account_id\n',
-            'cfg["accountId"] = account_id\n'
-            'cfg["agent_prefix"] = account_id\n',
-        )
+    shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\n', "")
+    if 'cfg.pop("agent_prefix", None)\n' not in shell_text:
+        if 'cfg["logFindRequests"] = True\n' in shell_text:
+            shell_text = shell_text.replace(
+                'cfg["logFindRequests"] = True\n',
+                'cfg["logFindRequests"] = True\n'
+                'cfg.pop("agent_prefix", None)\n',
+            )
+        else:
+            shell_text = shell_text.replace(
+                'cfg["accountId"] = account_id\n',
+                'cfg["accountId"] = account_id\n'
+                'cfg.pop("agent_prefix", None)\n',
+            )
     shell_text = shell_text.replace('cfg.pop("isolateUserScopeByAgent", None)\n', "")
     shell_text = shell_text.replace('cfg.pop("isolateAgentScopeByUser", None)\n', "")
 
@@ -747,6 +764,46 @@ def _ensure_openclaw_openviking_client_diag(source_text: str) -> str:
     const fallback: RuntimeIdentity = { userId: "default", agentId: effectiveAgentId };
     try {
       const status = await this.request<{ user?: unknown }>("/api/v1/system/status", {}, agentId);
+""",
+        )
+    if "return `${accountId}_${explicit}`;" not in source_text:
+        source_text = source_text.replace(
+            """  private resolveEffectiveAgentId(agentId?: string): string {
+    const explicit = agentId?.trim();
+    if (explicit) {
+      return explicit;
+    }
+    const prefix = this.defaultAgentId.trim();
+    return prefix ? `${prefix}_main` : "main";
+  }
+""",
+            """  private resolveEffectiveAgentId(agentId?: string): string {
+    const explicit = agentId?.trim();
+    if (explicit) {
+      const accountId = this.accountId.trim();
+      if (
+        accountId &&
+        this.isolateUserScopeByAgent &&
+        explicit !== accountId &&
+        !explicit.startsWith(`${accountId}_`)
+      ) {
+        return `${accountId}_${explicit}`;
+      }
+      return explicit;
+    }
+    const prefix = this.defaultAgentId.trim();
+    const fallback = prefix ? `${prefix}_main` : "main";
+    const accountId = this.accountId.trim();
+    if (
+      accountId &&
+      this.isolateUserScopeByAgent &&
+      fallback !== accountId &&
+      !fallback.startsWith(`${accountId}_`)
+    ) {
+      return `${accountId}_${fallback}`;
+    }
+    return fallback;
+  }
 """,
         )
     return source_text
