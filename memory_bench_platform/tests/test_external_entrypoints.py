@@ -142,7 +142,7 @@ def test_external_runner_receives_expected_version_env(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(
         cli_module,
         "build_version_selection",
-        lambda manifest: {
+        lambda manifest, overrides=None: {
             "selection_mode": "latest_official_release_tag",
             "overridden": False,
             "targets": [
@@ -202,3 +202,88 @@ def test_external_runner_receives_expected_version_env(monkeypatch, tmp_path: Pa
     env = captured["env"]
     assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
     assert env["MEMORY_BENCH_EXPECTED_OPENCLAW_UPSTREAM"] == "https://github.com/openclaw/openclaw"
+
+
+def test_external_runner_receives_version_override_env(monkeypatch, tmp_path: Path):
+    from memory_bench_platform import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+
+    captured = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "_plan_from_args",
+        lambda args: type(
+            "Plan",
+            (),
+            {
+                "run_id": "run-ext-version-override",
+                "benchmark_id": args.benchmark,
+                "agent_id": args.agent,
+                "benchmark_version": None,
+                "agent_version": None,
+                "memory_backend": None,
+                "hardware_profile": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_benchmark_entrypoint",
+        lambda benchmark, entrypoint_id: type(
+            "EntryPoint",
+            (),
+            {
+                "entrypoint_id": "official_small",
+                "entrypoint_kind": "external_runner",
+                "command": ["bash", "dummy.sh"],
+            },
+        )(),
+    )
+
+    def _fake_execute(entrypoint, env, cwd=None):
+        captured["env"] = env
+        output_dir = Path(env["OUTPUT_DIR"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "overall_accuracy": 1.0,
+                    "total_correct": 1,
+                    "total_graded": 1,
+                    "total_questions": 1,
+                    "accuracy_by_category": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (output_dir / "qa_results.csv").write_text(
+            "question,expected_answer,response,category,result,input_tokens,output_tokens,cacheRead,cacheWrite,total_tokens\n"
+            "q1,a1,r1,cat,CORRECT,1,1,0,0,2\n",
+            encoding="utf-8",
+        )
+        return {"status": "passed", "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli_module, "execute_external_runner", _fake_execute)
+    monkeypatch.setattr(cli_module.Path, "cwd", lambda: tmp_path)
+
+    cli_module.main(
+        [
+            "run",
+            "--benchmark",
+            "locomo",
+            "--agent",
+            "openclaw",
+            "--entrypoint",
+            "official_small",
+            "--version-override",
+            "openviking=v0.3.24",
+            "--version-override",
+            "openclaw=v2026.4.8",
+        ]
+    )
+
+    env = captured["env"]
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
+    assert env["MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION"] == "v2026.4.8"

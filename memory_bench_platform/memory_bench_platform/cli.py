@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--hardware-profile")
     p_plan.add_argument("--data-path")
     p_plan.add_argument("--run-id")
+    p_plan.add_argument("--version-override", action="append", default=[])
 
     p_run = sub.add_parser("run")
     p_run.add_argument("--benchmark", required=True)
@@ -51,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--data-path")
     p_run.add_argument("--entrypoint")
     p_run.add_argument("--run-id")
+    p_run.add_argument("--version-override", action="append", default=[])
 
     p_validate = sub.add_parser("validate")
     p_validate.add_argument("--benchmark")
@@ -86,10 +88,24 @@ def _plan_from_args(args: argparse.Namespace):
     return build_run_plan(request)
 
 
-def _build_version_selection(benchmark_manifest, agent_manifest) -> dict[str, dict]:
+def _parse_version_overrides(raw_items: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in raw_items or []:
+        if "=" not in item:
+            raise SystemExit(f"invalid --version-override value: {item!r}; expected target=version")
+        target, version = item.split("=", 1)
+        target = target.strip()
+        version = version.strip()
+        if not target or not version:
+            raise SystemExit(f"invalid --version-override value: {item!r}; expected target=version")
+        overrides[target] = version
+    return overrides
+
+
+def _build_version_selection(benchmark_manifest, agent_manifest, *, overrides: dict[str, str]) -> dict[str, dict]:
     return {
-        "benchmark": build_version_selection(benchmark_manifest),
-        "agent": build_version_selection(agent_manifest),
+        "benchmark": build_version_selection(benchmark_manifest, overrides=overrides),
+        "agent": build_version_selection(agent_manifest, overrides=overrides),
     }
 
 
@@ -172,6 +188,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     plan = _plan_from_args(args)
+    version_overrides = _parse_version_overrides(getattr(args, "version_override", []))
 
     if args.command == "plan-run":
         print(json.dumps(asdict(plan), ensure_ascii=False, indent=2))
@@ -196,8 +213,17 @@ def main(argv: list[str] | None = None) -> None:
         hardware_profile=plan.hardware_profile,
         benchmark_version_policy=benchmark_manifest.version_policy.model_dump(mode="json"),
         agent_version_policy=agent_manifest.version_policy.model_dump(mode="json"),
-        version_selection=_build_version_selection(benchmark_manifest, agent_manifest),
-        config={"data_path": args.data_path} if args.data_path else {},
+        version_selection=_build_version_selection(benchmark_manifest, agent_manifest, overrides=version_overrides),
+        config=(
+            {
+                key: value
+                for key, value in {
+                    "data_path": args.data_path,
+                    "version_overrides": version_overrides or None,
+                }.items()
+                if value
+            }
+        ),
         status="pending",
     )
     run_record.status = "running"

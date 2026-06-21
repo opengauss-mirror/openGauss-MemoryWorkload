@@ -10,8 +10,8 @@ import textwrap
 from pathlib import Path
 
 
-def _run(cmd: list[str]) -> None:
-    subprocess.run(cmd, check=True)
+def _run(cmd: list[str], *, input_text: str | None = None) -> None:
+    subprocess.run(cmd, check=True, text=input_text is not None, input=input_text)
 
 
 def _encode_file(path: Path) -> str:
@@ -48,6 +48,28 @@ def _remove_redundant_plugin_config_cleanup(phase_text: str) -> str:
 def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
     repeated = re.compile(r'(\n        "post_ingest_reindex": reindex_result,){2,}', re.MULTILINE)
     return repeated.sub('\n        "post_ingest_reindex": reindex_result,', phase_text)
+
+
+def _normalize_remote_python_source(source_text: str) -> str:
+    lines = source_text.splitlines()
+    normalized: list[str] = []
+    in_triple_single = False
+    in_triple_double = False
+
+    for line in lines:
+        current = line
+        if not in_triple_single and not in_triple_double and current.startswith("        "):
+            current = current[8:]
+        normalized.append(current)
+
+        single_markers = current.count("'''")
+        double_markers = current.count('"""')
+        if not in_triple_double and single_markers % 2 == 1:
+            in_triple_single = not in_triple_single
+        if not in_triple_single and double_markers % 2 == 1:
+            in_triple_double = not in_triple_double
+
+    return "\n".join(normalized)
 
 
 def _enable_benchmark_plugin_diagnostics(shell_text: str) -> str:
@@ -128,14 +150,14 @@ sync_openclaw_auth_profiles() {
 
 
 def _enable_isolated_runtime(shell_text: str) -> str:
-    if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"' not in shell_text:
+    if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"' not in shell_text:
         shell_text = shell_text.replace(
             'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\n',
             'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\n'
             'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"\n'
-            'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"\n'
+            'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"\n'
             'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\n'
-            'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"\n'
+            'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-$RUN_ID}"\n'
             'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"\n',
         )
 
@@ -154,6 +176,7 @@ def _enable_isolated_runtime(shell_text: str) -> str:
         'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"\n'
         'OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"\n'
         'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\n'
+        'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\n'
         'export OPENVIKING_CONFIG_FILE="${OV_CONF_PATH}"\n'
         'export OPENCLAW_STATE_DIR\n'
         'export OPENCLAW_CONFIG_PATH\n',
@@ -277,7 +300,7 @@ backup_and_reset() {\n""",
 
     shell_text = shell_text.replace(
         '  nohup python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1 >"${OV_LOG}" 2>&1 &\n',
-        '  nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\n',
+        '  nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\n',
     )
     shell_text = shell_text.replace(
         '    if curl -fsS http://127.0.0.1:1933/health >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\n',
@@ -530,6 +553,7 @@ def main() -> None:
     remote_python = textwrap.dedent(
         """
         import base64
+        import json
         import glob
         from pathlib import Path
         import re
@@ -640,14 +664,14 @@ sync_openclaw_auth_profiles() {
             return shell_text
 
         def _enable_isolated_runtime(shell_text: str) -> str:
-            if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"' not in shell_text:
+            if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"' not in shell_text:
                 shell_text = shell_text.replace(
                     'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\\n',
                     'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\\n'
                     'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"\\n'
-                    'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"\\n'
+                    'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"\\n'
                     'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\\n'
-                    'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"\\n'
+                    'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-$RUN_ID}"\\n'
                     'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"\\n',
                 )
 
@@ -666,6 +690,7 @@ sync_openclaw_auth_profiles() {
                 'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"\\n'
                 'OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"\\n'
                 'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\\n'
+                'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\\n'
                 'export OPENVIKING_CONFIG_FILE="${OV_CONF_PATH}"\\n'
                 'export OPENCLAW_STATE_DIR\\n'
                 'export OPENCLAW_CONFIG_PATH\\n',
@@ -790,7 +815,7 @@ backup_and_reset() {
 
             shell_text = shell_text.replace(
                 '  nohup python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1 >"${OV_LOG}" 2>&1 &\\n',
-                '  nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\\n',
+                '  nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\\n',
             )
             shell_text = shell_text.replace(
                 '    if curl -fsS http://127.0.0.1:1933/health >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\\n',
@@ -1319,19 +1344,13 @@ shell_text = shell_text.replace('cfg["isolateAgentScopeByUser"] = isolate_agent_
     remote_python = remote_python.replace("__LOCOMO_MODEL__", repr(args.locomo_model))
     remote_python = remote_python.replace("__AGENTS_B64__", repr(agents_b64))
     remote_python = remote_python.replace("{{", "{").replace("}}", "}")
-    remote_python = "\n".join(
-        line[8:] if line.startswith("        ") else line
-        for line in remote_python.splitlines()
-    )
+    remote_python = _normalize_remote_python_source(remote_python)
 
-    remote_cmd = (
-        "docker exec -i "
-        + args.remote_container
-        + " python3 - <<'PY'\n"
-        + remote_python
-        + "\nPY"
+    remote_cmd = f"docker exec -i {args.remote_container} python3 -"
+    _run(
+        ["ssh", "-p", args.ssh_port, args.ssh_host, remote_cmd],
+        input_text=remote_python,
     )
-    _run(["ssh", "-p", args.ssh_port, args.ssh_host, remote_cmd])
 
 
 if __name__ == "__main__":

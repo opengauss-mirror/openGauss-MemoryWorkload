@@ -8,7 +8,7 @@ def test_stub_run_creates_run_json_and_summary(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         "memory_bench_platform.cli.build_version_selection",
-        lambda manifest: {
+        lambda manifest, overrides=None: {
             "selection_mode": manifest.version_policy.default_selection,
             "overridden": False,
             "targets": [{"name": "stub", "resolved_default": {"status": "resolved", "resolved_version": "v1.2.3"}}],

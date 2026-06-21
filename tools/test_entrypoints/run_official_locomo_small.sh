@@ -77,8 +77,9 @@ resolve_openviking_introspect_python() {
 
   local -a candidates=()
   if [ -n "${EXPECTED_OPENVIKING_VERSION}" ]; then
-    candidates+=("/root/.openviking/venv-${EXPECTED_OPENVIKING_VERSION}/bin/python")
-    candidates+=("/root/.openviking/${EXPECTED_OPENVIKING_VERSION}/bin/python")
+    local normalized_expected_openviking="${EXPECTED_OPENVIKING_VERSION#v}"
+    candidates+=("/root/.openviking/venv-${normalized_expected_openviking}/bin/python")
+    candidates+=("/root/.openviking/${normalized_expected_openviking}/bin/python")
   fi
   candidates+=(
     "/root/.openviking/venv/bin/python"
@@ -99,6 +100,7 @@ resolve_openviking_introspect_python() {
 }
 
 OPENVIKING_INTROSPECT_PYTHON_BIN="$(resolve_openviking_introspect_python)"
+OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-${OPENVIKING_INTROSPECT_PYTHON_BIN}}"
 
 check_remote_runtime_versions() {
   local remote_json
@@ -382,6 +384,7 @@ export OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR}"
 export OPENVIKING_PORT="${OPENVIKING_PORT}"
 export OV_CONF_PATH="${OV_CONF_PATH}"
 export OV_DATA_DIR="${OV_DATA_DIR}"
+export OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN}"
 
 bash ./run_clean_small_in_container.sh
 

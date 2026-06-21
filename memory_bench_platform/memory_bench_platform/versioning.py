@@ -74,9 +74,15 @@ def resolve_latest_release_tag(
     }
 
 
-def build_version_selection(manifest: Any) -> dict[str, Any]:
+def build_version_selection(
+    manifest: Any,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
     policy = manifest.version_policy
+    overrides = overrides or {}
     targets: list[dict[str, Any]] = []
+    overridden = False
     for target in policy.targets:
         target_record = target.model_dump(mode="json")
         if target.version_source == "upstream_release_tag" and target.upstream:
@@ -86,10 +92,24 @@ def build_version_selection(manifest: Any) -> dict[str, Any]:
                 "status": "runtime_observed_only",
                 "upstream": target.upstream,
             }
+        selected_version = None
+        selected_by = "latest_official_release_tag"
+        override_version = overrides.get(target.name)
+        if override_version:
+            selected_version = override_version
+            selected_by = "user_specified_official_version"
+            overridden = True
+        else:
+            resolved_default = target_record.get("resolved_default") or {}
+            if isinstance(resolved_default, dict):
+                selected_version = resolved_default.get("resolved_version")
+        target_record["selected_version"] = selected_version
+        target_record["selected_by"] = selected_by
         targets.append(target_record)
     return {
-        "selection_mode": policy.default_selection,
-        "overridden": False,
+        "selection_mode": "user_specified_official_version" if overridden else policy.default_selection,
+        "overridden": overridden,
+        "overrides": dict(overrides),
         "targets": targets,
     }
 
@@ -118,7 +138,7 @@ def build_external_runner_env(version_selection: dict[str, Any]) -> dict[str, st
             resolved_default = target.get("resolved_default")
             if not isinstance(resolved_default, dict):
                 continue
-            resolved_version = resolved_default.get("resolved_version")
+            resolved_version = target.get("selected_version") or resolved_default.get("resolved_version")
             if not isinstance(resolved_version, str) or not resolved_version.strip():
                 continue
             env_key = _target_env_key(target_name)

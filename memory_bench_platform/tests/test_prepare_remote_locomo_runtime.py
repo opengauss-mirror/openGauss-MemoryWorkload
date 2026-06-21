@@ -126,12 +126,13 @@ def test_enable_isolated_runtime_injects_state_dir_and_openviking_isolation():
     updated = MODULE._enable_isolated_runtime(shell_text)
 
     assert 'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"' in updated
-    assert 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"' in updated
+    assert 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"' in updated
     assert 'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"' in updated
-    assert 'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"' in updated
+    assert 'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-$RUN_ID}"' in updated
     assert 'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"' in updated
+    assert 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"' in updated
     assert "bootstrap_isolated_runtime()" in updated
-    assert 'nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1' in updated
+    assert 'nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1' in updated
     assert 'export OPENCLAW_STATE_DIR' in updated
     assert 'export OPENCLAW_CONFIG_PATH' in updated
     assert 'nohup openclaw gateway >"${GW_LOG}" 2>&1 &' in updated
@@ -216,3 +217,21 @@ def test_prepare_remote_runtime_uses_dynamic_openviking_site_packages_patterns()
     assert 'glob.glob("/root/.openviking/venv*/lib/python*/site-packages/openviking/session/memory/session_extract_context_provider.py")' in source
     assert 'glob.glob("/root/.openviking/venv*/lib64/python*/site-packages/openviking/session/compressor_v2.py")' in source
     assert 'venv-0.3.24/lib/python3.11/site-packages/openviking/session/compressor_v2.py' not in source
+
+
+def test_normalize_remote_python_source_preserves_triple_quoted_literal_indentation():
+    source = (
+        "        import base64\n"
+        "        import glob\n"
+        "        block = '''line0\n"
+        "        keep-this-indent\n"
+        "'''\n"
+        "        print(block)\n"
+    )
+
+    updated = MODULE._normalize_remote_python_source(source)
+
+    assert updated.splitlines()[0] == "import base64"
+    assert updated.splitlines()[1] == "import glob"
+    assert "        keep-this-indent" in updated
+    assert updated.splitlines()[-1] == "print(block)"

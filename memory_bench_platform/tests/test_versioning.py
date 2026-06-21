@@ -8,6 +8,7 @@ from memory_bench_platform.versioning import (
 
 class _Target:
     def __init__(self, payload):
+        self.name = payload["name"]
         self.version_source = payload["version_source"]
         self.upstream = payload.get("upstream")
         self._payload = payload
@@ -82,6 +83,8 @@ def test_build_version_selection_records_resolved_default(monkeypatch):
     payload = build_version_selection(manifest)
     assert payload["selection_mode"] == "latest_official_release_tag"
     assert payload["targets"][0]["resolved_default"]["resolved_version"] == "v9.9.9"
+    assert payload["targets"][0]["selected_version"] == "v9.9.9"
+    assert payload["targets"][0]["selected_by"] == "latest_official_release_tag"
     assert payload["targets"][1]["resolved_default"]["status"] == "runtime_observed_only"
 
 
@@ -141,3 +144,61 @@ def test_build_external_runner_env_exports_expected_target_versions():
     assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
     assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_UPSTREAM"] == "https://github.com/volcengine/OpenViking"
     assert "MEMORY_BENCH_EXPECTED_GENERIC_CLI_VERSION" not in env
+
+
+def test_build_version_selection_applies_user_override(monkeypatch):
+    monkeypatch.setattr(
+        "memory_bench_platform.versioning.resolve_latest_release_tag",
+        lambda upstream, **kwargs: {
+            "status": "resolved",
+            "upstream": upstream,
+            "resolved_version": "v9.9.9",
+            "source": "test",
+        },
+    )
+    manifest = _Manifest(
+        [
+            {
+                "name": "openviking",
+                "scope": "memory_backend",
+                "version_source": "upstream_release_tag",
+                "upstream": "https://github.com/volcengine/OpenViking",
+            }
+        ]
+    )
+
+    payload = build_version_selection(
+        manifest,
+        overrides={"openviking": "v0.3.24"},
+    )
+
+    assert payload["selection_mode"] == "user_specified_official_version"
+    assert payload["overridden"] is True
+    assert payload["targets"][0]["resolved_default"]["resolved_version"] == "v9.9.9"
+    assert payload["targets"][0]["selected_version"] == "v0.3.24"
+    assert payload["targets"][0]["selected_by"] == "user_specified_official_version"
+
+
+def test_build_external_runner_env_prefers_selected_version_over_resolved_default():
+    payload = {
+        "agent": {
+            "selection_mode": "user_specified_official_version",
+            "overridden": True,
+            "targets": [
+                {
+                    "name": "openviking",
+                    "upstream": "https://github.com/volcengine/OpenViking",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v0.4.4",
+                    },
+                    "selected_version": "v0.3.24",
+                    "selected_by": "user_specified_official_version",
+                }
+            ],
+        }
+    }
+
+    env = build_external_runner_env(payload)
+
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"

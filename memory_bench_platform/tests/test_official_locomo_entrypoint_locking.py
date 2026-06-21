@@ -16,5 +16,7 @@ def test_official_locomo_small_uses_shared_remote_lock_and_process_guard():
     assert 'EXPECTED_OPENVIKING_VERSION="${MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION:-}"' in text
     assert 'EXPECTED_OPENCLAW_VERSION="${MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION:-}"' in text
     assert 'OPENVIKING_INTROSPECT_PYTHON_BIN="${OPENVIKING_INTROSPECT_PYTHON_BIN:-}"' in text
+    assert 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-${OPENVIKING_INTROSPECT_PYTHON_BIN}}"' in text
+    assert 'local normalized_expected_openviking="${EXPECTED_OPENVIKING_VERSION#v}"' in text
     assert 'OpenViking runtime version mismatch' in text
     assert 'OpenClaw runtime version mismatch' in text
