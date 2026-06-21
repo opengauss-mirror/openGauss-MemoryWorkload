@@ -57,6 +57,17 @@ def _get_json(url: str, headers: dict[str, str]) -> dict[str, Any] | None:
     return result if isinstance(result, dict) else None
 
 
+def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any] | None:
+    response = requests.post(url, headers=headers, json=payload, timeout=20)
+    if not response.ok:
+        return None
+    body = response.json()
+    if not isinstance(body, dict):
+        return None
+    result = body.get("result")
+    return result if isinstance(result, dict) else None
+
+
 def _extract_telemetry_summary(task_result: dict[str, Any]) -> dict[str, Any] | None:
     telemetry = task_result.get("telemetry_summary")
     if isinstance(telemetry, dict):
@@ -160,6 +171,72 @@ def _build_minimal_meta(*, run_id: str, csv_path: Path, session_rows: dict[int, 
     }
 
 
+def _build_qa_direct_search_probe(
+    *,
+    meta: dict[str, Any],
+    base_url: str,
+    headers: dict[str, str],
+    user_id: str,
+) -> dict[str, Any]:
+    qa_rows = meta.get("qa_rows", [])
+    selected: list[str] = []
+    seen: set[str] = set()
+    for row in qa_rows:
+        question = str(row.get("question", "") or "").strip()
+        if not question or question in seen:
+            continue
+        selected.append(question)
+        seen.add(question)
+        if len(selected) >= 5:
+            break
+
+    probes: list[dict[str, Any]] = []
+    user_target = f"viking://user/{user_id}/memories"
+    agent_target = "viking://agent/memories"
+    for question in selected:
+        user_result = _post_json(
+            f"{base_url.rstrip('/')}/api/v1/search/find",
+            headers,
+            {
+                "query": question,
+                "target_uri": user_target,
+                "limit": 3,
+                "score_threshold": 0,
+            },
+        ) or {}
+        agent_result = _post_json(
+            f"{base_url.rstrip('/')}/api/v1/search/find",
+            headers,
+            {
+                "query": question,
+                "target_uri": agent_target,
+                "limit": 3,
+                "score_threshold": 0,
+            },
+        ) or {}
+        user_memories = user_result.get("memories") or []
+        agent_memories = agent_result.get("memories") or []
+        probes.append(
+            {
+                "question": question,
+                "user_total": int(user_result.get("total", len(user_memories)) or 0),
+                "agent_total": int(agent_result.get("total", len(agent_memories)) or 0),
+                "user_top_uris": [item.get("uri", "") for item in user_memories[:3] if isinstance(item, dict)],
+                "agent_top_uris": [item.get("uri", "") for item in agent_memories[:3] if isinstance(item, dict)],
+            }
+        )
+
+    zero_total_count = sum(1 for item in probes if item["user_total"] == 0 and item["agent_total"] == 0)
+    return {
+        "question_count": len(probes),
+        "zero_total_count": zero_total_count,
+        "all_zero": bool(probes) and zero_total_count == len(probes),
+        "user_target_uri": user_target,
+        "agent_target_uri": agent_target,
+        "probes": probes,
+    }
+
+
 def enrich_phasea_meta(
     *,
     meta_path: Path,
@@ -235,6 +312,12 @@ def enrich_phasea_meta(
             "patched_tasks": patched_tasks,
             "master_log": str(master_log_path),
         }
+    )
+    meta["qa_direct_search_probe"] = _build_qa_direct_search_probe(
+        meta=meta,
+        base_url=base_url,
+        headers=headers,
+        user_id=user_id,
     )
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return meta["telemetry_backfill"]

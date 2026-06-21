@@ -61,6 +61,71 @@ def _enable_benchmark_plugin_diagnostics(shell_text: str) -> str:
     return shell_text.replace(anchor, replacement)
 
 
+def _enable_dedicated_gateway_port(shell_text: str) -> str:
+    if 'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"' not in shell_text:
+        shell_text = shell_text.replace(
+            'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\n',
+            'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\n'
+            'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\n',
+        )
+
+    if "set_openclaw_gateway_port()" not in shell_text:
+        shell_text = shell_text.replace(
+            "sync_openclaw_auth_profiles() {\n",
+            """set_openclaw_gateway_port() {
+  python3 - "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" <<'__OVTEST_GATEWAY_PORT_PY__'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+gateway_port = int(sys.argv[2])
+data = json.loads(config_path.read_text(encoding="utf-8"))
+gateway = data.setdefault("gateway", {})
+gateway["port"] = gateway_port
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{{gateway_port}}",
+    f"http://127.0.0.1:{{gateway_port}}",
+]
+config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+print(json.dumps({{"gateway_port": gateway_port}}, ensure_ascii=False))
+PY
+}
+
+sync_openclaw_auth_profiles() {
+""",
+        )
+
+    shell_text = shell_text.replace(
+        '    if curl -fsS http://127.0.0.1:18789/health >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\n',
+        '    if curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\n',
+    )
+    shell_text = shell_text.replace(
+        'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")\n',
+        'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")\n',
+    )
+    shell_text = re.sub(
+        r'config_path\.write_text\(json\.dumps\(data, ensure_ascii=False, indent=2\) \+ "\s*"\s*, encoding="utf-8"\)',
+        'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    base_url_flag = '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n'
+    if base_url_flag not in shell_text:
+        shell_text = shell_text.replace(
+            '    --output-dir "${OUTPUT_DIR}"\n',
+            '    --output-dir "${OUTPUT_DIR}"\n' + base_url_flag,
+        )
+    if "  set_openclaw_gateway_port\n  sync_openclaw_auth_profiles\n" not in shell_text:
+        shell_text = shell_text.replace(
+            "  sync_openclaw_auth_profiles\n",
+            "  set_openclaw_gateway_port\n"
+            "  sync_openclaw_auth_profiles\n",
+        )
+    return shell_text
+
+
 def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
     if kind == "session_extract_context_provider":
         marker = "latest_archive_session_time: str = \"\","
@@ -124,6 +189,75 @@ def _ensure_openclaw_openviking_plugin_compat(source_text: str) -> str:
         '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\n',
     )
     return updated
+
+
+def _ensure_openclaw_auto_recall_query_extract(source_text: str) -> str:
+    marker = 'const questionMarker = "Question:";'
+    if marker in source_text:
+        return source_text
+    old = """export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  const query =
+    sanitized.length > RECALL_QUERY_MAX_CHARS
+      ? sanitized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : sanitized;
+
+  return {
+    query,
+    truncated: sanitized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+"""
+    new = """export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  let normalized = sanitized;
+  const questionMarker = "Question:";
+  const markerIndex = sanitized.lastIndexOf(questionMarker);
+  if (markerIndex >= 0) {
+    const extracted = sanitized.slice(markerIndex + questionMarker.length).trim();
+    if (extracted) {
+      normalized = extracted;
+    }
+  }
+
+  const query =
+    normalized.length > RECALL_QUERY_MAX_CHARS
+      ? normalized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : normalized;
+
+  return {
+    query,
+    truncated: normalized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+"""
+    return source_text.replace(old, new)
 
 
 def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_profiles: dict | None) -> None:
@@ -210,12 +344,12 @@ def main() -> None:
     agents_b64 = _encode_file(agents_path)
 
     remote_python = textwrap.dedent(
-        f"""
+        """
         import base64
         from pathlib import Path
         import re
 
-        benchmark_dir = Path({args.benchmark_dir!r})
+        benchmark_dir = Path(__BENCHMARK_DIR__)
 
         def _remove_redundant_reindex_injection(phase_text: str) -> str:
             pattern = re.compile(
@@ -254,6 +388,71 @@ def main() -> None:
                 'cfg["logFindRequests"] = True\\n'
             )
             return shell_text.replace(anchor, replacement)
+
+        def _enable_dedicated_gateway_port(shell_text: str) -> str:
+            if 'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"' not in shell_text:
+                shell_text = shell_text.replace(
+                    'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\\n',
+                    'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\\n'
+                    'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\\n',
+                )
+
+            if "set_openclaw_gateway_port()" not in shell_text:
+                gateway_port_block = '''set_openclaw_gateway_port() {
+  python3 - "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" <<'__OVTEST_GATEWAY_PORT_PY__'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+gateway_port = int(sys.argv[2])
+data = json.loads(config_path.read_text(encoding="utf-8"))
+gateway = data.setdefault("gateway", {})
+gateway["port"] = gateway_port
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{gateway_port}",
+    f"http://127.0.0.1:{gateway_port}",
+]
+config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+print(json.dumps({"gateway_port": gateway_port}, ensure_ascii=False))
+__OVTEST_GATEWAY_PORT_PY__
+}
+
+sync_openclaw_auth_profiles() {
+'''
+                shell_text = shell_text.replace(
+                    "sync_openclaw_auth_profiles() {\\n",
+                    gateway_port_block,
+                )
+
+            shell_text = shell_text.replace(
+                '    if curl -fsS http://127.0.0.1:18789/health >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\\n',
+                '    if curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\\n',
+            )
+            shell_text = shell_text.replace(
+                'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\\\n", encoding="utf-8")\\n',
+                'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")\\n',
+            )
+            shell_text = re.sub(
+                r'config_path\.write_text\(json\.dumps\(data, ensure_ascii=False, indent=2\) \+ "\s*"\s*, encoding="utf-8"\)',
+                'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            base_url_flag = '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n'
+            if base_url_flag not in shell_text:
+                shell_text = shell_text.replace(
+                    '    --output-dir "${OUTPUT_DIR}"\\n',
+                    '    --output-dir "${OUTPUT_DIR}"\\n' + base_url_flag,
+                )
+            if "  set_openclaw_gateway_port\\n  sync_openclaw_auth_profiles\\n" not in shell_text:
+                shell_text = shell_text.replace(
+                    "  sync_openclaw_auth_profiles\\n",
+                    "  set_openclaw_gateway_port\\n"
+                    "  sync_openclaw_auth_profiles\\n",
+                )
+            return shell_text
 
         def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
             if kind == "session_extract_context_provider":
@@ -317,6 +516,74 @@ def main() -> None:
                 '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\\n',
             )
             return updated
+
+        def _ensure_openclaw_auto_recall_query_extract(source_text: str) -> str:
+            marker = 'const questionMarker = "Question:";'
+            if marker in source_text:
+                return source_text
+            old = '''export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  const query =
+    sanitized.length > RECALL_QUERY_MAX_CHARS
+      ? sanitized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : sanitized;
+
+  return {
+    query,
+    truncated: sanitized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+'''
+            new = '''export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  let normalized = sanitized;
+  const questionMarker = "Question:";
+  const markerIndex = sanitized.lastIndexOf(questionMarker);
+  if (markerIndex >= 0) {
+    const extracted = sanitized.slice(markerIndex + questionMarker.length).trim();
+    if (extracted) {
+      normalized = extracted;
+    }
+  }
+
+  const query =
+    normalized.length > RECALL_QUERY_MAX_CHARS
+      ? normalized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : normalized;
+
+  return {
+    query,
+    truncated: normalized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+'''
+            return source_text.replace(old, new)
 
         def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_profiles: dict | None) -> None:
             provider_name = str(model_name or "").split("/", 1)[0].strip()
@@ -387,6 +654,7 @@ def main() -> None:
         shell_path = benchmark_dir / "run_clean_small_in_container.sh"
         shell_text = shell_path.read_text(encoding="utf-8")
         shell_text = _enable_benchmark_plugin_diagnostics(shell_text)
+        shell_text = _enable_dedicated_gateway_port(shell_text)
         shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\\n', '')
         shell_text = shell_text.replace('cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\\n', '')
         shell_text = shell_text.replace('cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\\n', '')
@@ -621,6 +889,23 @@ def main() -> None:
             plugin_index_text = _ensure_openclaw_openviking_plugin_compat(plugin_index_text)
             plugin_index_path.write_text(plugin_index_text, encoding="utf-8")
 
+        auto_recall_targets = [
+            Path("/root/.openclaw/extensions/openviking/auto-recall.ts"),
+            Path("/home/jcp/agent/code/OpenViking/examples/openclaw-plugin/auto-recall.ts"),
+        ]
+        auto_recall_results = []
+        for auto_recall_path in auto_recall_targets:
+            if not auto_recall_path.exists():
+                auto_recall_results.append({{"path": str(auto_recall_path), "status": "missing"}})
+                continue
+            original = auto_recall_path.read_text(encoding="utf-8")
+            updated = _ensure_openclaw_auto_recall_query_extract(original)
+            if updated != original:
+                auto_recall_path.write_text(updated, encoding="utf-8")
+                auto_recall_results.append({{"path": str(auto_recall_path), "status": "patched"}})
+            else:
+                auto_recall_results.append({{"path": str(auto_recall_path), "status": "unchanged"}})
+
         compat_targets = [
             (
                 Path("/home/jcp/agent/code/OpenViking/openviking/session/memory/session_extract_context_provider.py"),
@@ -665,7 +950,7 @@ def main() -> None:
         if agents_path.exists():
             backup = agents_path.with_name("AGENTS.md.bak-20260616-benchmark")
             backup.write_text(agents_path.read_text(encoding="utf-8"), encoding="utf-8")
-        agents_path.write_text(base64.b64decode({agents_b64!r}).decode("utf-8"), encoding="utf-8")
+        agents_path.write_text(base64.b64decode(__AGENTS_B64__).decode("utf-8"), encoding="utf-8")
 
         config_path = Path("/root/.openclaw/openclaw.json")
         auth_path = Path("/root/.openclaw/agents/main/agent/auth-profiles.json")
@@ -682,7 +967,7 @@ def main() -> None:
                 container.pop("isolateAgentScopeByUser", None)
         agents_root = data.setdefault("agents", {{}})
         defaults = agents_root.setdefault("defaults", {{}})
-        default_model = {args.locomo_model!r} or (
+        default_model = __LOCOMO_MODEL__ or (
             defaults.get("model", {{}}).get("primary")
             if isinstance(defaults.get("model"), dict)
             else None
@@ -729,10 +1014,19 @@ def main() -> None:
             "locomo_eval_model": verified_agent.get("model"),
             "locomo_eval_workspace": verified_agent.get("workspace"),
             "default_model": default_model,
+            "openclaw_auto_recall": auto_recall_results,
             "openviking_signature_compat": compat_results,
         }}, ensure_ascii=False))
         """
     ).strip()
+    remote_python = remote_python.replace("__BENCHMARK_DIR__", repr(args.benchmark_dir))
+    remote_python = remote_python.replace("__LOCOMO_MODEL__", repr(args.locomo_model))
+    remote_python = remote_python.replace("__AGENTS_B64__", repr(agents_b64))
+    remote_python = remote_python.replace("{{", "{").replace("}}", "}")
+    remote_python = "\n".join(
+        line[8:] if line.startswith("        ") else line
+        for line in remote_python.splitlines()
+    )
 
     remote_cmd = (
         "docker exec -i "

@@ -89,6 +89,15 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
             '2026-06-14 08:48:16,313 - uvicorn.access - INFO - 127.0.0.1:40290 - "POST /api/v1/search/find HTTP/1.1" 200',
             '2026-06-14 08:48:16,532 - uvicorn.access - INFO - 127.0.0.1:40290 - "GET /api/v1/content/read?uri=viking%3A%2F%2Fuser%2Fdemo HTTP/1.1" 200',
         ],
+        "qa_direct_search_probe": {
+            "question_count": 2,
+            "zero_total_count": 2,
+            "all_zero": True,
+            "probes": [
+                {"question": "Q1", "user_total": 0, "agent_total": 0},
+                {"question": "Q2", "user_total": 0, "agent_total": 0},
+            ],
+        },
     }
     (artifacts / "phaseA_demo_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     (logs / "demo-run.master.log").write_text(
@@ -155,6 +164,7 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert result["nodes"]["memory_capture"]["durable_growth_sessions"] == 2
     assert result["nodes"]["memory_capture"]["durable_growth_with_zero_memory"] == 1
     assert result["nodes"]["recall_query"]["search_find_calls"] == 1
+    assert result["nodes"]["recall_query"]["direct_probe_all_zero"] is True
     assert result["nodes"]["answer_generation"]["qa_total"] == 2
     assert result["timing"]["ingest"]["p50_seconds"] == 11.0
     assert result["timing"]["qa"]["max_seconds"] == 7.0
@@ -171,6 +181,7 @@ def test_diagnose_official_small_extracts_node_summary_and_timing(tmp_path: Path
     assert any("post_ingest_reindex 未成功完成" in item for item in result["findings"])
     assert any("preflight 运行时接口自检失败" in item for item in result["findings"])
     assert any("接口签名错配" in item for item in result["findings"])
+    assert any("direct search probe 对多条 QA 问题均为 0 命中" in item for item in result["findings"])
     assert result["findings"]
 
 

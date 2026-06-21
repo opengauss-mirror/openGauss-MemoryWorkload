@@ -167,7 +167,7 @@ set -euo pipefail
 
 LOCK_DIR="${REMOTE_LOCK_DIR}"
 mkdir -p "\$LOCK_DIR"
-LOCK_FILE="\$LOCK_DIR/official_locomo_small.lock"
+LOCK_FILE="\$LOCK_DIR/locomo_eval.lock"
 if [ -f "\$LOCK_FILE" ]; then
   echo "LOCKED:\$LOCK_FILE" >&2
   exit 2
@@ -177,6 +177,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 echo \$\$ > "\$LOCK_FILE"
+
+EXISTING_PHASE_RUNS="\$(pgrep -af \"phase_a_off.py\" || true)"
+if [ -n "\${EXISTING_PHASE_RUNS}" ]; then
+  echo "RUN_CONFLICT:\${EXISTING_PHASE_RUNS}" >&2
+  exit 3
+fi
 
 cd "${REMOTE_BENCH_DIR}"
 TOKEN=\$(python3 -c 'import json;print(json.load(open("/root/.openclaw/openclaw.json"))["gateway"]["auth"]["token"])')

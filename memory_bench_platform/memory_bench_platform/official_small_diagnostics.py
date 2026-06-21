@@ -24,18 +24,40 @@ def _load_meta(run_dir: Path) -> dict[str, Any]:
     return json.loads(candidates[0].read_text(encoding="utf-8"))
 
 
+def _remote_log_candidates(run_dir: Path, pattern: str) -> list[Path]:
+    official_dir = _official_artifacts_dir(run_dir)
+    roots = [
+        official_dir / "remote_logs",
+        run_dir / "external_artifacts" / "remote_logs",
+        run_dir / "external_artifacts",
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        candidates.extend(sorted(root.glob(pattern)))
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped
+
+
 def _load_master_log(run_dir: Path) -> str:
-    candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob("*.master.log"))
+    candidates = _remote_log_candidates(run_dir, "*.master.log")
     return candidates[0].read_text(encoding="utf-8", errors="ignore") if candidates else ""
 
 
 def _load_ov_log(run_dir: Path) -> str:
-    candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob("*.ov.log"))
+    candidates = _remote_log_candidates(run_dir, "*.ov.log")
     return candidates[0].read_text(encoding="utf-8", errors="ignore") if candidates else ""
 
 
 def _load_remote_snapshot(run_dir: Path, suffix: str) -> dict[str, Any] | None:
-    candidates = sorted((_official_artifacts_dir(run_dir) / "remote_logs").glob(f"*.{suffix}.json"))
+    candidates = _remote_log_candidates(run_dir, f"*.{suffix}.json")
     if not candidates:
         return None
     try:
@@ -70,6 +92,7 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
     qa_rows = meta.get("qa_rows", [])
     namespace = meta.get("plugin_namespace_config", {}).get("final", {})
     ov_log_tail = meta.get("ov_log_tail", [])
+    direct_probe = meta.get("qa_direct_search_probe") or {}
     memory_counts = [int(match.group(1)) for match in re.finditer(r"memories=(\d+)", master_log)]
     search_find_calls = sum(1 for line in ov_log_tail if "POST /api/v1/search/find" in line)
     content_read_calls = sum(1 for line in ov_log_tail if "GET /api/v1/content/read" in line)
@@ -157,6 +180,9 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
                 "search_find_calls": search_find_calls,
                 "content_read_calls": content_read_calls,
                 "ledger_missing_rows": ledger_missing,
+                "direct_probe_question_count": int(direct_probe.get("question_count", 0) or 0),
+                "direct_probe_zero_total_count": int(direct_probe.get("zero_total_count", 0) or 0),
+                "direct_probe_all_zero": bool(direct_probe.get("all_zero", False)),
             },
             "answer_generation": {
                 "qa_total": len(qa_rows),
@@ -182,6 +208,7 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
             "extract_compatibility": extract_compatibility,
             "extract_runtime_errors": extract_runtime_errors[:20],
             "signature_mismatch_errors": signature_mismatch_errors,
+            "qa_direct_search_probe": direct_probe,
         },
     }
     findings: list[str] = []
@@ -197,6 +224,8 @@ def diagnose_official_small_run(run_dir: Path) -> dict[str, Any]:
         findings.append("namespace 隔离配置偏弱，可能放大 dedup / 跨 session 污染 / recall 不稳定。")
     if result["nodes"]["recall_query"]["search_find_calls"] > 0 and result["nodes"]["answer_generation"]["retrieval_miss_like_rows"] > 0:
         findings.append("recall 查询已发生，但大量回答仍是无信息模式，说明 recall 命中内容质量或可见性异常。")
+    if result["nodes"]["recall_query"]["direct_probe_all_zero"]:
+        findings.append("同 tenant direct search probe 对多条 QA 问题均为 0 命中，主异常位于检索/索引层，而不是答案提取或结果归档层。")
     if result["nodes"]["recall_query"]["ledger_missing_rows"] > 0:
         findings.append("OpenClaw session ledger 大量缺失，session 侧可观测性不足，不能只依赖最终回答判断链路健康。")
     if isinstance(reindex_result, dict) and reindex_result and not reindex_result.get("ok", True):

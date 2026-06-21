@@ -20,6 +20,19 @@ class _FakeResponse:
         return self._payload
 
 
+def _fake_search_response(total: int, uris: list[str]) -> _FakeResponse:
+    return _FakeResponse(
+        {
+            "result": {
+                "memories": [{"uri": uri} for uri in uris],
+                "resources": [],
+                "skills": [],
+                "total": total,
+            }
+        }
+    )
+
+
 def test_enrich_phasea_meta_backfills_session_and_task(monkeypatch, tmp_path: Path):
     meta_path = tmp_path / "phaseA_meta.json"
     meta_path.write_text(
@@ -71,7 +84,16 @@ def test_enrich_phasea_meta_backfills_session_and_task(monkeypatch, tmp_path: Pa
             )
         raise AssertionError(url)
 
+    def fake_post(url: str, headers: dict[str, str], json: dict[str, object], timeout: int):
+        assert url.endswith("/api/v1/search/find")
+        if json["target_uri"] == "viking://user/user/memories":
+            return _fake_search_response(2, ["viking://user/user/memories/events/demo.md"])
+        if json["target_uri"] == "viking://agent/memories":
+            return _fake_search_response(1, ["viking://agent/locomo-eval/memories/demo.md"])
+        raise AssertionError(json)
+
     monkeypatch.setattr(MODULE.requests, "get", fake_get)
+    monkeypatch.setattr(MODULE.requests, "post", fake_post)
 
     result = enrich_phasea_meta(
         meta_path=meta_path,
@@ -91,6 +113,7 @@ def test_enrich_phasea_meta_backfills_session_and_task(monkeypatch, tmp_path: Pa
     assert detail["session_id"] == "22222222-2222-2222-2222-222222222222"
     assert detail["_ov_task"]["task_id"] == "11111111-1111-1111-1111-111111111111"
     assert detail["telemetry_summary"]["duration_ms"] == 1234.5
+    assert meta["qa_direct_search_probe"]["question_count"] == 0
 
 
 def test_enrich_phasea_meta_creates_minimal_meta_when_missing(monkeypatch, tmp_path: Path):
@@ -139,7 +162,16 @@ def test_enrich_phasea_meta_creates_minimal_meta_when_missing(monkeypatch, tmp_p
             )
         raise AssertionError(url)
 
+    def fake_post(url: str, headers: dict[str, str], json: dict[str, object], timeout: int):
+        assert url.endswith("/api/v1/search/find")
+        if json["target_uri"] == "viking://user/user/memories":
+            return _fake_search_response(0, [])
+        if json["target_uri"] == "viking://agent/memories":
+            return _fake_search_response(0, [])
+        raise AssertionError(json)
+
     monkeypatch.setattr(MODULE.requests, "get", fake_get)
+    monkeypatch.setattr(MODULE.requests, "post", fake_post)
 
     result = enrich_phasea_meta(
         meta_path=meta_path,
@@ -160,3 +192,5 @@ def test_enrich_phasea_meta_creates_minimal_meta_when_missing(monkeypatch, tmp_p
     assert meta["qa_rows"][0]["usage"]["total_tokens"] == 150
     assert meta["ingest_sessions"][0]["compact_elapsed_seconds"] == 6.0
     assert meta["ingest_sessions"][0]["telemetry_summary"]["duration_ms"] == 1500.0
+    assert meta["qa_direct_search_probe"]["question_count"] == 1
+    assert meta["qa_direct_search_probe"]["all_zero"] is True
