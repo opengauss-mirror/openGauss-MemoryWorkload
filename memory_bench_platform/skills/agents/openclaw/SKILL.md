@@ -33,3 +33,16 @@
   - 先确认当前运行版本是否为正式 tag
   - 再确认最新 tag 是否是从 skill 声明的上游仓库解析出来的
   - 不要直接把问题归因到平台对接层
+
+## 对接约束
+
+- 当 `OpenClaw` 以 `OpenViking` 远端 context-engine 运行时，默认应显式写入：
+  - `accountId`
+  - `userId`
+  - `agent_prefix=accountId`
+  - `isolateUserScopeByAgent=true`
+  - `isolateAgentScopeByUser=true`
+- 若缺少 `agent_prefix=accountId`，可能出现：
+  - 手工 direct probe 能命中
+  - 平台自动 recall 仍落到错误 agent scope
+  - `official_small` 回答大量表现为 `retrieval_miss`

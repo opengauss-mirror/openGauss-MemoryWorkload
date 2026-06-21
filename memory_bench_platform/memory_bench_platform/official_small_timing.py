@@ -45,6 +45,13 @@ EXPECTED_DURATION_LABELS = {
     "ov.storage.write_file.archive_overview_md_ms",
     "ov.storage.write_file.archive_done_ms",
     "ov.storage.write_file.archive_failed_json_ms",
+    "ov.resource.request_ms",
+    "ov.resource.process_ms",
+    "ov.resource.parse_ms",
+    "ov.resource.finalize_ms",
+    "ov.resource.summarize_ms",
+    "ov.resource.wait_ms",
+    "ov.resource.watch_ms",
     "agent.qa.total_ms",
 }
 
@@ -78,6 +85,13 @@ RAW_DURATION_KEY_MAP = {
     "storage.write_file.archive_overview_md.duration_ms": "ov.storage.write_file.archive_overview_md_ms",
     "storage.write_file.archive_done.duration_ms": "ov.storage.write_file.archive_done_ms",
     "storage.write_file.archive_failed_json.duration_ms": "ov.storage.write_file.archive_failed_json_ms",
+    "resource.request.duration_ms": "ov.resource.request_ms",
+    "resource.process.duration_ms": "ov.resource.process_ms",
+    "resource.process.parse.duration_ms": "ov.resource.parse_ms",
+    "resource.process.finalize.duration_ms": "ov.resource.finalize_ms",
+    "resource.process.summarize.duration_ms": "ov.resource.summarize_ms",
+    "resource.wait.duration_ms": "ov.resource.wait_ms",
+    "resource.watch.duration_ms": "ov.resource.watch_ms",
 }
 
 FLAT_DURATION_KEY_MAP = {
@@ -115,6 +129,13 @@ FLAT_DURATION_KEY_MAP = {
     "storage_write_file_archive_done_ms": "ov.storage.write_file.archive_done_ms",
     "storage_write_file_archive_failed_json_ms": "ov.storage.write_file.archive_failed_json_ms",
     "storage_write_file_other_ms": "ov.storage.write_file.other_ms",
+    "resource_request_ms": "ov.resource.request_ms",
+    "resource_process_ms": "ov.resource.process_ms",
+    "resource_parse_ms": "ov.resource.parse_ms",
+    "resource_finalize_ms": "ov.resource.finalize_ms",
+    "resource_summarize_ms": "ov.resource.summarize_ms",
+    "resource_wait_ms": "ov.resource.wait_ms",
+    "resource_watch_ms": "ov.resource.watch_ms",
 }
 
 
@@ -215,6 +236,7 @@ def _public_duration_label(raw_key: str, scope_prefix: str) -> str:
         "memory.extract.",
         "embedding.async.",
         "search.",
+        "resource.",
     )
     if raw_key in RAW_DURATION_KEY_MAP:
         return RAW_DURATION_KEY_MAP[raw_key]

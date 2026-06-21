@@ -71,6 +71,17 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
                         "read_file": {"messages_jsonl": {"duration_ms": 4.0}},
                         "write_file": {"archive_done": {"duration_ms": 1.5}},
                     },
+                    "resource": {
+                        "request": {"duration_ms": 13.2},
+                        "process": {
+                            "duration_ms": 44.1,
+                            "parse": {"duration_ms": 8.0},
+                            "finalize": {"duration_ms": 5.2},
+                            "summarize": {"duration_ms": 2.1},
+                        },
+                        "wait": {"duration_ms": 3.4},
+                        "watch": {"duration_ms": 1.1},
+                    },
                     "session": {
                         "commit": {
                             "phase2": {"wait_for_request": {"duration_ms": 120.0}}
@@ -129,6 +140,13 @@ def test_build_official_small_timing_report_extracts_duration_events(tmp_path: P
     assert "ov.embedding.async.duration_ms" in report["duration_distributions"]
     assert "ov.storage.read_file.messages_jsonl_ms" in report["duration_distributions"]
     assert "ov.storage.write_file.archive_done_ms" in report["duration_distributions"]
+    assert "ov.resource.request_ms" in report["duration_distributions"]
+    assert "ov.resource.process_ms" in report["duration_distributions"]
+    assert "ov.resource.parse_ms" in report["duration_distributions"]
+    assert "ov.resource.finalize_ms" in report["duration_distributions"]
+    assert "ov.resource.summarize_ms" in report["duration_distributions"]
+    assert "ov.resource.wait_ms" in report["duration_distributions"]
+    assert "ov.resource.watch_ms" in report["duration_distributions"]
     assert "ov.session.commit.phase2.wait_for_request_ms" in report["duration_distributions"]
     assert "ov.search.find.total_ms" in report["duration_distributions"]
     assert report["token_summary"]["ingest"]["ov_llm_total_tokens"] == 100
@@ -166,3 +184,47 @@ def test_build_official_small_timing_report_maps_flat_duration_aliases(tmp_path:
     assert "ov.session.commit.phase2.wait_for_request_ms" in report["duration_distributions"]
     assert "ov.storage.read_file.other_ms" in report["duration_distributions"]
     assert "ov.storage.write_file.archive_meta_json_ms" in report["duration_distributions"]
+
+
+def test_build_official_small_timing_report_maps_resource_duration_aliases(tmp_path: Path):
+    run_dir = tmp_path / "run-resource"
+    artifacts = run_dir / "external_artifacts" / "official_small"
+    artifacts.mkdir(parents=True)
+    meta = {
+        "run_id": "demo-resource",
+        "ingest_sessions": [
+            {
+                "index": 1,
+                "telemetry_summary": {
+                    "operation": "resource.add",
+                    "duration_ms": 55.0,
+                    "resource": {
+                        "request": {"duration_ms": 12.0},
+                        "process": {
+                            "duration_ms": 30.0,
+                            "parse": {"duration_ms": 8.0},
+                            "finalize": {"duration_ms": 4.0},
+                            "summarize": {"duration_ms": 2.0},
+                        },
+                        "wait": {"duration_ms": 6.0},
+                        "watch": {"duration_ms": 1.0},
+                    },
+                },
+            }
+        ],
+        "qa_rows": [],
+    }
+    (artifacts / "phaseA_demo_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report = build_official_small_timing_report(run_dir)
+
+    for label in (
+        "ov.resource.request_ms",
+        "ov.resource.process_ms",
+        "ov.resource.parse_ms",
+        "ov.resource.finalize_ms",
+        "ov.resource.summarize_ms",
+        "ov.resource.wait_ms",
+        "ov.resource.watch_ms",
+    ):
+        assert label in report["duration_distributions"]
