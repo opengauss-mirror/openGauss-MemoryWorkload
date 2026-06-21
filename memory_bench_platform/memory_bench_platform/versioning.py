@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from typing import Any
@@ -91,3 +92,38 @@ def build_version_selection(manifest: Any) -> dict[str, Any]:
         "overridden": False,
         "targets": targets,
     }
+
+
+def _target_env_key(name: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", name.strip()).strip("_")
+    return normalized.upper()
+
+
+def build_external_runner_env(version_selection: dict[str, Any]) -> dict[str, str]:
+    env = {
+        "MEMORY_BENCH_VERSION_SELECTION_JSON": json.dumps(version_selection, ensure_ascii=False),
+    }
+    for section_name, section_payload in version_selection.items():
+        if not isinstance(section_payload, dict):
+            continue
+        selection_mode = section_payload.get("selection_mode")
+        if isinstance(selection_mode, str) and selection_mode:
+            env[f"MEMORY_BENCH_{section_name.upper()}_SELECTION_MODE"] = selection_mode
+        for target in section_payload.get("targets", []):
+            if not isinstance(target, dict):
+                continue
+            target_name = target.get("name")
+            if not isinstance(target_name, str) or not target_name.strip():
+                continue
+            resolved_default = target.get("resolved_default")
+            if not isinstance(resolved_default, dict):
+                continue
+            resolved_version = resolved_default.get("resolved_version")
+            if not isinstance(resolved_version, str) or not resolved_version.strip():
+                continue
+            env_key = _target_env_key(target_name)
+            env[f"MEMORY_BENCH_EXPECTED_{env_key}_VERSION"] = resolved_version
+            upstream = target.get("upstream")
+            if isinstance(upstream, str) and upstream.strip():
+                env[f"MEMORY_BENCH_EXPECTED_{env_key}_UPSTREAM"] = upstream
+    return env

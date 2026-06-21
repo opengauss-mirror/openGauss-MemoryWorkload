@@ -1,4 +1,9 @@
-from memory_bench_platform.versioning import _tag_sort_key, build_version_selection, resolve_latest_release_tag
+from memory_bench_platform.versioning import (
+    _tag_sort_key,
+    build_external_runner_env,
+    build_version_selection,
+    resolve_latest_release_tag,
+)
 
 
 class _Target:
@@ -78,3 +83,61 @@ def test_build_version_selection_records_resolved_default(monkeypatch):
     assert payload["selection_mode"] == "latest_official_release_tag"
     assert payload["targets"][0]["resolved_default"]["resolved_version"] == "v9.9.9"
     assert payload["targets"][1]["resolved_default"]["status"] == "runtime_observed_only"
+
+
+def test_build_external_runner_env_exports_expected_target_versions():
+    payload = {
+        "benchmark": {
+            "selection_mode": "latest_official_release_tag",
+            "targets": [
+                {
+                    "name": "locomo-benchmark",
+                    "scope": "benchmark_tooling",
+                    "upstream": "https://github.com/snap-research/locomo",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v1.0.0",
+                    },
+                }
+            ],
+        },
+        "agent": {
+            "selection_mode": "latest_official_release_tag",
+            "targets": [
+                {
+                    "name": "openclaw",
+                    "scope": "system_under_test",
+                    "upstream": "https://github.com/openclaw/openclaw",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v2026.4.8",
+                    },
+                },
+                {
+                    "name": "openviking",
+                    "scope": "memory_backend",
+                    "upstream": "https://github.com/volcengine/OpenViking",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v0.3.24",
+                    },
+                },
+                {
+                    "name": "generic-cli",
+                    "scope": "runtime_dependency",
+                    "upstream": None,
+                    "resolved_default": {
+                        "status": "runtime_observed_only",
+                    },
+                },
+            ],
+        },
+    }
+
+    env = build_external_runner_env(payload)
+
+    assert env["MEMORY_BENCH_EXPECTED_LOCOMO_BENCHMARK_VERSION"] == "v1.0.0"
+    assert env["MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION"] == "v2026.4.8"
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_UPSTREAM"] == "https://github.com/volcengine/OpenViking"
+    assert "MEMORY_BENCH_EXPECTED_GENERIC_CLI_VERSION" not in env

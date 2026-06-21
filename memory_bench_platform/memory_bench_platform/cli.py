@@ -25,7 +25,7 @@ from .result_analysis import analyze_run
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .resource_monitor import ResourceMonitor
 from .storage import RunStorage
-from .versioning import build_version_selection
+from .versioning import build_external_runner_env, build_version_selection
 from .workflow import execute_cases
 
 
@@ -221,6 +221,7 @@ def main(argv: list[str] | None = None) -> None:
                 "AGENT_ID": args.agent,
             }
         )
+        env.update(build_external_runner_env(run_record.version_selection))
         runner_result = execute_external_runner(entrypoint, env=env, cwd=Path.cwd().parent)
         (run_dir / "logs" / "external_runner.stdout.log").write_text(runner_result["stdout"], encoding="utf-8")
         (run_dir / "logs" / "external_runner.stderr.log").write_text(runner_result["stderr"], encoding="utf-8")

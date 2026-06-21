@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import glob
 import re
 import subprocess
 import textwrap
@@ -123,6 +124,189 @@ sync_openclaw_auth_profiles() {
             "  set_openclaw_gateway_port\n"
             "  sync_openclaw_auth_profiles\n",
         )
+    return shell_text
+
+
+def _enable_isolated_runtime(shell_text: str) -> str:
+    if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"' not in shell_text:
+        shell_text = shell_text.replace(
+            'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\n',
+            'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\n'
+            'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"\n'
+            'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"\n'
+            'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\n'
+            'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"\n'
+            'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"\n',
+        )
+
+    shell_text = shell_text.replace(
+        'OV_CONF_PATH="${OV_CONF_PATH:-/root/.openviking/ov.conf}"\n'
+        'OV_DATA_DIR="${OV_DATA_DIR:-/root/.openviking/data}"\n'
+        'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-/root/.openclaw/agents/locomo-eval}"\n'
+        'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-/root/.openclaw/agents/main/agent}"\n'
+        'OPENCLAW_ENV="${OPENCLAW_ENV:-/root/.openclaw/openviking.env}"\n'
+        'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\n',
+        'BASE_OV_CONF_PATH="${BASE_OV_CONF_PATH:-/root/.openviking/ov.conf}"\n'
+        'OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"\n'
+        'OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"\n'
+        'BASE_OPENCLAW_STATE_DIR="${BASE_OPENCLAW_STATE_DIR:-/root/.openclaw}"\n'
+        'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/locomo-eval}"\n'
+        'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"\n'
+        'OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"\n'
+        'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\n'
+        'export OPENVIKING_CONFIG_FILE="${OV_CONF_PATH}"\n'
+        'export OPENCLAW_STATE_DIR\n'
+        'export OPENCLAW_CONFIG_PATH\n',
+    )
+
+    if "bootstrap_isolated_runtime()" not in shell_text:
+        shell_text = shell_text.replace(
+            'mkdir -p "${OUTPUT_DIR}"\n\nbackup_and_reset() {\n',
+            """mkdir -p "${OUTPUT_DIR}"
+
+bootstrap_isolated_runtime() {
+  mkdir -p "${OPENCLAW_STATE_DIR}" "${OPENCLAW_AGENT_DIR}" "${OPENCLAW_MAIN_AGENT_DIR}" "${OV_DATA_DIR}"
+
+  python3 - "${BASE_OPENCLAW_STATE_DIR}" "${OPENCLAW_STATE_DIR}" "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" "${LOCOMO_EVAL_MODEL}" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+base_state_dir = Path(sys.argv[1])
+state_dir = Path(sys.argv[2])
+config_path = Path(sys.argv[3])
+gateway_port = int(sys.argv[4])
+locomo_model = sys.argv[5].strip()
+
+state_dir.mkdir(parents=True, exist_ok=True)
+config_path.parent.mkdir(parents=True, exist_ok=True)
+
+base_config = json.loads((base_state_dir / "openclaw.json").read_text(encoding="utf-8"))
+base_config["stateDir"] = str(state_dir)
+gateway = base_config.setdefault("gateway", {})
+gateway["port"] = gateway_port
+if locomo_model:
+    base_config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = locomo_model
+    for agent in base_config.get("agents", {}).get("list", []):
+        if isinstance(agent, dict) and agent.get("id") == "locomo-eval":
+            agent["model"] = locomo_model
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{gateway_port}",
+    f"http://127.0.0.1:{gateway_port}",
+]
+config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+
+for rel in [
+    ("agents/main/agent/auth-profiles.json", "agents/main/agent/auth-profiles.json"),
+    ("agents/main/agent/auth-state.json", "agents/main/agent/auth-state.json"),
+    ("openviking.env", "openviking.env"),
+]:
+    src = base_state_dir / rel[0]
+    dst = state_dir / rel[1]
+    if src.exists():
+      dst.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(src, dst)
+
+extensions_src = base_state_dir / "extensions" / "openviking"
+extensions_dst = state_dir / "extensions" / "openviking"
+if extensions_src.exists():
+    if extensions_dst.exists():
+        shutil.rmtree(extensions_dst)
+    extensions_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(extensions_src, extensions_dst)
+PY
+
+  python3 - "${BASE_OV_CONF_PATH}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base_conf = Path(sys.argv[1])
+target_conf = Path(sys.argv[2])
+data_dir = Path(sys.argv[3])
+ov_port = int(sys.argv[4])
+
+target_conf.parent.mkdir(parents=True, exist_ok=True)
+data_dir.mkdir(parents=True, exist_ok=True)
+
+cfg = json.loads(base_conf.read_text(encoding="utf-8"))
+cfg.setdefault("server", {})["port"] = ov_port
+cfg.setdefault("storage", {})["workspace"] = str(data_dir)
+target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+PY
+}
+
+backup_and_reset() {\n""",
+        )
+
+    shell_text = shell_text.replace(
+        '  pkill -f \'phase_a_off.py\' || true\n'
+        '  pkill -f \'openclaw-gateway\' || true\n'
+        '  pkill -f \'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\' || true\n'
+        '  sleep 2\n'
+        '\n'
+        '  rm -rf "${OV_DATA_DIR:?}/"*\n'
+        '  mkdir -p "${OV_DATA_DIR}"\n',
+        '  if [[ "${OPENCLAW_STATE_DIR}" == "/root/.openclaw" ]]; then\n'
+        '    pkill -f \'phase_a_off.py\' || true\n'
+        '    pkill -f \'openclaw-gateway\' || true\n'
+        '    pkill -f \'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\' || true\n'
+        '    sleep 2\n'
+        '  fi\n'
+        '\n'
+        '  rm -rf "${OV_DATA_DIR:?}/"*\n'
+        '  mkdir -p "${OV_DATA_DIR}"\n',
+    )
+
+    shell_text = shell_text.replace(
+        '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" <<\'PY\'\n',
+        '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" "${OPENVIKING_PORT}" <<\'PY\'\n',
+    )
+    shell_text = shell_text.replace(
+        'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\n',
+        'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\n'
+        'openviking_port = int(sys.argv[6])\n',
+    )
+    shell_text = shell_text.replace(
+        'cfg["userId"] = user_id\n',
+        'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n'
+        'cfg["userId"] = user_id\n',
+    )
+
+    shell_text = shell_text.replace(
+        '  nohup python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1 >"${OV_LOG}" 2>&1 &\n',
+        '  nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\n',
+    )
+    shell_text = shell_text.replace(
+        '    if curl -fsS http://127.0.0.1:1933/health >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\n',
+        '    if curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\n',
+    )
+    shell_text = shell_text.replace(
+        '  # shellcheck disable=SC1090\n'
+        '  source "${OPENCLAW_ENV}"\n'
+        '  nohup openclaw gateway >"${GW_LOG}" 2>&1 &\n',
+        '  # shellcheck disable=SC1090\n'
+        '  source "${OPENCLAW_ENV}"\n'
+        '  nohup env OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\n',
+    )
+
+    if '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            '    --output-dir "${OUTPUT_DIR}"\n',
+            '    --output-dir "${OUTPUT_DIR}"\n'
+            '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n'
+            '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n'
+            '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\n',
+        )
+
+    if "  bootstrap_isolated_runtime\n  backup_and_reset\n" not in shell_text:
+        shell_text = shell_text.replace(
+            "{\n  backup_and_reset\n",
+            "{\n  bootstrap_isolated_runtime\n  backup_and_reset\n",
+        )
+
     return shell_text
 
 
@@ -346,6 +530,7 @@ def main() -> None:
     remote_python = textwrap.dedent(
         """
         import base64
+        import glob
         from pathlib import Path
         import re
 
@@ -452,6 +637,181 @@ sync_openclaw_auth_profiles() {
                     "  set_openclaw_gateway_port\\n"
                     "  sync_openclaw_auth_profiles\\n",
                 )
+            return shell_text
+
+        def _enable_isolated_runtime(shell_text: str) -> str:
+            if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"' not in shell_text:
+                shell_text = shell_text.replace(
+                    'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\\n',
+                    'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\\n'
+                    'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"\\n'
+                    'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"\\n'
+                    'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\\n'
+                    'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"\\n'
+                    'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"\\n',
+                )
+
+            shell_text = shell_text.replace(
+                'OV_CONF_PATH="${OV_CONF_PATH:-/root/.openviking/ov.conf}"\\n'
+                'OV_DATA_DIR="${OV_DATA_DIR:-/root/.openviking/data}"\\n'
+                'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-/root/.openclaw/agents/locomo-eval}"\\n'
+                'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-/root/.openclaw/agents/main/agent}"\\n'
+                'OPENCLAW_ENV="${OPENCLAW_ENV:-/root/.openclaw/openviking.env}"\\n'
+                'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\\n',
+                'BASE_OV_CONF_PATH="${BASE_OV_CONF_PATH:-/root/.openviking/ov.conf}"\\n'
+                'OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"\\n'
+                'OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"\\n'
+                'BASE_OPENCLAW_STATE_DIR="${BASE_OPENCLAW_STATE_DIR:-/root/.openclaw}"\\n'
+                'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/locomo-eval}"\\n'
+                'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"\\n'
+                'OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"\\n'
+                'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\\n'
+                'export OPENVIKING_CONFIG_FILE="${OV_CONF_PATH}"\\n'
+                'export OPENCLAW_STATE_DIR\\n'
+                'export OPENCLAW_CONFIG_PATH\\n',
+            )
+
+            if "bootstrap_isolated_runtime()" not in shell_text:
+                shell_text = shell_text.replace(
+                    'mkdir -p "${OUTPUT_DIR}"\\n\\nbackup_and_reset() {\\n',
+                    '''mkdir -p "${OUTPUT_DIR}"
+
+bootstrap_isolated_runtime() {
+  mkdir -p "${OPENCLAW_STATE_DIR}" "${OPENCLAW_AGENT_DIR}" "${OPENCLAW_MAIN_AGENT_DIR}" "${OV_DATA_DIR}"
+
+  python3 - "${BASE_OPENCLAW_STATE_DIR}" "${OPENCLAW_STATE_DIR}" "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" "${LOCOMO_EVAL_MODEL}" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+base_state_dir = Path(sys.argv[1])
+state_dir = Path(sys.argv[2])
+config_path = Path(sys.argv[3])
+gateway_port = int(sys.argv[4])
+locomo_model = sys.argv[5].strip()
+
+state_dir.mkdir(parents=True, exist_ok=True)
+config_path.parent.mkdir(parents=True, exist_ok=True)
+
+base_config = json.loads((base_state_dir / "openclaw.json").read_text(encoding="utf-8"))
+base_config["stateDir"] = str(state_dir)
+gateway = base_config.setdefault("gateway", {})
+gateway["port"] = gateway_port
+if locomo_model:
+    base_config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = locomo_model
+    for agent in base_config.get("agents", {}).get("list", []):
+        if isinstance(agent, dict) and agent.get("id") == "locomo-eval":
+            agent["model"] = locomo_model
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{gateway_port}",
+    f"http://127.0.0.1:{gateway_port}",
+]
+config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+
+for rel in [
+    ("agents/main/agent/auth-profiles.json", "agents/main/agent/auth-profiles.json"),
+    ("agents/main/agent/auth-state.json", "agents/main/agent/auth-state.json"),
+    ("openviking.env", "openviking.env"),
+]:
+    src = base_state_dir / rel[0]
+    dst = state_dir / rel[1]
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+extensions_src = base_state_dir / "extensions" / "openviking"
+extensions_dst = state_dir / "extensions" / "openviking"
+if extensions_src.exists():
+    if extensions_dst.exists():
+        shutil.rmtree(extensions_dst)
+    extensions_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(extensions_src, extensions_dst)
+PY
+
+  python3 - "${BASE_OV_CONF_PATH}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base_conf = Path(sys.argv[1])
+target_conf = Path(sys.argv[2])
+data_dir = Path(sys.argv[3])
+ov_port = int(sys.argv[4])
+
+target_conf.parent.mkdir(parents=True, exist_ok=True)
+data_dir.mkdir(parents=True, exist_ok=True)
+
+cfg = json.loads(base_conf.read_text(encoding="utf-8"))
+cfg.setdefault("server", {})["port"] = ov_port
+cfg.setdefault("storage", {})["workspace"] = str(data_dir)
+target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+PY
+}
+
+backup_and_reset() {
+''',
+                )
+
+            shell_text = shell_text.replace(
+                '  pkill -f \\'phase_a_off.py\\' || true\\n'
+                '  pkill -f \\'openclaw-gateway\\' || true\\n'
+                '  pkill -f \\'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\\' || true\\n'
+                '  sleep 2\\n'
+                '\\n'
+                '  rm -rf "${OV_DATA_DIR:?}/"*\\n'
+                '  mkdir -p "${OV_DATA_DIR}"\\n',
+                '  if [[ "${OPENCLAW_STATE_DIR}" == "/root/.openclaw" ]]; then\\n'
+                '    pkill -f \\'phase_a_off.py\\' || true\\n'
+                '    pkill -f \\'openclaw-gateway\\' || true\\n'
+                '    pkill -f \\'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\\' || true\\n'
+                '    sleep 2\\n'
+                '  fi\\n'
+                '\\n'
+                '  rm -rf "${OV_DATA_DIR:?}/"*\\n'
+                '  mkdir -p "${OV_DATA_DIR}"\\n',
+            )
+
+            shell_text = shell_text.replace(
+                '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" <<\\'PY\\'\\n',
+                '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" "${OPENVIKING_PORT}" <<\\'PY\\'\\n',
+            )
+            shell_text = shell_text.replace(
+                'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\\n',
+                'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\\n'
+                'openviking_port = int(sys.argv[6])\\n',
+            )
+            shell_text = shell_text.replace(
+                'cfg["userId"] = user_id\\n',
+                'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n'
+                'cfg["userId"] = user_id\\n',
+            )
+
+            shell_text = shell_text.replace(
+                '  nohup python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1 >"${OV_LOG}" 2>&1 &\\n',
+                '  nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\\n',
+            )
+            shell_text = shell_text.replace(
+                '    if curl -fsS http://127.0.0.1:1933/health >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\\n',
+                '    if curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\\n',
+            )
+
+            if '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    '    --output-dir "${OUTPUT_DIR}"\\n',
+                    '    --output-dir "${OUTPUT_DIR}"\\n'
+                    '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n'
+                    '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n'
+                    '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\\n',
+                )
+
+            if "  bootstrap_isolated_runtime\\n  backup_and_reset\\n" not in shell_text:
+                shell_text = shell_text.replace(
+                    "{\\n  backup_and_reset\\n",
+                    "{\\n  bootstrap_isolated_runtime\\n  backup_and_reset\\n",
+                )
+
             return shell_text
 
         def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
@@ -651,13 +1011,14 @@ sync_openclaw_auth_profiles() {
                 merged["models"] = template["models"]
             providers[provider_name] = merged
 
-        shell_path = benchmark_dir / "run_clean_small_in_container.sh"
-        shell_text = shell_path.read_text(encoding="utf-8")
-        shell_text = _enable_benchmark_plugin_diagnostics(shell_text)
-        shell_text = _enable_dedicated_gateway_port(shell_text)
-        shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\\n', '')
-        shell_text = shell_text.replace('cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\\n', '')
-        shell_text = shell_text.replace('cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\\n', '')
+shell_path = benchmark_dir / "run_clean_small_in_container.sh"
+shell_text = shell_path.read_text(encoding="utf-8")
+shell_text = _enable_benchmark_plugin_diagnostics(shell_text)
+shell_text = _enable_dedicated_gateway_port(shell_text)
+shell_text = _enable_isolated_runtime(shell_text)
+shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\\n', '')
+shell_text = shell_text.replace('cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\\n', '')
+shell_text = shell_text.replace('cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\\n', '')
         shell_text = shell_text.replace(
             '    --qa-disable-autocapture\\n',
             '    ${{QA_DISABLE_AUTOCAPTURE:+--qa-disable-autocapture}}\\n',
@@ -915,23 +1276,15 @@ sync_openclaw_auth_profiles() {
                 Path("/home/jcp/agent/code/OpenViking/openviking/session/compressor_v2.py"),
                 "extract_agent_memories",
             ),
-            (
-                Path("/root/.openviking/venv-0.3.24/lib/python3.11/site-packages/openviking/session/memory/session_extract_context_provider.py"),
-                "session_extract_context_provider",
-            ),
-            (
-                Path("/root/.openviking/venv-0.3.24/lib64/python3.11/site-packages/openviking/session/memory/session_extract_context_provider.py"),
-                "session_extract_context_provider",
-            ),
-            (
-                Path("/root/.openviking/venv-0.3.24/lib/python3.11/site-packages/openviking/session/compressor_v2.py"),
-                "extract_agent_memories",
-            ),
-            (
-                Path("/root/.openviking/venv-0.3.24/lib64/python3.11/site-packages/openviking/session/compressor_v2.py"),
-                "extract_agent_memories",
-            ),
         ]
+        for matched in glob.glob("/root/.openviking/venv*/lib/python*/site-packages/openviking/session/memory/session_extract_context_provider.py"):
+            compat_targets.append((Path(matched), "session_extract_context_provider"))
+        for matched in glob.glob("/root/.openviking/venv*/lib64/python*/site-packages/openviking/session/memory/session_extract_context_provider.py"):
+            compat_targets.append((Path(matched), "session_extract_context_provider"))
+        for matched in glob.glob("/root/.openviking/venv*/lib/python*/site-packages/openviking/session/compressor_v2.py"):
+            compat_targets.append((Path(matched), "extract_agent_memories"))
+        for matched in glob.glob("/root/.openviking/venv*/lib64/python*/site-packages/openviking/session/compressor_v2.py"):
+            compat_targets.append((Path(matched), "extract_agent_memories"))
         compat_results = []
         for compat_path, compat_kind in compat_targets:
             if not compat_path.exists():
@@ -952,68 +1305,11 @@ sync_openclaw_auth_profiles() {
             backup.write_text(agents_path.read_text(encoding="utf-8"), encoding="utf-8")
         agents_path.write_text(base64.b64decode(__AGENTS_B64__).decode("utf-8"), encoding="utf-8")
 
-        config_path = Path("/root/.openclaw/openclaw.json")
-        auth_path = Path("/root/.openclaw/agents/main/agent/auth-profiles.json")
-        import json
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-        auth_payload = json.loads(auth_path.read_text(encoding="utf-8")) if auth_path.exists() else {{"profiles": {{}}}}
-        for container in [
-            data.get("plugins", {{}}).get("entries", {{}}).get("openviking", {{}}).get("config", {{}}),
-            data.get("plugins", {{}}).get("openviking", {{}}),
-        ]:
-            if isinstance(container, dict):
-                container.pop("agent_prefix", None)
-                container.pop("isolateUserScopeByAgent", None)
-                container.pop("isolateAgentScopeByUser", None)
-        agents_root = data.setdefault("agents", {{}})
-        defaults = agents_root.setdefault("defaults", {{}})
-        default_model = __LOCOMO_MODEL__ or (
-            defaults.get("model", {{}}).get("primary")
-            if isinstance(defaults.get("model"), dict)
-            else None
-        ) or "volcengine/doubao-seed-2.0-pro"
-        if not isinstance(defaults.get("model"), dict):
-            defaults["model"] = {{}}
-        defaults["model"]["primary"] = default_model
-        _inject_openclaw_provider_config(
-            data,
-            default_model,
-            auth_payload.get("profiles", {{}}) if isinstance(auth_payload, dict) else {{}},
-        )
-        expected_workspace = "/root/.openclaw/workspace/locomo-eval"
-        locomo_eval_found = False
-        for agent in (data.get("agents", {{}}).get("list") or []):
-            if not isinstance(agent, dict):
-                continue
-            if agent.get("id") != "locomo-eval":
-                continue
-            locomo_eval_found = True
-            agent["model"] = default_model
-            agent["workspace"] = expected_workspace
-        if not locomo_eval_found:
-            raise RuntimeError("locomo-eval agent entry not found in /root/.openclaw/openclaw.json")
-        config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
-        verified = json.loads(config_path.read_text(encoding="utf-8"))
-        verified_agent = None
-        for agent in (verified.get("agents", {{}}).get("list") or []):
-            if isinstance(agent, dict) and agent.get("id") == "locomo-eval":
-                verified_agent = agent
-                break
-        if not isinstance(verified_agent, dict):
-            raise RuntimeError("locomo-eval agent entry disappeared after writing /root/.openclaw/openclaw.json")
-        if verified_agent.get("model") != default_model:
-            raise RuntimeError(
-                f"locomo-eval model mismatch after prepare: expected {{default_model}}, got {{verified_agent.get('model')}}"
-            )
-        if verified_agent.get("workspace") != expected_workspace:
-            raise RuntimeError(
-                f"locomo-eval workspace mismatch after prepare: expected {{expected_workspace}}, got {{verified_agent.get('workspace')}}"
-            )
         print(json.dumps({{
             "status": "remote locomo runtime prepared",
-            "locomo_eval_model": verified_agent.get("model"),
-            "locomo_eval_workspace": verified_agent.get("workspace"),
-            "default_model": default_model,
+            "locomo_eval_model": __LOCOMO_MODEL__ or "unchanged-global-config",
+            "locomo_eval_workspace": "isolated-per-run-state-dir",
+            "default_model": __LOCOMO_MODEL__ or "inherit-from-isolated-copy",
             "openclaw_auto_recall": auto_recall_results,
             "openviking_signature_compat": compat_results,
         }}, ensure_ascii=False))

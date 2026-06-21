@@ -6,6 +6,7 @@ SSH_PORT="${SSH_PORT:-10008}"
 REMOTE_CONTAINER="${REMOTE_CONTAINER:-jcp-dev}"
 REMOTE_BENCH_DIR="${REMOTE_BENCH_DIR:-/home/jcp/agent/code/OpenViking/benchmark/locomo/openclaw}"
 REMOTE_LOCK_DIR="${REMOTE_LOCK_DIR:-/tmp/locomo-entrypoint-locks}"
+REMOTE_RUNTIME_LOCK_FILE="${REMOTE_LOCK_DIR}/official_small_runtime.lock"
 
 MODE="${MODE:-on}"
 SAMPLE="${SAMPLE:-0}"
@@ -21,6 +22,31 @@ LOCAL_OUTPUT_DIR="${OUTPUT_DIR}"
 REMOTE_OUTPUT_DIR="/tmp/${RUN_ID}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"
+OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"
+OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/locomo-eval}"
+OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"
+OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"
+OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-$(python3 -c 'import sys; s=sum(ord(c) for c in sys.argv[1]); print(28000 + (s % 1000))' "${RUN_ID}")}"
+OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"
+OPENVIKING_PORT="${OPENVIKING_PORT:-$(python3 -c 'import sys; s=sum(ord(c) for c in sys.argv[1]); print(21000 + (s % 1000))' "${RUN_ID}")}"
+OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"
+OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"
+EXPECTED_OPENVIKING_VERSION="${MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION:-}"
+EXPECTED_OPENCLAW_VERSION="${MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION:-}"
+EXPECTED_LOCOMO_BENCHMARK_VERSION="${MEMORY_BENCH_EXPECTED_LOCOMO_BENCHMARK_VERSION:-}"
+OPENVIKING_INTROSPECT_PYTHON_BIN="${OPENVIKING_INTROSPECT_PYTHON_BIN:-}"
+
+acquire_remote_runtime_lock() {
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "bash -lc 'mkdir -p \"${REMOTE_LOCK_DIR}\" && if [ -f \"${REMOTE_RUNTIME_LOCK_FILE}\" ]; then echo LOCKED:${REMOTE_RUNTIME_LOCK_FILE}; exit 2; fi; echo $$ > \"${REMOTE_RUNTIME_LOCK_FILE}\"'"
+}
+
+release_remote_runtime_lock() {
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "bash -lc 'rm -f \"${REMOTE_RUNTIME_LOCK_FILE}\"'" >/dev/null 2>&1 || true
+}
+
+trap release_remote_runtime_lock EXIT INT TERM
+acquire_remote_runtime_lock
 
 PREPARE_ARGS=(
   --ssh-host "${SSH_HOST}"
@@ -43,10 +69,80 @@ SEED_KEY="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["seed_key
 BASE_URL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["base_url"])' "${REMOTE_CFG_JSON}")"
 JUDGE_MODEL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["model"])' "${REMOTE_CFG_JSON}")"
 
+resolve_openviking_introspect_python() {
+  if [ -n "${OPENVIKING_INTROSPECT_PYTHON_BIN}" ]; then
+    echo "${OPENVIKING_INTROSPECT_PYTHON_BIN}"
+    return 0
+  fi
+
+  local -a candidates=()
+  if [ -n "${EXPECTED_OPENVIKING_VERSION}" ]; then
+    candidates+=("/root/.openviking/venv-${EXPECTED_OPENVIKING_VERSION}/bin/python")
+    candidates+=("/root/.openviking/${EXPECTED_OPENVIKING_VERSION}/bin/python")
+  fi
+  candidates+=(
+    "/root/.openviking/venv/bin/python"
+    "/root/.openviking/venv-0.3.24/bin/python"
+    "python3"
+  )
+
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    if ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc 'command -v ${candidate} >/dev/null 2>&1'" >/dev/null 2>&1; then
+      OPENVIKING_INTROSPECT_PYTHON_BIN="${candidate}"
+      echo "${OPENVIKING_INTROSPECT_PYTHON_BIN}"
+      return 0
+    fi
+  done
+
+  echo "python3"
+}
+
+OPENVIKING_INTROSPECT_PYTHON_BIN="$(resolve_openviking_introspect_python)"
+
+check_remote_runtime_versions() {
+  local remote_json
+  remote_json="$(
+    ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '${OPENVIKING_INTROSPECT_PYTHON_BIN} - <<\"PY\"
+import json
+import re
+import subprocess
+try:
+    import openviking
+    ov_version = getattr(openviking, \"__version__\", \"unknown\")
+except Exception as exc:
+    ov_version = f\"error:{exc}\"
+try:
+    oc_version = subprocess.check_output([\"openclaw\", \"--version\"], text=True).strip()
+except Exception as exc:
+    oc_version = f\"error:{exc}\"
+print(json.dumps({\"openviking_version\": ov_version, \"openclaw_version\": oc_version}, ensure_ascii=False))
+PY'"
+  )"
+  local actual_ov actual_oc expected_ov expected_oc
+  actual_ov="$(python3 -c 'import json,re,sys; value=json.loads(sys.argv[1])["openviking_version"]; m=re.search(r"(v?\\d+(?:\\.\\d+){2,3})", value or ""); print((m.group(1).lstrip("v") if m else value))' "${remote_json}")"
+  actual_oc="$(python3 -c 'import json,re,sys; value=json.loads(sys.argv[1])["openclaw_version"]; m=re.search(r"(v?\\d+(?:\\.\\d+){2,3})", value or ""); print((m.group(1).lstrip("v") if m else value))' "${remote_json}")"
+  expected_ov="$(python3 -c 'import re,sys; value=sys.argv[1]; m=re.search(r"(v?\\d+(?:\\.\\d+){2,3})", value or ""); print((m.group(1).lstrip("v") if m else value))' "${EXPECTED_OPENVIKING_VERSION}")"
+  expected_oc="$(python3 -c 'import re,sys; value=sys.argv[1]; m=re.search(r"(v?\\d+(?:\\.\\d+){2,3})", value or ""); print((m.group(1).lstrip("v") if m else value))' "${EXPECTED_OPENCLAW_VERSION}")"
+
+  if [ -n "${expected_ov}" ] && [ "${actual_ov}" != "${expected_ov}" ]; then
+    echo "OpenViking runtime version mismatch: expected ${expected_ov}, got ${actual_ov}" >&2
+    exit 11
+  fi
+  if [ -n "${expected_oc}" ] && [ "${actual_oc}" != "${expected_oc}" ]; then
+    echo "OpenClaw runtime version mismatch: expected ${expected_oc}, got ${actual_oc}" >&2
+    exit 12
+  fi
+}
+
+check_remote_runtime_versions
+
 capture_remote_preflight_local() {
-  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '/root/.openviking/venv-0.3.24/bin/python - <<\"PY\"
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '${OPENVIKING_INTROSPECT_PYTHON_BIN} - <<\"PY\"
 import inspect
 import json
+import re
+import subprocess
 import requests
 from openviking.session.compressor_v2 import SessionCompressorV2
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
@@ -66,10 +162,43 @@ provider_sig = inspect.signature(SessionExtractContextProvider.__init__)
 long_sig = inspect.signature(SessionCompressorV2.extract_long_term_memories)
 agent_attr = getattr(SessionCompressorV2, \"extract_agent_memories\", None)
 agent_sig = inspect.signature(agent_attr) if agent_attr else None
+try:
+    openclaw_version_proc = subprocess.run([\"openclaw\", \"--version\"], text=True, capture_output=True, timeout=20, check=False)
+    openclaw_version_stdout = openclaw_version_proc.stdout.strip()
+    openclaw_version_stderr = openclaw_version_proc.stderr.strip()
+    openclaw_version_exit_code = openclaw_version_proc.returncode
+except Exception as exc:
+    openclaw_version_stdout = \"\"
+    openclaw_version_stderr = str(exc)
+    openclaw_version_exit_code = -1
+
+try:
+    openviking_git_describe_proc = subprocess.run(
+        [\"git\", \"-C\", \"/home/jcp/agent/code/OpenViking\", \"describe\", \"--tags\", \"--always\", \"--dirty\"],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    openviking_git_describe = openviking_git_describe_proc.stdout.strip() or openviking_git_describe_proc.stderr.strip()
+except Exception as exc:
+    openviking_git_describe = f\"error:{exc}\"
+
 payload = {
     \"run_id\": \"${RUN_ID}\",
     \"snapshot\": \"preflight\",
+    \"expected_versions\": {
+        \"openviking\": \"${EXPECTED_OPENVIKING_VERSION}\",
+        \"openclaw\": \"${EXPECTED_OPENCLAW_VERSION}\",
+        \"locomo_benchmark\": \"${EXPECTED_LOCOMO_BENCHMARK_VERSION}\",
+    },
     \"health\": fetch(\"/health\"),
+    \"openviking_git_describe\": openviking_git_describe,
+    \"openclaw_version\": {
+        \"stdout\": openclaw_version_stdout,
+        \"stderr\": openclaw_version_stderr,
+        \"exit_code\": openclaw_version_exit_code,
+    },
     \"extract_compatibility\": {
         \"session_extract_context_provider\": {
             \"file\": inspect.getsourcefile(SessionExtractContextProvider),
@@ -96,7 +225,7 @@ PY'"
 }
 
 capture_remote_postrun_local() {
-  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '/root/.openviking/venv-0.3.24/bin/python - <<\"PY\"
+  ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec ${REMOTE_CONTAINER} bash -lc '${OPENVIKING_INTROSPECT_PYTHON_BIN} - <<\"PY\"
 import json
 import requests
 
@@ -114,6 +243,11 @@ def fetch(path):
 payload = {
     \"run_id\": \"${RUN_ID}\",
     \"snapshot\": \"postrun\",
+    \"expected_versions\": {
+        \"openviking\": \"${EXPECTED_OPENVIKING_VERSION}\",
+        \"openclaw\": \"${EXPECTED_OPENCLAW_VERSION}\",
+        \"locomo_benchmark\": \"${EXPECTED_LOCOMO_BENCHMARK_VERSION}\",
+    },
     \"health\": fetch(\"/health\"),
     \"observer_system\": fetch(\"/api/v1/observer/system\"),
     \"observer_models\": fetch(\"/api/v1/observer/models\"),
@@ -131,6 +265,7 @@ capture_remote_preflight_local > "${LOCAL_PREFLIGHT_JSON}"
 if [ "${FAIL_ON_OV_INCOMPATIBLE_EXTRACTION}" = "true" ]; then
   python3 - "${LOCAL_PREFLIGHT_JSON}" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -155,6 +290,40 @@ if not provider_ok or not agent_ok:
         file=sys.stderr,
     )
     sys.exit(3)
+
+
+def normalize_version(value):
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(v?\d+(?:\.\d+){2,3})", value)
+    if not match:
+        return None
+    return match.group(1).lstrip("v")
+
+
+expected_versions = payload.get("expected_versions") or {}
+expected_openviking = normalize_version(expected_versions.get("openviking"))
+expected_openclaw = normalize_version(expected_versions.get("openclaw"))
+health_body = (payload.get("health") or {}).get("body") or {}
+actual_openviking = normalize_version(
+    health_body.get("version") or payload.get("openviking_git_describe")
+)
+openclaw_version = payload.get("openclaw_version") or {}
+actual_openclaw = normalize_version(
+    openclaw_version.get("stdout") or openclaw_version.get("stderr")
+)
+if expected_openviking and actual_openviking and expected_openviking != actual_openviking:
+    print(
+        f"OpenViking runtime version mismatch: expected {expected_openviking}, got {actual_openviking}",
+        file=sys.stderr,
+    )
+    sys.exit(4)
+if expected_openclaw and actual_openclaw and expected_openclaw != actual_openclaw:
+    print(
+        f"OpenClaw runtime version mismatch: expected {expected_openclaw}, got {actual_openclaw}",
+        file=sys.stderr,
+    )
+    sys.exit(5)
 PY
 fi
 
@@ -185,7 +354,7 @@ if [ -n "\${EXISTING_PHASE_RUNS}" ]; then
 fi
 
 cd "${REMOTE_BENCH_DIR}"
-TOKEN=\$(python3 -c 'import json;print(json.load(open("/root/.openclaw/openclaw.json"))["gateway"]["auth"]["token"])')
+TOKEN=\$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["gateway"]["auth"]["token"])' "${OPENCLAW_CONFIG_PATH}")
 
 export OPENCLAW_GATEWAY_TOKEN="\$TOKEN"
 export OPENVIKING_ROOT_API_KEY="${ROOT_KEY}"
@@ -203,6 +372,16 @@ export OUTPUT_DIR="${REMOTE_OUTPUT_DIR}"
 export MASTER_LOG="/tmp/${RUN_ID}.master.log"
 export OV_LOG="/tmp/${RUN_ID}.ov.log"
 export GW_LOG="/tmp/${RUN_ID}.gw.log"
+export OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}"
+export OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}"
+export OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR}"
+export OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR}"
+export OPENCLAW_ENV="${OPENCLAW_ENV}"
+export OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT}"
+export OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR}"
+export OPENVIKING_PORT="${OPENVIKING_PORT}"
+export OV_CONF_PATH="${OV_CONF_PATH}"
+export OV_DATA_DIR="${OV_DATA_DIR}"
 
 bash ./run_clean_small_in_container.sh
 
