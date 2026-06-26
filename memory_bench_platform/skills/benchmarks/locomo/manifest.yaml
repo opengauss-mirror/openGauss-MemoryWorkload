@@ -40,5 +40,7 @@ execution:
       external_runner: ../../../../tools/test_entrypoints/run_official_locomo_small.sh
     official_sample0:
       external_runner: ../../../../tools/test_entrypoints/run_official_locomo_sample.sh
+    locomo_test_remote:
+      external_runner: ../../../../tools/test_entrypoints/run_locomo_test_remote.sh
 judging:
   mode: external

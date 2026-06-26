@@ -25,6 +25,13 @@ def test_resolve_benchmark_entrypoint_reads_sample0_wrapper():
     assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_official_locomo_sample.sh")
 
 
+def test_resolve_benchmark_entrypoint_reads_locomo_test_remote_wrapper():
+    entrypoint = resolve_benchmark_entrypoint("locomo", "locomo_test_remote")
+    assert entrypoint.entrypoint_kind == "external_runner"
+    assert entrypoint.command[0] == "bash"
+    assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_locomo_test_remote.sh")
+
+
 def test_execute_external_runner_captures_process_result(tmp_path: Path):
     script = tmp_path / "runner.py"
     script.write_text(

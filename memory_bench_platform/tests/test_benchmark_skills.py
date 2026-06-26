@@ -15,6 +15,9 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     assert manifest["version_policy"]["targets"][0]["name"] == "locomo-benchmark"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/snap-research/locomo"
+    assert manifest["execution"]["entrypoints"]["locomo_test_remote"]["external_runner"].endswith(
+        "tools/test_entrypoints/run_locomo_test_remote.sh"
+    )
 
 
 def test_longmemeval_manifest_declares_case_builder():

@@ -2,9 +2,20 @@
 
 负责将 LoCoMo 数据集整理为平台统一的多轮记忆任务。
 
+## 平台派生关系
+
+- `memory_bench_platform` 是 LoCoMo 评测的主入口与归档/分析框架。
+- `locomo_test` 不应继续被视为与平台平行的独立体系，而应视为：
+  - 基于 `memory_bench_platform` 的 LoCoMo 专项执行层
+  - 负责远端 OpenClaw/OpenViking runtime bootstrap、专项 QA/closure 诊断、以及 LoCoMo 专用结果导出
+- 在 skill 层上，这种关系通过 `locomo_test_remote` external runner entrypoint 体现：
+  - 平台负责 run 生命周期、版本策略、资源监控、统一报告
+  - `locomo_test` 负责 LoCoMo 专项执行实现
+
 ## 外部 runner 约束
 
 - `official_small` 这类 external runner 依赖真实 `OpenClaw/OpenViking` 环境。
+- `locomo_test_remote` 代表“通过 `memory_bench_platform` 调起 `locomo_test`”的 LoCoMo 专项路径。
 - 默认要求被测软件使用“当前最新正式 release tag”。
 - 除非 run 配置显式指定允许的 override，否则 benchmark skill 不应自行退回旧版本。
 - `manifest.yaml` 必须声明 `version_policy.default_selection=latest_official_release_tag`，让平台能结构化读取该约束。
@@ -37,6 +48,19 @@
 - 若 `qa_results.csv` 与平台 `summary/case_results` 数量不一致：
   - 归类为 external runner 导出或平台 importer 问题
   - 不应再归因到 `OpenViking tag` 本身
+
+## locomo_test_remote 的职责边界
+
+- `memory_bench_platform`
+  - 选择 benchmark / agent skill
+  - 落版本策略与 run archive
+  - 持续资源监控
+  - 统一 `analysis.json` / `run_report.html`
+- `locomo_test`
+  - 构造 LoCoMo 专项运行配置
+  - 启动 isolated OpenClaw/OpenViking runtime
+  - 导出 `qa_results.csv` / `qa_diagnostics.json` / `meta.json`
+  - 输出 OpenViking closure / recall 专项诊断字段
 
 ## OpenViking 闭环要求
 

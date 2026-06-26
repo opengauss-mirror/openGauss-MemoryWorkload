@@ -44,6 +44,23 @@ python3 -m memory_bench_platform.cli run \
   --entrypoint official_small
 ```
 
+Derived LoCoMo execution path via `locomo_test`:
+
+```bash
+python3 -m memory_bench_platform.cli run \
+  --benchmark locomo \
+  --agent openclaw \
+  --entrypoint locomo_test_remote
+```
+
+This is the preferred architecture direction when LoCoMo needs the richer
+OpenClaw/OpenViking bootstrap and diagnostics that already exist in
+`locomo_test`:
+
+- `memory_bench_platform` remains the main run entry, archive, monitor, and report framework.
+- `locomo_test_remote` acts as a LoCoMo-specific external runner derived from that framework.
+- `locomo_test` is therefore treated as a benchmark-specialized execution layer, not a parallel benchmark platform.
+
 Expected run artifacts:
 
 - `run.json` with `source_kind = "external_benchmark_runner"`
@@ -70,6 +87,7 @@ Every successful `run` command also writes:
 
 - `reports/analysis.json`
 - `reports/analysis.md`
+- `reports/run_report.html`
 
 ## External Integration Examples
 

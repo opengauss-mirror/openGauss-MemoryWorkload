@@ -12,6 +12,7 @@ def test_readme_mentions_mvp_matrix():
     assert "explicitly requests an allowed override" in text
     assert "concrete runtime version" in text
     assert "records/version_selection.json" in text
+    assert "locomo_test_remote" in text
 
 
 def test_architecture_doc_mentions_version_policy():
@@ -52,3 +53,9 @@ def test_agent_and_benchmark_skill_docs_require_upstream_for_latest_tag_policy()
         assert "version_source" in text
         assert "upstream" in text or "上游仓库" in text
         assert "override" in text
+
+
+def test_locomo_skill_doc_mentions_locomo_test_as_platform_derived_entrypoint():
+    text = Path("skills/benchmarks/locomo/SKILL.md").read_text(encoding="utf-8")
+    assert "locomo_test_remote" in text
+    assert "memory_bench_platform" in text
