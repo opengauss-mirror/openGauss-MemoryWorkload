@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import csv
-import json
 import re
 import statistics
-from pathlib import Path
 from typing import Any
 
+from .locomo_test_artifacts import load_locomo_test_artifacts
 
 _STEP_RE = re.compile(r"\[([a-zA-Z_]+)\] done in ([0-9.]+)s")
 
 
 def build_locomo_test_timing_report(output_dir: Path) -> dict[str, Any]:
-    meta = _load_optional_json(output_dir / "meta.json")
-    qa_rows = _load_csv_rows(output_dir / "qa_results.csv")
-    pipeline_log = (output_dir / "pipeline.log").read_text(encoding="utf-8", errors="ignore") if (output_dir / "pipeline.log").exists() else ""
-    ingest_record = _load_optional_json(output_dir / ".ingest_record.json")
+    bundle = load_locomo_test_artifacts(output_dir)
+    meta = bundle.meta
+    qa_rows = bundle.qa_rows
+    pipeline_log = bundle.pipeline_log
+    ingest_record = bundle.ingest_record
 
     step_seconds = {
         f"{match.group(1)}_seconds": float(match.group(2))
@@ -109,20 +108,3 @@ def _quantiles_ms(values: list[float]) -> dict[str, float]:
         "p50_ms": round(p50, 3),
         "p90_ms": round(p90, 3),
     }
-
-
-def _load_optional_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _load_csv_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))

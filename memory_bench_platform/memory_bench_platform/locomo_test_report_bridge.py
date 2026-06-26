@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import csv
 import html
-import json
 from pathlib import Path
+
+from .locomo_test_artifacts import load_locomo_test_artifacts
 
 
 def render_locomo_test_html_report(output_dir: Path) -> str:
-    meta = _read_json(output_dir / "meta.json")
-    diagnostics = _read_json(output_dir / "qa_diagnostics.json")
-    rows = _read_rows(output_dir / "qa_results.csv")
+    bundle = load_locomo_test_artifacts(output_dir)
+    meta = bundle.meta
+    diagnostics = bundle.qa_diagnostics
+    rows = bundle.qa_rows
 
     title = _esc(meta.get("name") or output_dir.name)
     accuracy = _pct(meta.get("overall_accuracy", 0.0))
@@ -172,19 +173,6 @@ def write_locomo_test_html_report(output_dir: Path) -> Path:
     report_path = output_dir / "report.html"
     report_path.write_text(render_locomo_test_html_report(output_dir), encoding="utf-8")
     return report_path
-
-
-def _read_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _read_rows(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
 
 
 def _pct(value: float | int | None) -> str:

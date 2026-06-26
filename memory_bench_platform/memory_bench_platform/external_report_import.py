@@ -5,18 +5,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .locomo_test_artifacts import load_locomo_test_artifacts
 
 def import_external_result(run_dir: Path) -> dict[str, Any]:
-    meta_path = run_dir / "meta.json"
-    diagnostics = _load_optional_json(run_dir / "qa_diagnostics.json")
+    bundle = load_locomo_test_artifacts(run_dir)
+    meta = bundle.meta
+    diagnostics = bundle.qa_diagnostics
     csv_path = _pick_csv(run_dir)
     phase_meta_rows = _load_phase_meta_rows(run_dir)
 
     case_results = _load_case_results_from_csv(csv_path)
     case_results = _merge_with_phase_meta(case_results, phase_meta_rows)
 
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if meta:
         # Keep question count aligned with meta when possible.
         total_questions = int(meta.get("total_questions", 0) or 0)
         if total_questions <= 0 and phase_meta_rows:
@@ -58,18 +59,6 @@ def import_external_result(run_dir: Path) -> dict[str, Any]:
         },
         "case_results": case_results,
     }
-
-
-def _load_optional_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
 def _build_locomo_benchmark_diagnostics(
     run_dir: Path,
     meta: dict[str, Any],

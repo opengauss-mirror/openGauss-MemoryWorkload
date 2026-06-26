@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import csv
-import json
 import re
-from pathlib import Path
 from typing import Any
 
+from .locomo_test_artifacts import load_locomo_test_artifacts
 
 _STEP_RE = re.compile(r"\[([a-zA-Z_]+)\] done in ([0-9.]+)s")
 
 
 def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
-    meta = _load_optional_json(output_dir / "meta.json")
-    qa_diagnostics = _load_optional_json(output_dir / "qa_diagnostics.json")
-    ingest_record = _load_optional_json(output_dir / ".ingest_record.json")
-    qa_rows = _load_csv_rows(output_dir / "qa_results.csv")
-    pipeline_log = (output_dir / "pipeline.log").read_text(encoding="utf-8", errors="ignore") if (output_dir / "pipeline.log").exists() else ""
+    bundle = load_locomo_test_artifacts(output_dir)
+    meta = bundle.meta
+    qa_diagnostics = bundle.qa_diagnostics
+    ingest_record = bundle.ingest_record
+    qa_rows = bundle.qa_rows
+    pipeline_log = bundle.pipeline_log
 
     recall_totals = [int(row.get("ov_recall_total", 0) or 0) for row in qa_rows if str(row.get("ov_recall_total", "")).strip()]
     recall_hits = sum(1 for row in qa_rows if str(row.get("ov_recall_hit", "")).strip().lower() == "true")
@@ -77,18 +76,7 @@ def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
             "steps": timings,
             "ingest_session_span_seconds": ingest_span_seconds,
         },
-        "artifacts": {
-            key: str(path)
-            for key, path in {
-                "meta_json": output_dir / "meta.json",
-                "qa_diagnostics_json": output_dir / "qa_diagnostics.json",
-                "qa_results_csv": output_dir / "qa_results.csv",
-                "pipeline_log": output_dir / "pipeline.log",
-                "ingest_record_json": output_dir / ".ingest_record.json",
-                "report_html": output_dir / "report.html",
-            }.items()
-            if path.exists()
-        },
+        "artifacts": bundle.artifact_paths(),
     }
     findings: list[str] = []
     if result["nodes"]["memory_capture"]["memory_written_but_index_unavailable"] > 0:
@@ -101,20 +89,3 @@ def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
         findings.append("OpenViking 已产出 memory token，但最终准确率仍为 0，问题更可能在 recall/answer 阶段。")
     result["findings"] = findings
     return result
-
-
-def _load_optional_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _load_csv_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))
