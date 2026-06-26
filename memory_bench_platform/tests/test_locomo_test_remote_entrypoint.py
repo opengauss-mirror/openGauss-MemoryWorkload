@@ -5,6 +5,8 @@ def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
     script = Path("/mnt/d/code/Agent/test/tools/test_entrypoints/run_locomo_test_remote.sh")
     text = script.read_text(encoding="utf-8")
 
+    assert 'tar czf "${TMP_TAR}" -C "${WORKSPACE_ROOT}" locomo_test memory_bench_platform' in text
+    assert 'PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform"' in text
     assert 'LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openviking-small-stable.toml}"' in text
     assert 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"' in text
     assert 'OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-${RUN_ID}}"' in text

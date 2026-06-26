@@ -31,7 +31,7 @@ WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP_TAR="$(mktemp)"
 trap 'rm -f "${TMP_TAR}"' EXIT
 
-tar czf "${TMP_TAR}" -C "${WORKSPACE_ROOT}" locomo_test
+tar czf "${TMP_TAR}" -C "${WORKSPACE_ROOT}" locomo_test memory_bench_platform
 cat "${TMP_TAR}" | ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -lc 'rm -rf ${REMOTE_ROOT} && mkdir -p /tmp && tar xzf - -C /tmp'"
 
 ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -s" <<INNER
@@ -56,6 +56,7 @@ trap cleanup EXIT INT TERM
 echo \$\$ > "\$LOCK_FILE"
 
 cd "${REMOTE_ROOT}"
+export PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform"
 mkdir -p "${REMOTE_OUTPUT_DIR}" "${REMOTE_MONITOR_DIR}"
 
 python3 - "${REMOTE_MONITOR_DIR}" <<'PY' &
@@ -164,7 +165,7 @@ if ! curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/dev/null 2>&1; the
   exit 1
 fi
 
-PYTHONPATH="${REMOTE_ROOT}" python3 -m locomo_test.bootstrap_remote_runtime \
+PYTHONPATH="${PYTHONPATH}" python3 -m locomo_test.bootstrap_remote_runtime \
   --base-state-dir /root/.openclaw \
   --base-ov-conf "${OV_CONF_PATH}" \
   --state-dir "${OPENCLAW_STATE_DIR}" \
@@ -194,7 +195,7 @@ if ! curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/dev/null 2>&
   exit 1
 fi
 
-PYTHONPATH="${REMOTE_ROOT}" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"
+PYTHONPATH="${PYTHONPATH}" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"
 INNER
 
 mkdir -p "${LOCAL_OUTPUT_ROOT}"
