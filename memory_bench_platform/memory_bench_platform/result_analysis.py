@@ -13,6 +13,7 @@ from .official_small_timing import (
     render_official_small_timing_html,
 )
 from .external_report_import import import_external_result
+from .locomo_test_diagnostics import diagnose_locomo_test_output
 from .reporter import write_analysis_json, write_analysis_markdown
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .reporter import write_run_report_html, write_timing_report_html, write_timing_report_json
@@ -66,11 +67,16 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "benchmark_diagnostics": _extract_benchmark_diagnostics(external_result),
         "analysis_notes": _build_notes(summary, external_result, buckets, _read_ingest_summary(run_dir)),
     }
-    if list((run_dir / "external_artifacts").glob("official_*")):
+    external_output_dir = _resolve_external_output_dir(run_dir)
+    if external_result is not None and external_result.get("source") == "locomo_test" and external_output_dir is not None:
+        analysis["chain_diagnostics"] = diagnose_locomo_test_output(external_output_dir)
+    elif list((run_dir / "external_artifacts").glob("official_*")):
         try:
             analysis["chain_diagnostics"] = diagnose_official_small_run(run_dir)
         except FileNotFoundError:
             analysis["chain_diagnostics"] = {}
+
+    if list((run_dir / "external_artifacts").glob("official_*")):
         try:
             timing_report = build_official_small_timing_report(run_dir)
         except FileNotFoundError:
@@ -401,6 +407,10 @@ def _render_analysis_markdown(analysis: dict[str, Any]) -> str:
         lines.extend(["", "## Benchmark Diagnostics", ""])
         for key, value in analysis["benchmark_diagnostics"].items():
             lines.append(f"- {key}: `{value}`")
+    if analysis.get("chain_diagnostics"):
+        lines.extend(["", "## Chain Diagnostics", ""])
+        for key, value in analysis["chain_diagnostics"].items():
+            lines.append(f"- {key}: `{value}`")
     lines.extend(["", "## Notes", ""])
     for note in analysis["analysis_notes"]:
         lines.append(f"- {note}")
@@ -430,6 +440,13 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
         timing_html = (
             "<section class='card'><h2>Timing Report</h2><table><tbody>"
             + render_mapping(analysis["timing_report"])
+            + "</tbody></table></section>"
+        )
+    chain_html = ""
+    if analysis.get("chain_diagnostics"):
+        chain_html = (
+            "<section class='card' style='margin-top: 16px;'><h2>Chain Diagnostics</h2><table><tbody>"
+            + render_mapping(analysis["chain_diagnostics"])
             + "</tbody></table></section>"
         )
 
@@ -487,6 +504,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <section class="card"><h2>Artifacts</h2><table><tbody>{render_mapping(analysis.get("source_artifacts", {}))}</tbody></table></section>
     </section>
     {timing_html}
+    {chain_html}
     <section class="card" style="margin-top: 16px;">
       <h2>Analysis Notes</h2>
       <ul>{notes_html}</ul>

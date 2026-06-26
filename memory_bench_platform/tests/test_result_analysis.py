@@ -160,6 +160,25 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
         encoding="utf-8",
     )
     (artifacts / "report.html").write_text("<html>locomo</html>", encoding="utf-8")
+    (artifacts / "pipeline.log").write_text(
+        "\n".join(
+            [
+                "  [health_check] done in 5.0s",
+                "  [ingest] done in 10.0s",
+                "  [qa] done in 20.0s",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / ".ingest_record.json").write_text(
+        json.dumps(
+            {
+                "session_1": {"timestamp": 100},
+                "session_2": {"timestamp": 120},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     analysis = analyze_run(run_dir)
 
@@ -170,6 +189,8 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert analysis["ingest_summary"]["session_total"] == 2
     assert analysis["ingest_summary"]["zero_memory_sessions"] == 1
     assert analysis["benchmark_diagnostics"]["source"] == "locomo_test"
+    assert analysis["chain_diagnostics"]["source"] == "locomo_test"
+    assert analysis["chain_diagnostics"]["timing"]["steps"]["qa_seconds"] == 20.0
     assert (run_dir / "reports" / "analysis.json").is_file()
     assert (run_dir / "reports" / "analysis.md").is_file()
     assert (run_dir / "reports" / "run_report.html").is_file()
@@ -178,6 +199,7 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     report_html = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
     assert "memory_recalled_with_consistency_gap" in report_html
     assert "openviking_memory_written_but_index_unavailable" in report_html
+    assert "Chain Diagnostics" in report_html
 
 
 def test_analyze_run_refreshes_external_result_and_summary_from_external_artifacts(tmp_path: Path):
