@@ -10,6 +10,7 @@ RUN_ID="${RUN_ID:-locomo_test_remote_$(date +%Y%m%d_%H%M%S)}"
 LOCAL_OUTPUT_ROOT="${LOCAL_OUTPUT_ROOT:-/tmp/locomo_test_output}"
 LOCAL_OUTPUT_DIR="${LOCAL_OUTPUT_ROOT}/${RUN_ID}"
 REMOTE_OUTPUT_DIR="/tmp/locomo_test_output/${RUN_ID}"
+REMOTE_MONITOR_DIR="${REMOTE_OUTPUT_DIR}/monitor"
 LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openviking-small-stable.toml}"
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"
 OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-${RUN_ID}}"
@@ -45,6 +46,9 @@ if [ -f "\$LOCK_FILE" ]; then
 fi
 cleanup() {
   rm -f "\$LOCK_FILE"
+  if [ -n "\${MONITOR_PID:-}" ]; then
+    kill "\${MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
   pkill -f "${OPENCLAW_STATE_DIR}" >/dev/null 2>&1 || true
   pkill -f "${OV_CONF_PATH}" >/dev/null 2>&1 || true
 }
@@ -52,6 +56,65 @@ trap cleanup EXIT INT TERM
 echo \$\$ > "\$LOCK_FILE"
 
 cd "${REMOTE_ROOT}"
+mkdir -p "${REMOTE_OUTPUT_DIR}" "${REMOTE_MONITOR_DIR}"
+
+python3 - "${REMOTE_MONITOR_DIR}" <<'PY' &
+from __future__ import annotations
+
+import csv
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+out_dir = Path(sys.argv[1])
+out_dir.mkdir(parents=True, exist_ok=True)
+cpu_path = out_dir / "cpu_status.csv"
+mem_path = out_dir / "mem_status.csv"
+with cpu_path.open("w", encoding="utf-8", newline="") as handle:
+    csv.writer(handle).writerow(["timestamp", "summary_util_user", "summary_util_sys", "summary_util_idle"])
+with mem_path.open("w", encoding="utf-8", newline="") as handle:
+    csv.writer(handle).writerow(["timestamp", "mem_free_mb", "mem_used_mb"])
+
+running = True
+
+def _stop(signum, frame):
+    del signum, frame
+    global running
+    running = False
+
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
+
+def _read_cpu():
+    cpu_line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+    parts = cpu_line.split()[1:]
+    values = [float(item) for item in parts[:7]]
+    total = sum(values) or 1.0
+    return round(values[0] / total * 100, 2), round(values[2] / total * 100, 2), round(values[3] / total * 100, 2)
+
+def _read_mem():
+    meminfo = {}
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+        key, value = line.split(":", 1)
+        meminfo[key] = float(value.strip().split()[0])
+    total_mb = meminfo.get("MemTotal", 0.0) / 1024.0
+    available_mb = meminfo.get("MemAvailable", 0.0) / 1024.0
+    used_mb = max(0.0, total_mb - available_mb)
+    return round(available_mb, 2), round(used_mb, 2)
+
+while running:
+    ts = datetime.now().isoformat()
+    user, system, idle = _read_cpu()
+    free_mb, used_mb = _read_mem()
+    with cpu_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow([ts, user, system, idle])
+    with mem_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow([ts, free_mb, used_mb])
+    time.sleep(1.0)
+PY
+MONITOR_PID=$!
 
 python3 - "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" "${RUN_ID}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
 import json

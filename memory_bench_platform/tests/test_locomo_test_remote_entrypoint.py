@@ -14,6 +14,9 @@ def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
     assert 'OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"' in text
     assert 'OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"' in text
     assert 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-/root/.openviking/venv-0.3.24/bin/python}"' in text
+    assert 'REMOTE_MONITOR_DIR="${REMOTE_OUTPUT_DIR}/monitor"' in text
+    assert 'cpu_status.csv' in text
+    assert 'mem_status.csv' in text
     assert 'python3 -m locomo_test.bootstrap_remote_runtime \\' in text
     assert '--base-state-dir /root/.openclaw \\' in text
     assert '--base-ov-conf "${OV_CONF_PATH}" \\' in text

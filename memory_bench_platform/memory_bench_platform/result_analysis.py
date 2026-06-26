@@ -60,7 +60,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "category_summary": summary.get("category_summary", {}),
         "failure_summary": _summarize_failures(case_results, buckets),
         "failure_buckets": buckets,
-        "resource_summary": _read_cpu_summary(run_dir / "artifacts" / "monitor" / "cpu_status.csv"),
+        "resource_summary": _read_resource_summary(run_dir),
         "ingest_summary": _read_ingest_summary(run_dir),
         "source_artifacts": _source_artifacts(run_dir, external_result),
         "benchmark_diagnostics": _extract_benchmark_diagnostics(external_result),
@@ -276,11 +276,58 @@ def _read_cpu_summary(csv_path: Path) -> dict[str, Any]:
     }
 
 
+def _read_memory_summary(csv_path: Path) -> dict[str, Any]:
+    if not csv_path.exists():
+        return {"mem_sample_count": 0, "missing_mem": "artifacts/monitor/mem_status.csv"}
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    if not rows:
+        return {"mem_sample_count": 0, "missing_mem": "artifacts/monitor/mem_status.csv"}
+    free_values = [float(row["mem_free_mb"]) for row in rows]
+    used_values = [float(row["mem_used_mb"]) for row in rows]
+    return {
+        "mem_sample_count": len(rows),
+        "mem_free_avg_mb": round(sum(free_values) / len(free_values), 4),
+        "mem_used_avg_mb": round(sum(used_values) / len(used_values), 4),
+        "mem_free_min_mb": min(free_values),
+        "mem_used_peak_mb": max(used_values),
+    }
+
+
+def _read_resource_summary(run_dir: Path) -> dict[str, Any]:
+    cpu_path = run_dir / "artifacts" / "monitor" / "cpu_status.csv"
+    mem_path = run_dir / "artifacts" / "monitor" / "mem_status.csv"
+    if not cpu_path.exists() or not mem_path.exists():
+        fallback_root = _resolve_external_output_dir(run_dir)
+        if fallback_root is not None:
+            fallback_cpu = fallback_root / "monitor" / "cpu_status.csv"
+            fallback_mem = fallback_root / "monitor" / "mem_status.csv"
+            if fallback_cpu.exists():
+                cpu_path = fallback_cpu
+            if fallback_mem.exists():
+                mem_path = fallback_mem
+    payload = {}
+    payload.update(_read_cpu_summary(cpu_path))
+    payload.update(_read_memory_summary(mem_path))
+    return payload
+
+
 def _source_artifacts(run_dir: Path, external_result: dict[str, Any] | None) -> dict[str, Any]:
+    cpu_path = run_dir / "artifacts" / "monitor" / "cpu_status.csv"
+    mem_path = run_dir / "artifacts" / "monitor" / "mem_status.csv"
+    if not cpu_path.exists() or not mem_path.exists():
+        fallback_root = _resolve_external_output_dir(run_dir)
+        if fallback_root is not None:
+            fallback_cpu = fallback_root / "monitor" / "cpu_status.csv"
+            fallback_mem = fallback_root / "monitor" / "mem_status.csv"
+            if fallback_cpu.exists():
+                cpu_path = fallback_cpu
+            if fallback_mem.exists():
+                mem_path = fallback_mem
     payload = {
         "summary_json": str(run_dir / "reports" / "summary.json"),
         "case_results_json": str(run_dir / "reports" / "case_results.json"),
-        "cpu_status_csv": str(run_dir / "artifacts" / "monitor" / "cpu_status.csv"),
+        "cpu_status_csv": str(cpu_path),
+        "mem_status_csv": str(mem_path),
     }
     if external_result is not None:
         payload["external_result_summary_json"] = str(run_dir / "reports" / "external_result_summary.json")

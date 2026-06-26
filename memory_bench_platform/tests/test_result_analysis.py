@@ -62,6 +62,12 @@ def _build_minimal_run(run_dir: Path) -> None:
         "2,20.0,7.0,73.0\n",
         encoding="utf-8",
     )
+    (run_dir / "artifacts" / "monitor" / "mem_status.csv").write_text(
+        "timestamp,mem_free_mb,mem_used_mb\n"
+        "1,1000.0,2000.0\n"
+        "2,900.0,2100.0\n",
+        encoding="utf-8",
+    )
 
 
 def _write_master_log(run_dir: Path, text: str) -> None:
@@ -160,6 +166,7 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert analysis["overall_accuracy"] == 0.5
     assert analysis["failure_summary"]["retrieval_miss_count"] == 1
     assert analysis["resource_summary"]["cpu_user_peak"] == 20.0
+    assert analysis["resource_summary"]["mem_used_peak_mb"] == 2100.0
     assert analysis["ingest_summary"]["session_total"] == 2
     assert analysis["ingest_summary"]["zero_memory_sessions"] == 1
     assert analysis["benchmark_diagnostics"]["source"] == "locomo_test"
@@ -290,6 +297,7 @@ def test_analyze_run_tolerates_missing_cpu_monitor_file(tmp_path: Path):
     run_dir = tmp_path / "run-2"
     _build_minimal_run(run_dir)
     (run_dir / "artifacts" / "monitor" / "cpu_status.csv").unlink()
+    (run_dir / "artifacts" / "monitor" / "mem_status.csv").unlink()
     (run_dir / "reports" / "case_results.json").write_text(
         json.dumps(
             [
@@ -322,6 +330,49 @@ def test_analyze_run_tolerates_missing_cpu_monitor_file(tmp_path: Path):
 
     assert analysis["failure_summary"]["format_or_empty_count"] == 1
     assert analysis["resource_summary"]["cpu_sample_count"] == 0
+
+
+def test_analyze_run_falls_back_to_external_monitor_files(tmp_path: Path):
+    run_dir = tmp_path / "run-fallback-monitor"
+    _build_minimal_run(run_dir)
+    (run_dir / "artifacts" / "monitor" / "cpu_status.csv").unlink()
+    (run_dir / "artifacts" / "monitor" / "mem_status.csv").unlink()
+    artifacts = run_dir / "external_artifacts" / "locomo_test_remote" / "monitor"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "source_id": "locomo:locomo_test_remote",
+                "source_kind": "external_benchmark_runner",
+                "agent_id": "openclaw",
+                "status": "partial",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "records").mkdir(parents=True, exist_ok=True)
+    (run_dir / "records" / "external_entrypoint.json").write_text(
+        json.dumps({"entrypoint_id": "locomo_test_remote"}),
+        encoding="utf-8",
+    )
+    (artifacts / "cpu_status.csv").write_text(
+        "timestamp,summary_util_user,summary_util_sys,summary_util_idle\n"
+        "1,11.0,4.0,85.0\n"
+        "2,21.0,8.0,71.0\n",
+        encoding="utf-8",
+    )
+    (artifacts / "mem_status.csv").write_text(
+        "timestamp,mem_free_mb,mem_used_mb\n"
+        "1,800.0,2200.0\n"
+        "2,750.0,2250.0\n",
+        encoding="utf-8",
+    )
+
+    analysis = analyze_run(run_dir)
+
+    assert analysis["resource_summary"]["cpu_user_peak"] == 21.0
+    assert analysis["resource_summary"]["mem_used_peak_mb"] == 2250.0
 
 
 def test_cli_analyze_run_generates_analysis_files(tmp_path: Path):
