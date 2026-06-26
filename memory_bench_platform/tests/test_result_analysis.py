@@ -196,6 +196,7 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert (run_dir / "reports" / "run_report.html").is_file()
     assert (run_dir / "reports" / "timing_report.json").is_file()
     assert (run_dir / "reports" / "timing_report.html").is_file()
+    assert analysis["timing_report"]["duration_label_count"] >= 1
     report_html = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
     assert "memory_recalled_with_consistency_gap" in report_html
     assert "openviking_memory_written_but_index_unavailable" in report_html

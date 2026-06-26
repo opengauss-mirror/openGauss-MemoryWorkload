@@ -14,6 +14,7 @@ from .official_small_timing import (
 )
 from .external_report_import import import_external_result
 from .locomo_test_diagnostics import diagnose_locomo_test_output
+from .locomo_test_timing import build_locomo_test_timing_report, render_locomo_test_timing_html
 from .reporter import write_analysis_json, write_analysis_markdown
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .reporter import write_run_report_html, write_timing_report_html, write_timing_report_json
@@ -70,6 +71,14 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     external_output_dir = _resolve_external_output_dir(run_dir)
     if external_result is not None and external_result.get("source") == "locomo_test" and external_output_dir is not None:
         analysis["chain_diagnostics"] = diagnose_locomo_test_output(external_output_dir)
+        timing_report = build_locomo_test_timing_report(external_output_dir)
+        write_timing_report_json(run_dir, timing_report)
+        write_timing_report_html(run_dir, render_locomo_test_timing_html(timing_report))
+        analysis["timing_report"] = {
+            "json": str(run_dir / "reports" / "timing_report.json"),
+            "html": str(run_dir / "reports" / "timing_report.html"),
+            "duration_label_count": len(timing_report.get("duration_distributions", {})),
+        }
     elif list((run_dir / "external_artifacts").glob("official_*")):
         try:
             analysis["chain_diagnostics"] = diagnose_official_small_run(run_dir)
