@@ -3,12 +3,74 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sys
+import time
 
 import requests
 
 from .config import Config
+from .eval import get_session_id_from_key, reset_session, send_message
+
+
+def _truthy_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def bootstrap_openviking_context(cfg: Config) -> bool:
+    """Warm up the OpenViking-backed memory path so a fresh data dir creates schema eagerly."""
+    bootstrap_user = f"_ov_bootstrap_{cfg.user}"
+    session_key = f"bootstrap-{cfg.agent_id}-{cfg.user}"
+    message = "OpenViking bootstrap probe. Reply with OK only."
+    print("  OpenViking bootstrap: sending warmup request ... ", end="", file=sys.stderr)
+    try:
+        reply, _ = send_message(
+            cfg.gateway.base_url,
+            cfg.gateway.token,
+            bootstrap_user,
+            message,
+            cfg.agent_id,
+            session_key,
+        )
+        print(f"OK ({reply[:32]})", file=sys.stderr)
+    except Exception as e:
+        print(f"FAIL ({e})", file=sys.stderr)
+        return False
+
+    found = get_session_id_from_key(session_key, bootstrap_user, cfg.agent_id, cfg.gateway.state_dir)
+    if found:
+        session_file, sessions_dir = found
+        session_path = session_file if os.path.isabs(session_file) else os.path.join(sessions_dir, session_file)
+        if not session_path.endswith(".jsonl"):
+            session_path += ".jsonl"
+        reset_session(session_path, cfg.agent_id, cfg.gateway.state_dir)
+    return True
+
+
+def _check_http_with_retry(
+    label: str,
+    url: str,
+    *,
+    attempts: int = 3,
+    timeout: int = 10,
+) -> bool:
+    for attempt in range(1, attempts + 1):
+        print(f"  {label}: {url} ... ", end="", file=sys.stderr)
+        try:
+            resp = requests.get(url, timeout=timeout)
+            print(f"OK ({resp.status_code})", file=sys.stderr)
+            return True
+        except Exception as e:
+            if attempt >= attempts:
+                print(f"FAIL ({e})", file=sys.stderr)
+                return False
+            print(f"RETRY ({e})", file=sys.stderr)
+            time.sleep(attempt)
+    return False
 
 
 def check_health(cfg: Config) -> bool:
@@ -17,12 +79,7 @@ def check_health(cfg: Config) -> bool:
 
     # Gateway — use /health endpoint (lightweight, no LLM call)
     gw_health = cfg.gateway.base_url + "/health"
-    print(f"  Gateway: {gw_health} ... ", end="", file=sys.stderr)
-    try:
-        resp = requests.get(gw_health, timeout=10)
-        print(f"OK ({resp.status_code})", file=sys.stderr)
-    except Exception as e:
-        print(f"FAIL ({e})", file=sys.stderr)
+    if not _check_http_with_retry("Gateway", gw_health, attempts=4, timeout=10):
         ok = False
 
     if cfg.memory_mode == "openviking":
@@ -37,6 +94,8 @@ def check_health(cfg: Config) -> bool:
         except Exception as e:
             print(f"FAIL ({e})", file=sys.stderr)
             ok = False
+        if ok and _truthy_env("LOCOMO_OPENVIKING_BOOTSTRAP", default=True):
+            ok = bootstrap_openviking_context(cfg) and ok
     elif cfg.memory_mode == "ogmem":
         og_url = f"{cfg.ogmem.api_url}/api/v1/health"
         print(f"  oGMemory: {og_url} ... ", end="", file=sys.stderr)
@@ -109,7 +168,81 @@ def check_qa_results(output_dir: str) -> dict:
     if empty_responses:
         issues["empty_or_error_responses"] = empty_responses
 
+    ov_token_col = "ov_llm_total_tokens"
+    if rows and ov_token_col in rows[0]:
+        ov_zero = sum(1 for r in rows if int((r.get(ov_token_col) or "0").strip() or 0) == 0)
+        if ov_zero == len(rows):
+            issues["openviking_tokens_all_zero"] = ov_zero
+
+    ov_missing_col = "ov_missing_records"
+    if rows and ov_missing_col in rows[0]:
+        max_missing = max(int((r.get(ov_missing_col) or "0").strip() or 0) for r in rows)
+        if max_missing > 0:
+            issues["openviking_index_missing_records_max"] = max_missing
+            rows_with_tokens = sum(
+                1
+                for r in rows
+                if int((r.get(ov_token_col) or "0").strip() or 0) > 0
+            )
+            if rows_with_tokens > 0:
+                issues["openviking_memory_written_but_index_unavailable"] = rows_with_tokens
+
     return issues
+
+
+def summarize_qa_results(output_dir: str) -> dict:
+    """Build run-level QA diagnostics from qa_results.csv."""
+    csv_path = os.path.join(output_dir, "qa_results.csv")
+    if not os.path.exists(csv_path):
+        return {"missing_csv": csv_path}
+
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        return {"csv_read_error": str(e)}
+
+    valid = [r for r in rows if r.get("category") != "5"]
+    closure_counts: dict[str, int] = {}
+    for row in valid:
+        state = str(row.get("ov_closure_state") or "").strip()
+        if not state:
+            continue
+        closure_counts[state] = closure_counts.get(state, 0) + 1
+
+    def _has_true(field: str) -> bool:
+        return any(str((row.get(field) or "")).strip().lower() == "true" for row in valid)
+
+    dominant_state = ""
+    if closure_counts:
+        dominant_state = max(sorted(closure_counts.items()), key=lambda item: item[1])[0]
+
+    issues = check_qa_results(output_dir)
+    return {
+        "rows": len(rows),
+        "valid_rows": len(valid),
+        "issues": issues,
+        "ov_closure_counts": closure_counts,
+        "ov_closure_summary": {
+            "dominant_state": dominant_state,
+            "has_memory_written": _has_true("ov_memory_written"),
+            "has_token_emitted": _has_true("ov_token_emitted"),
+            "has_index_unavailable": any(
+                str((row.get("ov_index_available") or "")).strip().lower() == "false" for row in valid
+            ),
+        }
+        if closure_counts
+        else {},
+    }
+
+
+def write_qa_diagnostics(output_dir: str) -> dict:
+    """Write qa_diagnostics.json and return its content."""
+    diagnostics = summarize_qa_results(output_dir)
+    path = os.path.join(output_dir, "qa_diagnostics.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, indent=2, ensure_ascii=False)
+    return diagnostics
 
 
 def check_judge_results(output_dir: str) -> dict:

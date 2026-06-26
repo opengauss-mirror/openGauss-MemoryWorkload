@@ -8,7 +8,7 @@
 
 | 入口 | 当前用途 | 关键依赖 | 当前状态 | 推荐级别 | 已知问题 |
 | --- | --- | --- | --- | --- | --- |
-| `locomo_test` | LoCoMo `small` / `locomo10` 主跑数入口 | OpenClaw gateway、OpenViking、judge LLM、远端容器 `jcp-dev` | 可跑并已产出可信结果 | 高 | 旧 compact / task 兼容层仍需清理；部分 token 统计链路过时 |
+| `locomo_test` | LoCoMo `small` / `locomo10` 主跑数入口 | OpenClaw gateway、OpenViking、judge LLM、远端容器 `jcp-dev` | 可跑并已产出可信结果 | 高 | 旧 compact / task 兼容层仍需清理；部分 token 统计链路过时；OpenViking 本地 vectordb `collection_meta.json`/`index_meta.json` 残缺时需要先做 schema bootstrap |
 | `memory_bench_platform` | 统一 workflow/case 平台、skill 验证、归档与报告 | benchmark skill、agent skill、native workflow、OpenClaw/OpenViking | 可跑并已完成 from-scratch 验证 | 中 | external runner 当前结果与 `official wrapper` 对齐，但与 `locomo_test` 主入口仍有结果差异 |
 | `benchmark/locomo/openclaw/phase_a_off.py` 及 `run_clean_small_in_container.sh` | 官方 LoCoMo direct-ov 基线入口 | OpenViking benchmark 目录、OpenClaw 插件配置、远端容器 `jcp-dev` | 可跑但易串口径 | 中 | 并发 run 会污染插件配置、账号前缀与评测结果 |
 
@@ -35,6 +35,13 @@
 - OpenClaw 插件配置中的 `accountId` / `userId` / `agent_prefix` 必须与本次 run 的命名空间一致。
 - OpenViking 数据目录、OpenClaw `locomo-eval` 会话态、评测输出目录需要按 run 级隔离。
 - 所有入口最终都必须落到统一 artifact 目录，并能导出 `accuracy`、`category stats`、`logs`、`resource summary`。
+- 对 `locomo_test` 的 OpenViking 模式，至少应能稳定导出：
+  - `qa_results.csv`
+  - `qa_diagnostics.json`
+  - 在启用 `stats` 时额外导出 `meta.json`
+- 若 `qa_diagnostics.json.ov_closure_summary.dominant_state=memory_written_but_index_unavailable`：
+  - 应优先归因为 OpenViking vectordb / index consistency 缺陷
+  - 不再归因为 benchmark prompt 或平台 token 提取链
 
 ## 5. 当前判断
 

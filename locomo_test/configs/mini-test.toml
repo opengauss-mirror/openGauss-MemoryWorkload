@@ -14,6 +14,9 @@ agent_id = "locomo-eval"
 [session]
 policy = "isolated"
 
+[openviking]
+keep_recent_count = 0
+
 [steps]
 health_check = true
 ingest = true

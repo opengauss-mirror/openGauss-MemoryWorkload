@@ -10,6 +10,19 @@ RUN_ID="${RUN_ID:-locomo_test_remote_$(date +%Y%m%d_%H%M%S)}"
 LOCAL_OUTPUT_ROOT="${LOCAL_OUTPUT_ROOT:-/tmp/locomo_test_output}"
 LOCAL_OUTPUT_DIR="${LOCAL_OUTPUT_ROOT}/${RUN_ID}"
 REMOTE_OUTPUT_DIR="/tmp/locomo_test_output/${RUN_ID}"
+LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openviking-small-stable.toml}"
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"
+OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-${RUN_ID}}"
+OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"
+OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-$(python3 -c 'import sys; s=sum(ord(c) for c in sys.argv[1]); print(28000 + (s % 1000))' "${RUN_ID}")}"
+OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"
+OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"
+OPENVIKING_PORT="${OPENVIKING_PORT:-$(python3 -c 'import sys; s=sum(ord(c) for c in sys.argv[1]); print(22000 + (s % 1000))' "${RUN_ID}")}"
+OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"
+OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"
+OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-/root/.openviking/venv-0.3.24/bin/python}"
+OV_LOG="${OV_LOG:-/tmp/${RUN_ID}_openviking.log}"
+GW_LOG="${GW_LOG:-/tmp/${RUN_ID}_openclaw_gateway.log}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -19,11 +32,6 @@ trap 'rm -f "${TMP_TAR}"' EXIT
 
 tar czf "${TMP_TAR}" -C "${WORKSPACE_ROOT}" locomo_test
 cat "${TMP_TAR}" | ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -lc 'rm -rf ${REMOTE_ROOT} && mkdir -p /tmp && tar xzf - -C /tmp'"
-
-REMOTE_CFG_JSON="$(
-  ssh -p "${SSH_PORT}" "${SSH_HOST}" \
-    "docker exec ${REMOTE_CONTAINER} python3 -c 'import json; oc=json.load(open(\"/root/.openclaw/openclaw.json\")); ov=json.load(open(\"/root/.openviking/ov.conf\")); print(json.dumps({\"gateway_port\": oc[\"gateway\"][\"port\"], \"gateway_token\": oc[\"gateway\"][\"auth\"][\"token\"], \"state_dir\": oc.get(\"stateDir\") or \"/root/.openclaw\", \"ov_port\": ov[\"server\"][\"port\"], \"judge_key\": ov[\"vlm\"][\"api_key\"], \"judge_base_url\": ov[\"vlm\"][\"api_base\"], \"judge_model\": ov[\"vlm\"][\"model\"]}))'"
-)"
 
 ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -s" <<INNER
 set -euo pipefail
@@ -37,50 +45,93 @@ if [ -f "\$LOCK_FILE" ]; then
 fi
 cleanup() {
   rm -f "\$LOCK_FILE"
+  pkill -f "${OPENCLAW_STATE_DIR}" >/dev/null 2>&1 || true
+  pkill -f "${OV_CONF_PATH}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 echo \$\$ > "\$LOCK_FILE"
 
 cd "${REMOTE_ROOT}"
 
-python3 - <<'PY'
+python3 - "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" "${RUN_ID}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
 import json
+import sys
 from pathlib import Path
 
-cfg = json.loads("""${REMOTE_CFG_JSON}""")
-env_toml = Path("${REMOTE_ROOT}/configs/env.toml")
-env_toml.write_text(
-    f"""[gateway]
-port = {cfg['gateway_port']}
-token = "{cfg['gateway_token']}"
-state_dir = "{cfg['state_dir']}"
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore[no-redef]
 
-[openviking]
-port = {cfg['ov_port']}
+config_path = Path(sys.argv[1])
+run_id = sys.argv[2]
+ov_conf_path = Path(sys.argv[3])
+ov_data_dir = Path(sys.argv[4])
+ov_port = int(sys.argv[5])
 
-[judge]
-api_key = "{cfg['judge_key']}"
-base_url = "{cfg['judge_base_url']}"
-model = "{cfg['judge_model']}"
-api_format = "openai"
-parallel = 5
-""",
-    encoding="utf-8",
-)
+runtime_cfg = tomllib.loads(config_path.read_text(encoding="utf-8"))
+runtime_user = str(runtime_cfg.get("general", {}).get("user", "eval-1"))
+payload = {
+    "account_id": f"acct-{run_id}",
+    "user_id": runtime_user,
+}
+base_ov_conf = Path("/root/.openviking/ov.conf")
+ov_conf = json.loads(base_ov_conf.read_text(encoding="utf-8"))
+ov_conf.setdefault("server", {})["port"] = ov_port
+ov_conf.setdefault("storage", {})["workspace"] = str(ov_data_dir)
+ov_conf.setdefault("memory", {}).pop("wm_v2_preprocess_enabled", None)
+ov_conf_path.parent.mkdir(parents=True, exist_ok=True)
+ov_data_dir.mkdir(parents=True, exist_ok=True)
+ov_conf_path.write_text(json.dumps(ov_conf, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(payload, ensure_ascii=False))
 PY
 
-python3 - <<'PY'
-from pathlib import Path
+nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &
+for _ in \$(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then
+    cat /tmp/"${RUN_ID}"_ov_health.json
+    break
+  fi
+  sleep 1
+done
 
-src = Path("${REMOTE_ROOT}/configs/openviking-small-stable.toml")
-dst = Path("${REMOTE_ROOT}/configs/openviking-small-stable-runtime.toml")
-text = src.read_text(encoding="utf-8")
-text = text.replace('name = "openviking-small-stable"', 'name = "${RUN_ID}"')
-text = text.replace('[general]\n', '[general]\noutput_dir = "/tmp/locomo_test_output"\n', 1)
-dst.write_text(text, encoding="utf-8")
-PY
+if ! curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/dev/null 2>&1; then
+  echo "failed to start isolated openviking" >&2
+  tail -n 120 "${OV_LOG}" 2>/dev/null || true
+  exit 1
+fi
 
-PYTHONPATH="${REMOTE_ROOT}" python3 -m locomo_test.cli run configs/openviking-small-stable-runtime.toml --skip health_check
+PYTHONPATH="${REMOTE_ROOT}" python3 -m locomo_test.bootstrap_remote_runtime \
+  --base-state-dir /root/.openclaw \
+  --base-ov-conf "${OV_CONF_PATH}" \
+  --state-dir "${OPENCLAW_STATE_DIR}" \
+  --home-dir "${OPENCLAW_HOME_DIR}" \
+  --config-path "${OPENCLAW_CONFIG_PATH}" \
+  --env-path "${OPENCLAW_ENV}" \
+  --gateway-port "${OPENCLAW_GATEWAY_PORT}" \
+  --run-id "${RUN_ID}" \
+  --runtime-config-src "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" \
+  --runtime-config-dst "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml" \
+  --output-dir "/tmp/locomo_test_output"
+
+# shellcheck disable=SC1090
+source "${OPENCLAW_ENV}" 2>/dev/null || true
+nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" OPENVIKING_BASE_URL="${OPENVIKING_BASE_URL:-http://127.0.0.1:${OPENVIKING_PORT}}" OPENVIKING_API_KEY="${OPENVIKING_API_KEY:-}" openclaw gateway >"${GW_LOG}" 2>&1 &
+for _ in \$(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then
+    cat /tmp/"${RUN_ID}"_gw_health.json
+    break
+  fi
+  sleep 1
+done
+
+if ! curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/dev/null 2>&1; then
+  echo "failed to start isolated gateway" >&2
+  tail -n 120 "${GW_LOG}" 2>/dev/null || true
+  exit 1
+fi
+
+PYTHONPATH="${REMOTE_ROOT}" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"
 INNER
 
 mkdir -p "${LOCAL_OUTPUT_ROOT}"

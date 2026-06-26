@@ -37,3 +37,23 @@
 - 若 `qa_results.csv` 与平台 `summary/case_results` 数量不一致：
   - 归类为 external runner 导出或平台 importer 问题
   - 不应再归因到 `OpenViking tag` 本身
+
+## OpenViking 闭环要求
+
+- 对接 OpenViking 作为记忆后端时，LoCoMo benchmark 不应只把对话 turn 写入 session。
+- 平台或 external runner 必须保证真实链路满足：
+  - `messages -> commit -> recall`
+- 若平台实现把 `direct_ov_stable` 简化成“跳过 compact/commit”，则该 run 应视为对接不完整，不应直接拿来解释 recall 能力。
+
+## recall=0 的归因优先级
+
+- 若出现以下组合现象：
+  - `qa_results.csv` 里 `ov_llm_total_tokens` 已非 0
+  - `ov_missing_records` 持续大于 0
+  - OpenViking memory 文件系统中已能看到对应 memory 文件
+  - 但 LoCoMo 回答仍然大面积 `I don't have any recalled memory...`
+- 优先归因为 OpenViking vectordb / index consistency 缺陷，而不是 LoCoMo benchmark 数据或 question prompt 问题。
+- 特别是当：
+  - 运行态 `observer/vikingdb` 报 `Vector Count > 0`
+  - fresh backend 复查却 `collection_exists=False`
+- 应明确标记为 SUT 缺陷，避免把该 run 误判为 benchmark skill 未对接完成。

@@ -8,6 +8,7 @@ from typing import Any
 
 def import_external_result(run_dir: Path) -> dict[str, Any]:
     meta_path = run_dir / "meta.json"
+    diagnostics = _load_optional_json(run_dir / "qa_diagnostics.json")
     csv_path = _pick_csv(run_dir)
     phase_meta_rows = _load_phase_meta_rows(run_dir)
 
@@ -36,6 +37,7 @@ def import_external_result(run_dir: Path) -> dict[str, Any]:
                 "memory_token_totals": meta.get("memory_token_totals", {}),
             },
             "case_results": case_results,
+            "benchmark_diagnostics": _build_locomo_benchmark_diagnostics(run_dir, meta, diagnostics),
         }
 
     csv_path = _pick_csv(run_dir)
@@ -56,6 +58,41 @@ def import_external_result(run_dir: Path) -> dict[str, Any]:
         },
         "case_results": case_results,
     }
+
+
+def _load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_locomo_benchmark_diagnostics(
+    run_dir: Path,
+    meta: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "source": "locomo_test",
+        "ov_closure_summary": meta.get("ov_closure_summary", {}),
+        "ov_closure_counts": meta.get("ov_closure_counts", {}),
+        "issues": diagnostics.get("issues", {}),
+        "qa_diagnostics_summary": diagnostics.get("ov_closure_summary", {}),
+        "artifacts": {},
+    }
+    artifact_map = {
+        "report_html": run_dir / "report.html",
+        "qa_diagnostics_json": run_dir / "qa_diagnostics.json",
+        "meta_json": run_dir / "meta.json",
+        "qa_results_csv": run_dir / "qa_results.csv",
+    }
+    for key, path in artifact_map.items():
+        if path.exists():
+            payload["artifacts"][key] = str(path)
+    return payload
 
 
 def _pick_csv(run_dir: Path) -> Path:

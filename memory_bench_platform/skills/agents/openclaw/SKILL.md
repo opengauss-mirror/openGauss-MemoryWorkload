@@ -47,3 +47,32 @@
   - 手工 direct probe 能命中
   - 平台自动 recall 仍落到错误 agent scope
   - `official_small` 回答大量表现为 `retrieval_miss`
+
+## OpenViking 评测闭环
+
+- 对接 `LoCoMo` / `LongMemEval` 这类多轮记忆 benchmark 时，不要把 `direct_ov_stable` 理解成“跳过 commit”。
+- 平台侧应保证 OpenViking 至少走通以下闭环：
+  - `messages`
+  - `commit`
+  - `recall`
+- 也就是说，每轮通过 OpenClaw 产出 user/assistant turn 后，必须显式触发一次 OpenViking session commit，至少满足：
+  - `wait=false`
+  - `keepRecentCount=10`
+- 若只写 session messages、不做 commit，常见后果是：
+  - memory extraction 未真正执行
+  - recall 只能读到 session live context，读不到稳定 memory
+  - `qa_results.csv` 回答表现为大面积 `retrieval_miss`
+  - token 统计与 official wrapper / locomo-test-kit 口径不一致
+
+## OpenViking vectordb 分叉识别
+
+- 若已经确认：
+  - `messages -> commit` 已执行
+  - `ov_llm_total_tokens` / `ov_embedding_tokens` 已非 0
+  - memory 文件在 `viking://user/.../memories` 下可见
+  - 但 `/search/find` 仍然为 0
+- 则下一优先级不要继续怀疑 OpenClaw 发送链，而应先排查 OpenViking local vectordb 分叉：
+  - 运行态 `observer/vikingdb` 有 `Vector Count`
+  - fresh backend / 新进程 `collection_exists=False`
+  - `collection_meta.json` 缺失
+- 该类问题应归类为被测系统索引持久化缺陷，不应误记为 benchmark skill 或 token 提取链故障。

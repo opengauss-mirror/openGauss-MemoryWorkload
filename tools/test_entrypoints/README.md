@@ -21,6 +21,16 @@
 - `run_locomo_test_remote.sh`
   - `locomo_test` 主入口的远端稳定 wrapper。
   - 自动同步本地 `locomo_test` 代码、生成远端 `env.toml`，并在容器内跑完整 pipeline。
+- `diagnose_openviking_split.py`
+  - 远端 OpenViking local vectordb 运行态/持久态分叉诊断脚本。
+  - 统一收集以下证据：
+    - `observer/vikingdb`
+    - `search/find`
+    - `search/search`
+    - `system/consistency`
+    - fresh backend `collection_exists / collection_meta / account_rows`
+    - 复制后 candidate store 条数
+  - 目标：把“平台提取问题”和“OpenViking 本地 vectordb 持久化残缺”明确区分开。
 
 ## 预期新增
 

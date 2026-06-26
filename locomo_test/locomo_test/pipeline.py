@@ -9,7 +9,13 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .checks import check_health, check_qa_results, check_judge_results, report_issues
+from .checks import (
+    check_health,
+    check_qa_results,
+    check_judge_results,
+    report_issues,
+    write_qa_diagnostics,
+)
 from .eval import run_ingest, run_qa
 from .judge import run_judge
 from .stats import run_stats
@@ -145,6 +151,13 @@ def run_pipeline(
 
             elif step == "qa":
                 run_qa(cfg, output_dir)
+                diagnostics = write_qa_diagnostics(output_dir)
+                summary = diagnostics.get("ov_closure_summary", {})
+                if summary:
+                    print(
+                        f"  [qa] OV closure summary: {summary}",
+                        file=sys.stderr,
+                    )
                 issues = check_qa_results(output_dir)
                 report_issues("qa", issues)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 from pathlib import Path
 import re
@@ -14,7 +15,7 @@ from .official_small_timing import (
 from .external_report_import import import_external_result
 from .reporter import write_analysis_json, write_analysis_markdown
 from .reporter import write_case_results, write_external_result_summary, write_summary
-from .reporter import write_timing_report_html, write_timing_report_json
+from .reporter import write_run_report_html, write_timing_report_html, write_timing_report_json
 
 RETRIEVAL_MISS_PATTERNS = (
     "no information",
@@ -62,6 +63,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "resource_summary": _read_cpu_summary(run_dir / "artifacts" / "monitor" / "cpu_status.csv"),
         "ingest_summary": _read_ingest_summary(run_dir),
         "source_artifacts": _source_artifacts(run_dir, external_result),
+        "benchmark_diagnostics": _extract_benchmark_diagnostics(external_result),
         "analysis_notes": _build_notes(summary, external_result, buckets, _read_ingest_summary(run_dir)),
     }
     if list((run_dir / "external_artifacts").glob("official_*")):
@@ -83,6 +85,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             }
     write_analysis_json(run_dir, analysis)
     write_analysis_markdown(run_dir, _render_analysis_markdown(analysis))
+    write_run_report_html(run_dir, _render_analysis_html(analysis))
     return analysis
 
 
@@ -203,6 +206,13 @@ def _compute_accuracy(summary: dict[str, Any], external_result: dict[str, Any] |
     total = int(summary.get("case_total", 0) or 0)
     passed = int(summary.get("case_passed", 0) or 0)
     return round(passed / total, 4) if total else 0.0
+
+
+def _extract_benchmark_diagnostics(external_result: dict[str, Any] | None) -> dict[str, Any]:
+    if not external_result:
+        return {}
+    payload = external_result.get("benchmark_diagnostics")
+    return payload if isinstance(payload, dict) else {}
 
 
 def _bucket_failures(failures: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -340,7 +350,100 @@ def _render_analysis_markdown(analysis: dict[str, Any]) -> str:
     lines.extend(["", "## Ingest Summary", ""])
     for key, value in analysis["ingest_summary"].items():
         lines.append(f"- {key}: `{value}`")
+    if analysis.get("benchmark_diagnostics"):
+        lines.extend(["", "## Benchmark Diagnostics", ""])
+        for key, value in analysis["benchmark_diagnostics"].items():
+            lines.append(f"- {key}: `{value}`")
     lines.extend(["", "## Notes", ""])
     for note in analysis["analysis_notes"]:
         lines.append(f"- {note}")
     return "\n".join(lines) + "\n"
+
+
+def _render_analysis_html(analysis: dict[str, Any]) -> str:
+    def esc(value: Any) -> str:
+        return html.escape("" if value is None else str(value))
+
+    def pct(value: Any) -> str:
+        try:
+            return f"{float(value) * 100:.2f}%"
+        except Exception:
+            return "0.00%"
+
+    def render_mapping(mapping: dict[str, Any]) -> str:
+        if not mapping:
+            return "<tr><td colspan='2' class='muted'>无</td></tr>"
+        return "".join(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in mapping.items())
+
+    notes_html = "".join(f"<li>{esc(item)}</li>" for item in (analysis.get("analysis_notes") or []))
+    if not notes_html:
+        notes_html = "<li class='muted'>无</li>"
+    timing_html = ""
+    if analysis.get("timing_report"):
+        timing_html = (
+            "<section class='card'><h2>Timing Report</h2><table><tbody>"
+            + render_mapping(analysis["timing_report"])
+            + "</tbody></table></section>"
+        )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{esc(analysis.get("run_id"))} - Run Report</title>
+  <style>
+    :root {{
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #667085;
+      --line: #d9e2ec;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: var(--text); background: linear-gradient(180deg, #f8fafc, #edf4f7); }}
+    .wrap {{ max-width: 1280px; margin: 0 auto; padding: 24px; }}
+    .hero, .card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05); }}
+    .hero {{ padding: 24px; margin-bottom: 20px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 20px; }}
+    .sections {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+    .card {{ padding: 18px; }}
+    h1, h2 {{ margin: 0 0 12px; }}
+    .metric-label {{ color: var(--muted); font-size: 13px; }}
+    .metric-value {{ font-size: 28px; font-weight: 700; margin-top: 8px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }}
+    .muted {{ color: var(--muted); }}
+    ul {{ margin: 0; padding-left: 18px; line-height: 1.8; }}
+    @media (max-width: 960px) {{ .grid, .sections {{ grid-template-columns: 1fr 1fr; }} }}
+    @media (max-width: 680px) {{ .grid, .sections {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>{esc(analysis.get("run_id"))}</h1>
+      <div class="muted">benchmark={esc(analysis.get("benchmark_id"))} · agent={esc(analysis.get("agent_id"))} · status={esc(analysis.get("status"))}</div>
+    </section>
+    <section class="grid">
+      <div class="card"><div class="metric-label">Overall Accuracy</div><div class="metric-value">{pct(analysis.get("overall_accuracy"))}</div></div>
+      <div class="card"><div class="metric-label">Cases</div><div class="metric-value">{esc(analysis.get("case_passed"))} / {esc(analysis.get("case_total"))}</div></div>
+      <div class="card"><div class="metric-label">Failures</div><div class="metric-value">{esc(analysis.get("case_failed"))}</div></div>
+      <div class="card"><div class="metric-label">EntryPoint</div><div class="metric-value">{esc(analysis.get("entrypoint_kind"))}</div></div>
+    </section>
+    <section class="sections">
+      <section class="card"><h2>Failure Summary</h2><table><tbody>{render_mapping(analysis.get("failure_summary", {}))}</tbody></table></section>
+      <section class="card"><h2>Resource Summary</h2><table><tbody>{render_mapping(analysis.get("resource_summary", {}))}</tbody></table></section>
+      <section class="card"><h2>Ingest Summary</h2><table><tbody>{render_mapping(analysis.get("ingest_summary", {}))}</tbody></table></section>
+      <section class="card"><h2>Benchmark Diagnostics</h2><table><tbody>{render_mapping(analysis.get("benchmark_diagnostics", {}))}</tbody></table></section>
+      <section class="card"><h2>Category Summary</h2><table><tbody>{render_mapping(analysis.get("category_summary", {}))}</tbody></table></section>
+      <section class="card"><h2>Artifacts</h2><table><tbody>{render_mapping(analysis.get("source_artifacts", {}))}</tbody></table></section>
+    </section>
+    {timing_html}
+    <section class="card" style="margin-top: 16px;">
+      <h2>Analysis Notes</h2>
+      <ul>{notes_html}</ul>
+    </section>
+  </div>
+</body>
+</html>"""

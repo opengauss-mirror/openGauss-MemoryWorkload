@@ -236,12 +236,12 @@ def calculate_usage_from_jsonl(jsonl_path: str) -> dict:
                     continue
                 entry = json.loads(line)
                 if entry.get("type") == "message" and entry.get("message", {}).get("role") == "assistant":
-                    eu = entry.get("message", {}).get("usage", {})
-                    usage["input_tokens"] += eu.get("input", 0)
-                    usage["output_tokens"] += eu.get("output", 0)
+                    eu = _normalize_usage(entry.get("message", {}).get("usage", {}))
+                    usage["input_tokens"] += eu.get("input_tokens", 0)
+                    usage["output_tokens"] += eu.get("output_tokens", 0)
                     usage["cacheRead"] += eu.get("cacheRead", 0)
                     usage["cacheWrite"] += eu.get("cacheWrite", 0)
-                    usage["total_tokens"] += eu.get("totalTokens", 0)
+                    usage["total_tokens"] += eu.get("total_tokens", 0)
     except (json.JSONDecodeError, IOError):
         pass
     return usage
@@ -267,6 +267,37 @@ def extract_response_text(response_json: dict) -> str:
     except (KeyError, TypeError, IndexError):
         pass
     return f"[ERROR: could not extract text from response]"
+
+
+def _normalize_usage(raw: dict | None) -> dict:
+    raw = raw or {}
+    input_tokens = int(
+        raw.get("input_tokens", 0)
+        or raw.get("prompt_tokens", 0)
+        or raw.get("inputTokens", 0)
+        or raw.get("input", 0)
+        or 0
+    )
+    output_tokens = int(
+        raw.get("output_tokens", 0)
+        or raw.get("completion_tokens", 0)
+        or raw.get("outputTokens", 0)
+        or raw.get("output", 0)
+        or 0
+    )
+    total_tokens = int(
+        raw.get("total_tokens", 0)
+        or raw.get("totalTokens", 0)
+        or raw.get("total", 0)
+        or (input_tokens + output_tokens)
+    )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cacheRead": int(raw.get("cacheRead", 0) or raw.get("cache_read", 0) or 0),
+        "cacheWrite": int(raw.get("cacheWrite", 0) or raw.get("cache_write", 0) or 0),
+        "total_tokens": total_tokens,
+    }
 
 
 def send_message(
@@ -298,7 +329,7 @@ def send_message(
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Error parsing response: {e}")
 
-    usage = body.get("usage", {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "total_tokens": 0})
+    usage = _normalize_usage(body.get("usage", {}))
     return extract_response_text(body), usage
 
 
@@ -342,19 +373,119 @@ def _parse_ov_task_result(data: dict) -> dict | None:
     }
 
 
-def _ov_headers() -> dict | None:
-    api_key = os.environ.get("OPENVIKING_API_KEY") or os.environ.get("OPENVIKING_ROOT_API_KEY")
-    if api_key:
-        return {"X-API-Key": api_key}
-    return None
+def _load_openviking_plugin_config(state_dir: str) -> dict:
+    if not state_dir:
+        return {}
+    config_path = os.path.join(state_dir, "openclaw.json")
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return (
+            data.get("plugins", {})
+            .get("entries", {})
+            .get("openviking", {})
+            .get("config", {})
+        ) or {}
+    except (json.JSONDecodeError, IOError, AttributeError):
+        return {}
 
 
-def query_ov_task_token_usage(ov_api_url: str, task_id: str, max_wait: int = 60) -> dict | None:
+def _resolve_openviking_agent_header(plugin_cfg: dict, fallback_agent_id: str) -> str:
+    configured_prefix = str(plugin_cfg.get("agent_prefix") or plugin_cfg.get("agentId") or "").strip()
+    if configured_prefix:
+        return f"{configured_prefix}_main"
+    env_agent = str(os.environ.get("OPENVIKING_AGENT_ID", "")).strip()
+    if env_agent:
+        return env_agent
+    return fallback_agent_id or "main"
+
+
+def _ov_request_headers(state_dir: str = "", fallback_agent_id: str = "main") -> dict | None:
+    plugin_cfg = _load_openviking_plugin_config(state_dir)
+    api_key = str(
+        plugin_cfg.get("apiKey")
+        or os.environ.get("OPENVIKING_API_KEY")
+        or os.environ.get("OPENVIKING_ROOT_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        return None
+
+    headers = {"X-API-Key": api_key}
+    account_id = str(plugin_cfg.get("accountId") or os.environ.get("OPENVIKING_ACCOUNT_ID") or "").strip()
+    user_id = str(plugin_cfg.get("userId") or os.environ.get("OPENVIKING_USER_ID") or "").strip()
+    agent_id = _resolve_openviking_agent_header(plugin_cfg, fallback_agent_id)
+    if account_id:
+        headers["X-OpenViking-Account"] = account_id
+    if user_id:
+        headers["X-OpenViking-User"] = user_id
+    if agent_id:
+        headers["X-OpenViking-Agent"] = agent_id
+    return headers
+
+
+def _extract_session_id(session_file: str) -> str:
+    return Path(session_file).name.removesuffix(".jsonl")
+
+
+def commit_openviking_session(
+    *,
+    ov_api_url: str,
+    session_id: str,
+    keep_recent_count: int | None = None,
+    wait: bool = False,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+) -> dict:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        raise RuntimeError("Missing OpenViking API key for direct session commit")
+    payload = {"wait": wait}
+    if keep_recent_count is not None:
+        payload["keep_recent_count"] = keep_recent_count
+    resp = requests.post(
+        f"{ov_api_url}/api/v1/sessions/{session_id}/commit",
+        json=payload,
+        headers=headers,
+        timeout=60,
+    )
+    if resp.status_code == 404:
+        return {
+            "status": "not_found",
+            "task_id": "",
+            "archived": False,
+            "memories_extracted": {},
+            "error": f"HTTP 404 for session {session_id}",
+        }
+    resp.raise_for_status()
+    body = resp.json()
+    result = body.get("result", {}) if isinstance(body, dict) else {}
+    return {
+        "status": result.get("status", ""),
+        "task_id": result.get("task_id", ""),
+        "archived": result.get("archived", False),
+        "memories_extracted": result.get("memories_extracted", {}),
+    }
+
+
+def query_ov_task_token_usage(
+    ov_api_url: str,
+    task_id: str,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+    max_wait: int = 60,
+) -> dict | None:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return None
     deadline = time.time() + max_wait
     interval = 2
     try:
         while True:
-            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", headers=_ov_headers(), timeout=30)
+            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", headers=headers, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             status = data.get("result", {}).get("status", "") if isinstance(data.get("result"), dict) else ""
@@ -369,12 +500,21 @@ def query_ov_task_token_usage(ov_api_url: str, task_id: str, max_wait: int = 60)
         return None
 
 
-def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None) -> dict | None:
+def query_ov_latest_task(
+    ov_api_url: str,
+    resource_id: str | None = None,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+) -> dict | None:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return None
     try:
         params = {"task_type": "session_commit", "status": "completed", "limit": 1}
         if resource_id:
             params["resource_id"] = resource_id
-        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, headers=_ov_headers(), timeout=30)
+        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         tasks = data.get("result", [])
@@ -384,6 +524,29 @@ def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None) -> dic
             if result:
                 result["task_id"] = task.get("task_id", "")
             return result
+    except requests.exceptions.HTTPError as e:
+        if resource_id and e.response is not None and e.response.status_code == 400:
+            try:
+                resp = requests.get(
+                    f"{ov_api_url}/api/v1/tasks",
+                    params={"task_type": "session_commit", "status": "completed", "limit": 1},
+                    headers=headers,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                tasks = data.get("result", [])
+                if tasks:
+                    task = tasks[0]
+                    result = _parse_ov_task_result({"result": task})
+                    if result:
+                        result["task_id"] = task.get("task_id", "")
+                    return result
+            except Exception as inner:
+                print(f"    [ov-task] Error querying latest task without resource_id: {inner}", file=sys.stderr)
+                return None
+        print(f"    [ov-task] Error querying latest task: {e}", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"    [ov-task] Error querying latest task: {e}", file=sys.stderr)
     return None
@@ -392,18 +555,95 @@ def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None) -> dic
 def wait_for_ov_latest_task(
     ov_api_url: str,
     resource_id: str | None = None,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
     max_wait: int = 60,
 ) -> dict | None:
     deadline = time.time() + max_wait
     interval = 2
     while True:
-        result = query_ov_latest_task(ov_api_url, resource_id=resource_id)
+        result = query_ov_latest_task(
+            ov_api_url,
+            resource_id=resource_id,
+            state_dir=state_dir,
+            fallback_agent_id=fallback_agent_id,
+        )
         if result:
             return result
         if time.time() >= deadline:
             return None
         time.sleep(interval)
         interval = min(interval * 2, 10)
+
+
+def query_ov_session_usage(
+    ov_api_url: str,
+    session_id: str,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+    max_wait: int = 30,
+    interval: float = 1.0,
+) -> dict | None:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return None
+    deadline = time.time() + max_wait
+    while True:
+        try:
+            resp = requests.get(f"{ov_api_url}/api/v1/sessions/{session_id}", headers=headers, timeout=30)
+            resp.raise_for_status()
+            body = resp.json()
+            result = body.get("result", {}) if isinstance(body, dict) else {}
+            if int(result.get("commit_count", 0) or 0) > 0:
+                llm = result.get("llm_token_usage", {}) or {}
+                embed = result.get("embedding_token_usage", {}) or {}
+                memories = result.get("memories_extracted", {}) or {}
+                return {
+                    "llm_prompt": int(llm.get("prompt_tokens", 0) or 0),
+                    "llm_completion": int(llm.get("completion_tokens", 0) or 0),
+                    "llm_total": int(llm.get("total_tokens", 0) or 0),
+                    "embedding": int(embed.get("total_tokens", 0) or 0),
+                    "memories": int(memories.get("total", 0) or 0),
+                    "memory_write": int(memories.get("memory_write", 0) or 0),
+                    "memory_edit": int(memories.get("memory_edit", 0) or 0),
+                    "commit_count": int(result.get("commit_count", 0) or 0),
+                    "last_commit_at": result.get("last_commit_at", ""),
+                    "session_id": session_id,
+                    "source": "session_meta",
+                }
+        except Exception as e:
+            print(f"    [ov-session] Error querying session {session_id}: {e}", file=sys.stderr)
+            return None
+        if time.time() >= deadline:
+            return None
+        time.sleep(interval)
+
+
+def query_ov_index_consistency(
+    ov_api_url: str,
+    uri: str,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+) -> dict | None:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return None
+    try:
+        resp = requests.post(
+            f"{ov_api_url}/api/v1/system/consistency",
+            json={"uri": uri},
+            headers=headers,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return body.get("result", {}) if isinstance(body, dict) else {}
+    except Exception as e:
+        print(f"    [ov-consistency] Error checking {uri}: {e}", file=sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +854,10 @@ CSV_FIELDS = [
     "sample_id", "sample_idx", "qi", "question", "expected",
     "response", "category", "evidence", "input_tokens",
     "output_tokens", "cacheRead", "cacheWrite", "total_tokens",
+    "ov_llm_prompt_tokens", "ov_llm_completion_tokens", "ov_llm_total_tokens",
+    "ov_embedding_tokens", "ov_memories_extracted", "ov_memory_write", "ov_memory_edit",
+    "ov_missing_records", "ov_recall_total", "ov_recall_hit",
+    "ov_memory_written", "ov_token_emitted", "ov_index_available", "ov_closure_state",
     "timestamp", "jsonl_filename", "result", "reasoning",
 ]
 
@@ -642,6 +886,21 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
     flat["cacheRead"] = usage.get("cacheRead", 0)
     flat["cacheWrite"] = usage.get("cacheWrite", 0)
     flat["total_tokens"] = usage.get("total_tokens", 0)
+    ov_usage = flat.pop("ov_token_usage", {}) or {}
+    flat["ov_llm_prompt_tokens"] = ov_usage.get("llm_prompt", 0)
+    flat["ov_llm_completion_tokens"] = ov_usage.get("llm_completion", 0)
+    flat["ov_llm_total_tokens"] = ov_usage.get("llm_total", 0)
+    flat["ov_embedding_tokens"] = ov_usage.get("embedding", 0)
+    flat["ov_memories_extracted"] = ov_usage.get("memories", 0)
+    flat["ov_memory_write"] = ov_usage.get("memory_write", 0)
+    flat["ov_memory_edit"] = ov_usage.get("memory_edit", 0)
+    flat["ov_missing_records"] = flat.get("ov_missing_records", 0)
+    flat["ov_recall_total"] = flat.get("ov_recall_total", 0)
+    flat["ov_recall_hit"] = flat.get("ov_recall_hit", "")
+    flat["ov_memory_written"] = flat.get("ov_memory_written", "")
+    flat["ov_token_emitted"] = flat.get("ov_token_emitted", "")
+    flat["ov_index_available"] = flat.get("ov_index_available", "")
+    flat["ov_closure_state"] = flat.get("ov_closure_state", "")
     flat["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
     flat.setdefault("jsonl_filename", "")
     flat.setdefault("result", "")
@@ -655,6 +914,82 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
             f.flush()
     except (csv.Error, IOError) as e:
         print(f"Warning: Error writing CSV: {e}", file=sys.stderr)
+
+
+def derive_ov_closure_status(
+    ov_token_usage: dict | None,
+    consistency: dict | None,
+    *,
+    recall_total: int = 0,
+    response_text: str = "",
+) -> dict:
+    token_emitted = False
+    memory_written = False
+    index_available = False
+    recall_hit = int(recall_total or 0) > 0
+    answered = bool(str(response_text or "").strip())
+
+    if ov_token_usage:
+        token_emitted = int(ov_token_usage.get("llm_total", 0) or 0) > 0 or int(
+            ov_token_usage.get("embedding", 0) or 0
+        ) > 0
+        memory_written = int(ov_token_usage.get("memories", 0) or 0) > 0 or int(
+            ov_token_usage.get("memory_write", 0) or 0
+        ) > 0 or int(ov_token_usage.get("memory_edit", 0) or 0) > 0
+
+    if consistency:
+        index_available = bool(consistency.get("ok", False))
+
+    if not token_emitted and not memory_written:
+        state = "no_memory_signal"
+    elif token_emitted and not memory_written:
+        state = "token_emitted_only"
+    elif token_emitted and memory_written and recall_hit and answered and not index_available:
+        state = "memory_recalled_with_consistency_gap"
+    elif token_emitted and memory_written and recall_hit and answered:
+        state = "memory_closed_loop_ready"
+    elif token_emitted and memory_written and not index_available:
+        state = "memory_written_but_index_unavailable"
+    elif token_emitted and memory_written and index_available:
+        state = "memory_closed_loop_ready"
+    else:
+        state = "partial_memory_signal"
+
+    return {
+        "memory_written": str(memory_written).lower(),
+        "token_emitted": str(token_emitted).lower(),
+        "index_available": str(index_available).lower(),
+        "recall_hit": str(recall_hit).lower(),
+        "closure_state": state,
+    }
+
+
+def query_ov_search_find_total(
+    ov_api_url: str,
+    query: str,
+    target_uri: str,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+    limit: int = 5,
+) -> int:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return 0
+    try:
+        resp = requests.post(
+            f"{ov_api_url}/api/v1/search/find",
+            headers=headers,
+            json={"query": query, "target_uri": target_uri, "limit": limit},
+            timeout=60,
+        )
+        if not resp.ok:
+            return 0
+        payload = resp.json()
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        return int(result.get("total", 0) or 0)
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -735,26 +1070,57 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 ov_token_usage = None
                 if cfg.memory_mode == "openviking":
                     query_mode = normalize_ov_task_query_mode(cfg.memory_mode)
-                    if should_attempt_gateway_compact(cfg.memory_mode):
-                        compact_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
-                        compact_result = None
-                        try:
-                            compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
-                        except Exception as compact_error:
-                            print(f"    [compact] fallback to legacy task polling: {compact_error}", file=sys.stderr)
-
-                        if cfg.openviking.api_url:
-                            task_id = compact_result.get("taskId") if compact_result else None
-                            if task_id:
-                                ov_token_usage = query_ov_task_token_usage(cfg.openviking.api_url, task_id)
-                            if not ov_token_usage:
-                                ov_token_usage = wait_for_ov_latest_task(cfg.openviking.api_url)
-                    else:
-                        print(f"    [ov-task] skip compact in {query_mode} mode", file=sys.stderr)
+                    commit_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
+                    found = get_session_id_from_key(commit_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
+                    if not found:
+                        raise RuntimeError(f"OpenViking session not found for {commit_key}")
+                    session_file, _ = found
+                    ov_session_id = _extract_session_id(session_file)
+                    commit_result = commit_openviking_session(
+                        ov_api_url=cfg.openviking.api_url,
+                        session_id=ov_session_id,
+                        keep_recent_count=cfg.openviking.keep_recent_count,
+                        wait=False,
+                        state_dir=cfg.gateway.state_dir,
+                        fallback_agent_id=cfg.agent_id,
+                    )
+                    print(
+                        f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
+                        f"session={ov_session_id}",
+                        file=sys.stderr,
+                    )
+                    task_id = commit_result.get("task_id") or ""
+                    if task_id:
+                        ov_token_usage = query_ov_task_token_usage(
+                            cfg.openviking.api_url,
+                            task_id,
+                            state_dir=cfg.gateway.state_dir,
+                            fallback_agent_id=cfg.agent_id,
+                        )
+                    if not ov_token_usage:
+                        ov_token_usage = wait_for_ov_latest_task(
+                            cfg.openviking.api_url,
+                            resource_id=ov_session_id,
+                            state_dir=cfg.gateway.state_dir,
+                            fallback_agent_id=cfg.agent_id,
+                            max_wait=5,
+                        )
 
                     if ov_token_usage:
                         print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
                         memory_token_usage = {"provider": "openviking", **ov_token_usage}
+                        consistency = query_ov_index_consistency(
+                            cfg.openviking.api_url,
+                            f"viking://user/{user_key}/memories",
+                            state_dir=cfg.gateway.state_dir,
+                            fallback_agent_id=cfg.agent_id,
+                        )
+                        if consistency and not consistency.get("ok", True):
+                            print(
+                                f"    [ov-consistency] missing_records={consistency.get('missing_record_count', 0)} "
+                                f"after session {ov_session_id}",
+                                file=sys.stderr,
+                            )
                 elif cfg.memory_mode == "ogmem":
                     wait_for_ogmem_after_turn_extract(
                         container=cfg.ogmem.docker_container,
@@ -861,6 +1227,9 @@ def _process_single_question(
         input_msg = f"{qa_prompt_prefix}Answer the question directly: {question}"
 
     jsonl_filename = ""
+    ov_token_usage = None
+    consistency = None
+    ov_recall_total = 0
     try:
         response, api_usage = send_message_with_retry(
             cfg.gateway.base_url, cfg.gateway.token, qa_user,
@@ -882,6 +1251,74 @@ def _process_single_question(
                     jsonl_path = os.path.join(qa_sessions_dir, sf if sf.endswith(".jsonl") else f"{sf}.jsonl")
 
         if jsonl_path and os.path.exists(jsonl_path):
+            if cfg.memory_mode == "openviking":
+                ov_session_id = _extract_session_id(Path(jsonl_path).name)
+                commit_result = commit_openviking_session(
+                    ov_api_url=cfg.openviking.api_url,
+                    session_id=ov_session_id,
+                    keep_recent_count=cfg.openviking.keep_recent_count,
+                    wait=False,
+                    state_dir=cfg.gateway.state_dir,
+                    fallback_agent_id=cfg.agent_id,
+                )
+                print(
+                    f"  [{sample_idx}]   [ov-commit] status={commit_result.get('status') or 'unknown'} "
+                    f"session={ov_session_id}",
+                    file=sys.stderr,
+                )
+                task_id = commit_result.get("task_id") or ""
+                if task_id:
+                    ov_token_usage = query_ov_task_token_usage(
+                        cfg.openviking.api_url,
+                        task_id,
+                        state_dir=cfg.gateway.state_dir,
+                        fallback_agent_id=cfg.agent_id,
+                        max_wait=30,
+                    )
+                    if ov_token_usage:
+                        print(
+                            f"  [{sample_idx}]   [ov-task] llm={ov_token_usage['llm_total']:,} "
+                            f"embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}",
+                            file=sys.stderr,
+                        )
+                if not ov_token_usage:
+                    ov_token_usage = query_ov_session_usage(
+                        cfg.openviking.api_url,
+                        ov_session_id,
+                        state_dir=cfg.gateway.state_dir,
+                        fallback_agent_id=cfg.agent_id,
+                        max_wait=30,
+                        interval=1.0,
+                    )
+                    if ov_token_usage:
+                        print(
+                            f"  [{sample_idx}]   [ov-session] llm={ov_token_usage['llm_total']:,} "
+                            f"embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}",
+                            file=sys.stderr,
+                        )
+                consistency = query_ov_index_consistency(
+                    cfg.openviking.api_url,
+                    f"viking://user/{user_key}/memories",
+                    state_dir=cfg.gateway.state_dir,
+                    fallback_agent_id=cfg.agent_id,
+                )
+                ov_recall_total = query_ov_search_find_total(
+                    cfg.openviking.api_url,
+                    question,
+                    f"viking://user/{user_key}/memories",
+                    state_dir=cfg.gateway.state_dir,
+                    fallback_agent_id=cfg.agent_id,
+                )
+                if ov_recall_total:
+                    print(
+                        f"  [{sample_idx}]   [ov-recall] total={ov_recall_total}",
+                        file=sys.stderr,
+                    )
+                if consistency and not consistency.get("ok", True):
+                    print(
+                        f"  [{sample_idx}]   [ov-consistency] missing_records={consistency.get('missing_record_count', 0)}",
+                        file=sys.stderr,
+                    )
             usage = calculate_usage_from_jsonl(jsonl_path)
             # Now archive the session
             jsonl_filename = reset_session(jsonl_path, cfg.agent_id, cfg.gateway.state_dir) or ""
@@ -903,6 +1340,24 @@ def _process_single_question(
         "category": category, "evidence": evidence,
         "usage": usage, "jsonl_filename": jsonl_filename,
     }
+    if ov_token_usage:
+        record["ov_token_usage"] = ov_token_usage
+    if consistency:
+        record["ov_missing_records"] = int(consistency.get("missing_record_count", 0) or 0)
+    if cfg.memory_mode == "openviking":
+        record["ov_recall_total"] = ov_recall_total
+    if cfg.memory_mode == "openviking":
+        ov_state = derive_ov_closure_status(
+            ov_token_usage,
+            consistency,
+            recall_total=ov_recall_total,
+            response_text=response,
+        )
+        record["ov_recall_hit"] = ov_state["recall_hit"]
+        record["ov_memory_written"] = ov_state["memory_written"]
+        record["ov_token_emitted"] = ov_state["token_emitted"]
+        record["ov_index_available"] = ov_state["index_available"]
+        record["ov_closure_state"] = ov_state["closure_state"]
 
     with csv_lock:
         save_record_to_csv(csv_path, record)

@@ -35,6 +35,7 @@ class GatewayEnv:
 class OpenVikingEnv:
     port: int = 2936
     api_url: str = ""  # derived from port if empty
+    keep_recent_count: int | None = None
 
     def __post_init__(self):
         if not self.api_url:
@@ -62,6 +63,27 @@ class JudgeEnv:
     model: str = ""
     parallel: int = 5
     api_format: str | None = None  # auto-detect from base_url
+
+
+@dataclass
+class ChatLLMEnv:
+    base_url: str = "https://codex.jemmy.icu/v1"
+    api_key: str = ""
+    model: str = "gpt-5.4-mini"
+
+
+@dataclass
+class EmbeddingLLMEnv:
+    base_url: str = "http://127.0.0.1:18080/v1"
+    api_key: str = "dummy"
+    model: str = "Qwen/Qwen3-Embedding-0.6B"
+    dimension: int = 1024
+
+
+@dataclass
+class LLMEnv:
+    chat: ChatLLMEnv = field(default_factory=ChatLLMEnv)
+    embedding: EmbeddingLLMEnv = field(default_factory=EmbeddingLLMEnv)
 
 
 @dataclass
@@ -105,6 +127,7 @@ class Config:
     gateway: GatewayEnv = field(default_factory=GatewayEnv)
     openviking: OpenVikingEnv = field(default_factory=OpenVikingEnv)
     ogmem: OgmemEnv = field(default_factory=OgmemEnv)
+    llm: LLMEnv = field(default_factory=LLMEnv)
     judge_env: JudgeEnv = field(default_factory=JudgeEnv)
     session: SessionConfig = field(default_factory=SessionConfig)
     steps: StepsConfig = field(default_factory=StepsConfig)
@@ -195,6 +218,7 @@ def load_config(test_toml_path: str) -> Config:
     cfg.openviking = OpenVikingEnv(
         port=ov.get("port", 2936),
         api_url=ov.get("api_url", ""),
+        keep_recent_count=(None if ov.get("keep_recent_count") is None else int(ov.get("keep_recent_count"))),
     )
 
     # --- ogmem ---
@@ -210,16 +234,40 @@ def load_config(test_toml_path: str) -> Config:
         log_tail=og.get("log_tail", 500),
     )
 
+    # --- unified llm ---
+    llm_env = env.get("llm", {})
+    llm_test = test.get("llm", {})
+    llm_root = {**llm_env, **llm_test}
+    chat_env = llm_env.get("chat", {}) if isinstance(llm_env, dict) else {}
+    chat_test = llm_test.get("chat", {}) if isinstance(llm_test, dict) else {}
+    embed_env = llm_env.get("embedding", {}) if isinstance(llm_env, dict) else {}
+    embed_test = llm_test.get("embedding", {}) if isinstance(llm_test, dict) else {}
+    chat = {**chat_env, **chat_test}
+    embed = {**embed_env, **embed_test}
+    cfg.llm = LLMEnv(
+        chat=ChatLLMEnv(
+            base_url=chat.get("base_url", "https://codex.jemmy.icu/v1"),
+            api_key=chat.get("api_key", ""),
+            model=chat.get("model", "gpt-5.4-mini"),
+        ),
+        embedding=EmbeddingLLMEnv(
+            base_url=embed.get("base_url", "http://127.0.0.1:18080/v1"),
+            api_key=embed.get("api_key", "dummy"),
+            model=embed.get("model", "Qwen/Qwen3-Embedding-0.6B"),
+            dimension=int(embed.get("dimension", 1024)),
+        ),
+    )
+
     # --- judge ---
     j_env = env.get("judge", {})
     j_test = test.get("judge", {})
     j = {**j_env, **j_test}
     cfg.judge_env = JudgeEnv(
-        api_key=j.get("api_key", os.environ.get("ARK_API_KEY", "")),
-        base_url=j.get("base_url", "https://ark.cn-beijing.volces.com/api/v3"),
-        model=j.get("model", ""),
+        api_key=j.get("api_key", cfg.llm.chat.api_key or os.environ.get("ARK_API_KEY", "")),
+        base_url=j.get("base_url", cfg.llm.chat.base_url),
+        model=j.get("model", cfg.llm.chat.model),
         parallel=j.get("parallel", 5),
-        api_format=j.get("api_format"),
+        api_format=j.get("api_format") or llm_root.get("api_format"),
     )
 
     # --- session ---

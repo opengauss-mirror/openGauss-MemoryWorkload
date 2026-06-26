@@ -55,6 +55,15 @@ def cmd_check(args):
     print("All services healthy.", file=sys.stderr)
 
 
+def cmd_report(args):
+    from pathlib import Path
+    from .report import write_html_report
+
+    output_dir = Path(args.output_dir)
+    report_path = write_html_report(output_dir)
+    print(str(report_path), file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="locomo-test",
@@ -84,6 +93,11 @@ def main():
     p_check = sub.add_parser("check", help="Check service health")
     p_check.add_argument("config", help="Path to test config TOML file")
     p_check.set_defaults(func=cmd_check)
+
+    # --- report ---
+    p_report = sub.add_parser("report", help="Generate HTML report from an output directory")
+    p_report.add_argument("output_dir", help="Path to output directory containing meta.json/qa_results.csv")
+    p_report.set_defaults(func=cmd_report)
 
     args = parser.parse_args()
     args.func(args)

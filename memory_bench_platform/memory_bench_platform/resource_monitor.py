@@ -4,6 +4,8 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import threading
+import time
 
 
 @dataclass
@@ -17,11 +19,21 @@ class CsvWriter:
 
 
 class ResourceMonitor:
-    def __init__(self, output_dir: Path, work_dir: Path, disk_mount: str, net_interface: str):
+    def __init__(
+        self,
+        output_dir: Path,
+        work_dir: Path,
+        disk_mount: str,
+        net_interface: str,
+        sample_interval_seconds: float = 1.0,
+    ):
         self.output_dir = output_dir
         self.work_dir = work_dir
         self.disk_mount = disk_mount
         self.net_interface = net_interface
+        self.sample_interval_seconds = sample_interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def setup_writers(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,3 +83,21 @@ class ResourceMonitor:
             "mem_free_mb": mem_free_mb,
             "mem_used_mb": mem_used_mb,
         }
+
+    def start_background_sampling(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._sampling_loop, name="resource-monitor", daemon=True)
+        self._thread.start()
+
+    def stop_background_sampling(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(1.0, self.sample_interval_seconds * 4))
+
+    def _sampling_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self.capture_once()
+            if self._stop_event.wait(self.sample_interval_seconds):
+                break

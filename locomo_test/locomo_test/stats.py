@@ -12,6 +12,25 @@ from pathlib import Path
 from .config import Config
 
 
+def derive_ov_closure_summary(rows: list[dict], counts: dict[str, int]) -> dict:
+    if not rows or not counts:
+        return {}
+
+    dominant_state = max(sorted(counts.items()), key=lambda item: item[1])[0]
+
+    def _has_true(field: str) -> bool:
+        return any(str((row.get(field) or "")).strip().lower() == "true" for row in rows)
+
+    return {
+        "dominant_state": dominant_state,
+        "has_memory_written": _has_true("ov_memory_written"),
+        "has_token_emitted": _has_true("ov_token_emitted"),
+        "has_index_unavailable": any(
+            str((row.get("ov_index_available") or "")).strip().lower() == "false" for row in rows
+        ),
+    }
+
+
 def run_stats(
     cfg: Config,
     output_dir: str,
@@ -55,6 +74,14 @@ def run_stats(
     for k in token_keys:
         token_totals[k] = sum(int(r.get(k, 0) or 0) for r in valid)
 
+    ov_closure_counts: dict[str, int] = {}
+    for r in valid:
+        state = (r.get("ov_closure_state") or "").strip()
+        if not state:
+            continue
+        ov_closure_counts[state] = ov_closure_counts.get(state, 0) + 1
+    ov_closure_summary = derive_ov_closure_summary(valid, ov_closure_counts)
+
     # Print summary
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"  Overall: {total_correct}/{total_graded} = {overall_acc:.2%}", file=sys.stderr)
@@ -81,6 +108,10 @@ def run_stats(
             f"memories={memory_token_totals['memories']:,}",
             file=sys.stderr,
         )
+    if ov_closure_counts:
+        print(f"  OV closure states: {json.dumps(ov_closure_counts, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
+    if ov_closure_summary:
+        print(f"  OV closure summary: {json.dumps(ov_closure_summary, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
 
     memory_provider = (memory_token_totals or {}).get("provider", cfg.memory_mode)
 
@@ -110,6 +141,8 @@ def run_stats(
         "memory_token_totals": memory_token_totals or {},
         "ov_token_totals": memory_token_totals if memory_provider == "openviking" else {},
         "ogmem_token_totals": memory_token_totals if memory_provider == "ogmem" else {},
+        "ov_closure_counts": ov_closure_counts,
+        "ov_closure_summary": ov_closure_summary,
     }
 
     meta_path = os.path.join(output_dir, "meta.json")

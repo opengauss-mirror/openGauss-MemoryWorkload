@@ -51,3 +51,9 @@ def write_timing_report_html(run_dir: Path, html_text: str) -> None:
     reports_dir = run_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     (reports_dir / "timing_report.html").write_text(html_text, encoding="utf-8")
+
+
+def write_run_report_html(run_dir: Path, html_text: str) -> None:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "run_report.html").write_text(html_text, encoding="utf-8")

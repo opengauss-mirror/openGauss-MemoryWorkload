@@ -31,6 +31,54 @@ def test_import_external_result_reads_meta_json_when_present(tmp_path: Path):
     assert result["case_results"][0]["passed"] is True
 
 
+def test_import_external_result_reads_locomo_diagnostics_when_present(tmp_path: Path):
+    (tmp_path / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.7429,
+                "total_correct": 26,
+                "total_graded": 35,
+                "total_questions": 35,
+                "ov_closure_summary": {
+                    "dominant_state": "memory_recalled_with_consistency_gap",
+                    "has_memory_written": True,
+                },
+                "ov_closure_counts": {
+                    "memory_recalled_with_consistency_gap": 27,
+                    "no_memory_signal": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "qa_diagnostics.json").write_text(
+        json.dumps(
+            {
+                "issues": {
+                    "openviking_memory_written_but_index_unavailable": 30,
+                },
+                "ov_closure_summary": {
+                    "dominant_state": "memory_recalled_with_consistency_gap",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "report.html").write_text("<html>demo</html>", encoding="utf-8")
+    (tmp_path / "qa_results.csv").write_text(
+        "sample_id,qi,question,expected,response,category,result,reasoning\n"
+        "conv-1,1,Q1,A1,R1,1,CORRECT,ok\n",
+        encoding="utf-8",
+    )
+
+    result = import_external_result(tmp_path)
+
+    assert result["benchmark_diagnostics"]["source"] == "locomo_test"
+    assert result["benchmark_diagnostics"]["ov_closure_counts"]["no_memory_signal"] == 5
+    assert result["benchmark_diagnostics"]["issues"]["openviking_memory_written_but_index_unavailable"] == 30
+    assert result["benchmark_diagnostics"]["artifacts"]["report_html"].endswith("report.html")
+
+
 def test_import_external_result_falls_back_to_csv_only(tmp_path: Path):
     (tmp_path / "phaseA_demo.csv").write_text(
         "sample_id,qi,question,expected,response,category,result,reasoning\n"

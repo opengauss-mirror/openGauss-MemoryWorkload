@@ -169,8 +169,57 @@ python3 -m json.tool output/ogmem-small/meta.json
 
 ```text
 output/ogmem-small/qa_results.csv
+output/ogmem-small/qa_diagnostics.json
 output/ogmem-small/meta.json
 output/ogmem-small/pipeline.log
+```
+
+## OpenViking 闭环诊断
+
+当 `memory_mode = "openviking"` 时，`qa_results.csv` 会额外写出以下字段：
+
+- `ov_memory_written`
+- `ov_token_emitted`
+- `ov_index_available`
+- `ov_closure_state`
+
+其中 `ov_closure_state` 当前重点关注：
+
+- `memory_closed_loop_ready`
+  - 说明 token、memory、index 三段信号都闭合。
+- `memory_written_but_index_unavailable`
+  - 说明 memory 已写入、token 已产出，但 index consistency 仍异常，`search/find/recall` 仍不可用。
+
+即便不跑 `stats`，QA 阶段结束后也会自动生成：
+
+```text
+output/<run-name>/qa_diagnostics.json
+```
+
+其中包含 run 级聚合：
+
+- `issues`
+- `ov_closure_counts`
+- `ov_closure_summary`
+
+例如：
+
+```json
+{
+  "issues": {
+    "openviking_index_missing_records_max": 52,
+    "openviking_memory_written_but_index_unavailable": 3
+  },
+  "ov_closure_counts": {
+    "memory_written_but_index_unavailable": 3
+  },
+  "ov_closure_summary": {
+    "dominant_state": "memory_written_but_index_unavailable",
+    "has_index_unavailable": true,
+    "has_memory_written": true,
+    "has_token_emitted": true
+  }
+}
 ```
 
 ## 常见问题

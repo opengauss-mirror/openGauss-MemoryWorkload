@@ -237,6 +237,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if entrypoint.entrypoint_kind == "external_runner":
         output_dir = run_dir / "external_artifacts" / entrypoint.entrypoint_id
+        monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
+        monitor.setup_writers()
         env = os.environ.copy()
         env.update(
             {
@@ -248,7 +250,12 @@ def main(argv: list[str] | None = None) -> None:
             }
         )
         env.update(build_external_runner_env(run_record.version_selection))
-        runner_result = execute_external_runner(entrypoint, env=env, cwd=Path.cwd().parent)
+        monitor.start_background_sampling()
+        try:
+            runner_result = execute_external_runner(entrypoint, env=env, cwd=Path.cwd().parent)
+        finally:
+            monitor.stop_background_sampling()
+        cpu_snapshot = monitor.capture_once()
         (run_dir / "logs" / "external_runner.stdout.log").write_text(runner_result["stdout"], encoding="utf-8")
         (run_dir / "logs" / "external_runner.stderr.log").write_text(runner_result["stderr"], encoding="utf-8")
         if output_dir.exists():
@@ -274,7 +281,7 @@ def main(argv: list[str] | None = None) -> None:
                     case_total=0,
                     case_passed=0,
                     case_failed=0,
-                    resource_summary={"external_error": str(exc)},
+                    resource_summary={"external_error": str(exc), "cpu": cpu_snapshot},
                     category_summary={},
                 )
             else:
@@ -298,6 +305,7 @@ def main(argv: list[str] | None = None) -> None:
                     case_passed=imported["summary"]["total_correct"],
                     case_failed=imported["summary"]["total_questions"] - imported["summary"]["total_correct"],
                     resource_summary={
+                        "cpu": cpu_snapshot,
                         "token_totals": imported["summary"].get("token_totals", {}),
                         "memory_token_totals": imported["summary"].get("memory_token_totals", {}),
                         "ungraded_count": imported["summary"].get("ungraded_count", 0),
@@ -324,7 +332,7 @@ def main(argv: list[str] | None = None) -> None:
                 case_total=0,
                 case_passed=0,
                 case_failed=0,
-                resource_summary={"external_error": f"missing external output dir: {output_dir}"},
+                resource_summary={"external_error": f"missing external output dir: {output_dir}", "cpu": cpu_snapshot},
                 category_summary={},
             )
         final_status = summary_record.status
@@ -344,16 +352,19 @@ def main(argv: list[str] | None = None) -> None:
 
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
+    monitor.start_background_sampling()
+    try:
+        workflow_output = execute_cases(
+            run_id=run_record.run_id,
+            agent_id=args.agent,
+            cases=cases,
+            steps=steps,
+            execution_spec=execution_spec,
+            run_dir=run_dir,
+        )
+    finally:
+        monitor.stop_background_sampling()
     cpu_snapshot = monitor.capture_once()
-
-    workflow_output = execute_cases(
-        run_id=run_record.run_id,
-        agent_id=args.agent,
-        cases=cases,
-        steps=steps,
-        execution_spec=execution_spec,
-        run_dir=run_dir,
-    )
 
     judge_results = workflow_output["judge_results"]
     passed_cases = sum(1 for item in judge_results if item.passed)

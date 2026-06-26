@@ -80,6 +80,16 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     )
     artifacts = run_dir / "external_artifacts" / "official_small"
     artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "qa_results.csv").write_text(
+        "\n".join(
+            [
+                "sample_id,qi,question,expected,response,category,result,reasoning",
+                "conv-1,1,Q1,A1,R1,1,CORRECT,ok",
+                "conv-1,2,Q2,A2,There is no mention of that in the memory.,1,WRONG,bad",
+            ]
+        ),
+        encoding="utf-8",
+    )
     (artifacts / "phaseA_demo_meta.json").write_text(
         json.dumps(
             {
@@ -116,6 +126,34 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
         ),
         encoding="utf-8",
     )
+    (artifacts / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.5,
+                "total_correct": 1,
+                "total_graded": 2,
+                "total_questions": 2,
+                "ov_closure_summary": {
+                    "dominant_state": "memory_recalled_with_consistency_gap",
+                },
+                "ov_closure_counts": {
+                    "memory_recalled_with_consistency_gap": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "qa_diagnostics.json").write_text(
+        json.dumps(
+            {
+                "issues": {
+                    "openviking_memory_written_but_index_unavailable": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "report.html").write_text("<html>locomo</html>", encoding="utf-8")
 
     analysis = analyze_run(run_dir)
 
@@ -124,10 +162,15 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert analysis["resource_summary"]["cpu_user_peak"] == 20.0
     assert analysis["ingest_summary"]["session_total"] == 2
     assert analysis["ingest_summary"]["zero_memory_sessions"] == 1
+    assert analysis["benchmark_diagnostics"]["source"] == "locomo_test"
     assert (run_dir / "reports" / "analysis.json").is_file()
     assert (run_dir / "reports" / "analysis.md").is_file()
+    assert (run_dir / "reports" / "run_report.html").is_file()
     assert (run_dir / "reports" / "timing_report.json").is_file()
     assert (run_dir / "reports" / "timing_report.html").is_file()
+    report_html = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
+    assert "memory_recalled_with_consistency_gap" in report_html
+    assert "openviking_memory_written_but_index_unavailable" in report_html
 
 
 def test_analyze_run_refreshes_external_result_and_summary_from_external_artifacts(tmp_path: Path):
