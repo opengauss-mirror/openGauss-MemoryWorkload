@@ -12,6 +12,11 @@ import requests
 
 from .config import Config
 from .eval import get_session_id_from_key, reset_session, send_message
+from memory_bench_platform.locomo_test_metrics_bridge import (
+    check_locomo_qa_results,
+    summarize_locomo_qa_results,
+    write_locomo_qa_diagnostics,
+)
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
@@ -150,99 +155,17 @@ def check_health(cfg: Config) -> bool:
 
 def check_qa_results(output_dir: str) -> dict:
     """Post-QA check: verify CSV integrity. Returns issues dict."""
-    csv_path = os.path.join(output_dir, "qa_results.csv")
-    issues = {}
-
-    if not os.path.exists(csv_path):
-        issues["missing_csv"] = csv_path
-        return issues
-
-    try:
-        with open(csv_path, "r", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except Exception as e:
-        issues["csv_read_error"] = str(e)
-        return issues
-
-    empty_responses = sum(1 for r in rows if not r.get("response") or r["response"].startswith("[ERROR"))
-    if empty_responses:
-        issues["empty_or_error_responses"] = empty_responses
-
-    ov_token_col = "ov_llm_total_tokens"
-    if rows and ov_token_col in rows[0]:
-        ov_zero = sum(1 for r in rows if int((r.get(ov_token_col) or "0").strip() or 0) == 0)
-        if ov_zero == len(rows):
-            issues["openviking_tokens_all_zero"] = ov_zero
-
-    ov_missing_col = "ov_missing_records"
-    if rows and ov_missing_col in rows[0]:
-        max_missing = max(int((r.get(ov_missing_col) or "0").strip() or 0) for r in rows)
-        if max_missing > 0:
-            issues["openviking_index_missing_records_max"] = max_missing
-            rows_with_tokens = sum(
-                1
-                for r in rows
-                if int((r.get(ov_token_col) or "0").strip() or 0) > 0
-            )
-            if rows_with_tokens > 0:
-                issues["openviking_memory_written_but_index_unavailable"] = rows_with_tokens
-
-    return issues
+    return check_locomo_qa_results(output_dir)
 
 
 def summarize_qa_results(output_dir: str) -> dict:
     """Build run-level QA diagnostics from qa_results.csv."""
-    csv_path = os.path.join(output_dir, "qa_results.csv")
-    if not os.path.exists(csv_path):
-        return {"missing_csv": csv_path}
-
-    try:
-        with open(csv_path, "r", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except Exception as e:
-        return {"csv_read_error": str(e)}
-
-    valid = [r for r in rows if r.get("category") != "5"]
-    closure_counts: dict[str, int] = {}
-    for row in valid:
-        state = str(row.get("ov_closure_state") or "").strip()
-        if not state:
-            continue
-        closure_counts[state] = closure_counts.get(state, 0) + 1
-
-    def _has_true(field: str) -> bool:
-        return any(str((row.get(field) or "")).strip().lower() == "true" for row in valid)
-
-    dominant_state = ""
-    if closure_counts:
-        dominant_state = max(sorted(closure_counts.items()), key=lambda item: item[1])[0]
-
-    issues = check_qa_results(output_dir)
-    return {
-        "rows": len(rows),
-        "valid_rows": len(valid),
-        "issues": issues,
-        "ov_closure_counts": closure_counts,
-        "ov_closure_summary": {
-            "dominant_state": dominant_state,
-            "has_memory_written": _has_true("ov_memory_written"),
-            "has_token_emitted": _has_true("ov_token_emitted"),
-            "has_index_unavailable": any(
-                str((row.get("ov_index_available") or "")).strip().lower() == "false" for row in valid
-            ),
-        }
-        if closure_counts
-        else {},
-    }
+    return summarize_locomo_qa_results(output_dir)
 
 
 def write_qa_diagnostics(output_dir: str) -> dict:
     """Write qa_diagnostics.json and return its content."""
-    diagnostics = summarize_qa_results(output_dir)
-    path = os.path.join(output_dir, "qa_diagnostics.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(diagnostics, f, indent=2, ensure_ascii=False)
-    return diagnostics
+    return write_locomo_qa_diagnostics(output_dir)
 
 
 def check_judge_results(output_dir: str) -> dict:

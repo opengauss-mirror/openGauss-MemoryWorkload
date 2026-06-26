@@ -10,25 +10,11 @@ import time
 from pathlib import Path
 
 from .config import Config
+from memory_bench_platform.locomo_test_metrics_bridge import derive_locomo_ov_closure_summary
 
 
 def derive_ov_closure_summary(rows: list[dict], counts: dict[str, int]) -> dict:
-    if not rows or not counts:
-        return {}
-
-    dominant_state = max(sorted(counts.items()), key=lambda item: item[1])[0]
-
-    def _has_true(field: str) -> bool:
-        return any(str((row.get(field) or "")).strip().lower() == "true" for row in rows)
-
-    return {
-        "dominant_state": dominant_state,
-        "has_memory_written": _has_true("ov_memory_written"),
-        "has_token_emitted": _has_true("ov_token_emitted"),
-        "has_index_unavailable": any(
-            str((row.get("ov_index_available") or "")).strip().lower() == "false" for row in rows
-        ),
-    }
+    return derive_locomo_ov_closure_summary(rows, counts)
 
 
 def run_stats(
