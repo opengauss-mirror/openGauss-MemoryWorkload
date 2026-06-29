@@ -15,6 +15,7 @@ def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
     ingest_record = bundle.ingest_record
     qa_rows = bundle.qa_rows
     pipeline_log = bundle.pipeline_log
+    chunk_diagnostics = bundle.chunk_diagnostics
 
     recall_totals = [int(row.get("ov_recall_total", 0) or 0) for row in qa_rows if str(row.get("ov_recall_total", "")).strip()]
     recall_hits = sum(1 for row in qa_rows if str(row.get("ov_recall_hit", "")).strip().lower() == "true")
@@ -36,6 +37,31 @@ def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
         if len(ingest_session_timestamps) >= 2
         else 0
     )
+    slow_threshold = 120.0
+    chunk_elapsed_values = [
+        float((item.get("send") or {}).get("elapsed_seconds", 0.0) or 0.0)
+        + float((item.get("ov_task_wait") or {}).get("elapsed_seconds", 0.0) or 0.0)
+        for item in chunk_diagnostics
+        if isinstance(item, dict) and item.get("status") == "passed"
+    ]
+    slow_chunks = [
+        item for item in chunk_diagnostics
+        if isinstance(item, dict)
+        and item.get("status") == "passed"
+        and (
+            float((item.get("send") or {}).get("elapsed_seconds", 0.0) or 0.0)
+            + float((item.get("ov_task_wait") or {}).get("elapsed_seconds", 0.0) or 0.0)
+        ) >= slow_threshold
+    ]
+    timeout_chunks = [
+        item for item in chunk_diagnostics
+        if isinstance(item, dict)
+        and (
+            bool((item.get("send") or {}).get("timeout_hit"))
+            or bool((item.get("ov_task_wait") or {}).get("timed_out"))
+            or item.get("status") == "failed"
+        )
+    ]
 
     result = {
         "source": "locomo_test",
@@ -55,6 +81,10 @@ def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
                 "ov_llm_total": (meta.get("memory_token_totals") or {}).get("llm_total", 0),
                 "ov_embedding_total": (meta.get("memory_token_totals") or {}).get("embedding", 0),
                 "ov_memories_total": (meta.get("memory_token_totals") or {}).get("memories", 0),
+                "chunk_total": len(chunk_diagnostics),
+                "slow_chunk_count": len(slow_chunks),
+                "timeout_chunk_count": len(timeout_chunks),
+                "chunk_elapsed_max_seconds": round(max(chunk_elapsed_values), 3) if chunk_elapsed_values else 0.0,
             },
             "recall_query": {
                 "qa_row_count": len(qa_rows),
@@ -75,12 +105,45 @@ def diagnose_locomo_test_output(output_dir: Path) -> dict[str, Any]:
         "timing": {
             "steps": timings,
             "ingest_session_span_seconds": ingest_span_seconds,
+            "chunk_elapsed_max_seconds": round(max(chunk_elapsed_values), 3) if chunk_elapsed_values else 0.0,
         },
         "artifacts": bundle.artifact_paths(),
+        "chunk_diagnostics_summary": {
+            "chunk_total": len(chunk_diagnostics),
+            "slow_threshold_seconds": slow_threshold,
+            "slow_chunk_count": len(slow_chunks),
+            "timeout_chunk_count": len(timeout_chunks),
+            "slowest_chunks": [
+                {
+                    "session_key": item.get("session_key"),
+                    "chunk_index": item.get("chunk_index"),
+                    "chunk_total": item.get("chunk_total"),
+                    "elapsed_seconds": round(
+                        float((item.get("send") or {}).get("elapsed_seconds", 0.0) or 0.0)
+                        + float((item.get("ov_task_wait") or {}).get("elapsed_seconds", 0.0) or 0.0),
+                        3,
+                    ),
+                    "send_attempts": (item.get("send") or {}).get("attempts", 0),
+                    "ov_task_timed_out": bool((item.get("ov_task_wait") or {}).get("timed_out")),
+                }
+                for item in sorted(
+                    slow_chunks,
+                    key=lambda payload: (
+                        float((payload.get("send") or {}).get("elapsed_seconds", 0.0) or 0.0)
+                        + float((payload.get("ov_task_wait") or {}).get("elapsed_seconds", 0.0) or 0.0)
+                    ),
+                    reverse=True,
+                )[:5]
+            ],
+        },
     }
     findings: list[str] = []
     if result["nodes"]["memory_capture"]["memory_written_but_index_unavailable"] > 0:
         findings.append("存在 memory written but index unavailable 样本，主要异常位于 OpenViking 检索/索引可见性。")
+    if len(slow_chunks) > 0:
+        findings.append(f"存在 {len(slow_chunks)} 个 ingest chunk 超过 {int(slow_threshold)}s，当前更像长尾慢而不是完全卡死。")
+    if len(timeout_chunks) > 0:
+        findings.append(f"存在 {len(timeout_chunks)} 个 ingest chunk 命中超时/失败边界，需要重点检查上游 LLM 长尾与 OV 任务等待。")
     if result["nodes"]["recall_query"]["recall_hit_count"] == 0 and qa_rows:
         findings.append("所有 QA 样本 recall_hit 均为 0，LoCoMo recall 闭环未真正建立。")
     if result["nodes"]["answer_generation"]["qa_total_tokens"] == 0 and result["nodes"]["answer_generation"]["total_graded"]:

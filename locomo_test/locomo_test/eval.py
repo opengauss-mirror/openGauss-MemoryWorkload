@@ -732,6 +732,77 @@ def _merge_ov_token_usage(left: dict | None, right: dict | None) -> dict | None:
     return merged
 
 
+def get_gateway_request_timeout_seconds() -> float:
+    raw = os.environ.get("LOCOMO_GATEWAY_REQUEST_TIMEOUT_SECONDS", "180").strip()
+    try:
+        value = float(raw or "0")
+    except ValueError:
+        value = 180.0
+    return max(value, 10.0)
+
+
+def get_gateway_retry_count(default: int = 2) -> int:
+    raw = os.environ.get("LOCOMO_GATEWAY_RETRY_COUNT", "").strip()
+    if not raw:
+        return max(default, 0)
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(value, 0)
+
+
+def get_gateway_retry_backoff_seconds() -> float:
+    raw = os.environ.get("LOCOMO_GATEWAY_RETRY_BACKOFF_SECONDS", "3").strip()
+    try:
+        value = float(raw or "0")
+    except ValueError:
+        value = 3.0
+    return max(value, 0.1)
+
+
+def get_openviking_commit_timeout_seconds() -> float:
+    raw = os.environ.get("LOCOMO_OPENVIKING_COMMIT_TIMEOUT_SECONDS", "60").strip()
+    try:
+        value = float(raw or "0")
+    except ValueError:
+        value = 60.0
+    return max(value, 5.0)
+
+
+def get_openviking_task_request_timeout_seconds() -> float:
+    raw = os.environ.get("LOCOMO_OPENVIKING_TASK_REQUEST_TIMEOUT_SECONDS", "30").strip()
+    try:
+        value = float(raw or "0")
+    except ValueError:
+        value = 30.0
+    return max(value, 5.0)
+
+
+def get_openviking_ingest_task_wait_seconds() -> int:
+    raw = os.environ.get("LOCOMO_OPENVIKING_INGEST_TASK_WAIT_SECONDS", "900").strip()
+    try:
+        value = int(raw or "0")
+    except ValueError:
+        value = 900
+    return max(value, 30)
+
+
+def get_openviking_chunk_slow_threshold_seconds() -> float:
+    raw = os.environ.get("LOCOMO_OPENVIKING_CHUNK_SLOW_THRESHOLD_SECONDS", "120").strip()
+    try:
+        value = float(raw or "0")
+    except ValueError:
+        value = 120.0
+    return max(value, 1.0)
+
+
+def append_chunk_diagnostic(output_dir: str, payload: dict[str, object]) -> None:
+    path = os.path.join(output_dir, "chunk_diagnostics.jsonl")
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def should_skip_openviking_qa_commit(session_key: str | None) -> bool:
     if not session_key:
         return False
@@ -765,7 +836,12 @@ def send_message(
         payload["user"] = user
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=6000)
+        resp = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=get_gateway_request_timeout_seconds(),
+        )
         resp.raise_for_status()
         body = resp.json()
     except requests.exceptions.ConnectionError as e:
@@ -781,21 +857,59 @@ def send_message(
     return extract_response_text(body), usage
 
 
+def _send_message_with_retry_diagnostics(
+    base_url: str, token: str, user: str, message: str, retries: int = 2,
+    agent_id: str = "main", session_key: str | None = None,
+) -> tuple[str, dict, dict]:
+    retries = get_gateway_retry_count(retries)
+    request_timeout = get_gateway_request_timeout_seconds()
+    backoff = get_gateway_retry_backoff_seconds()
+    last_exc = None
+    waits: list[float] = []
+    started = time.monotonic()
+    for attempt in range(retries + 1):
+        try:
+            reply, usage = send_message(base_url, token, user, message, agent_id, session_key)
+            return reply, usage, {
+                "attempts": attempt + 1,
+                "retries_configured": retries,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "request_timeout_seconds": request_timeout,
+                "wait_schedule_seconds": waits,
+                "timeout_hit": False,
+                "final_error": "",
+            }
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                wait = backoff * (attempt + 1)
+                waits.append(wait)
+                print(f"    [retry {attempt + 1}/{retries}] {e} (waiting {wait}s)", file=sys.stderr)
+                time.sleep(wait)
+    assert last_exc is not None
+    raise RuntimeError(
+        json.dumps(
+            {
+                "message": str(last_exc),
+                "attempts": retries + 1,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "request_timeout_seconds": request_timeout,
+                "wait_schedule_seconds": waits,
+                "timeout_hit": "timeout" in str(last_exc).lower(),
+            },
+            ensure_ascii=False,
+        )
+    ) from last_exc
+
+
 def send_message_with_retry(
     base_url: str, token: str, user: str, message: str, retries: int = 2,
     agent_id: str = "main", session_key: str | None = None,
 ) -> tuple[str, dict]:
-    last_exc = None
-    for attempt in range(retries + 1):
-        try:
-            return send_message(base_url, token, user, message, agent_id, session_key)
-        except Exception as e:
-            last_exc = e
-            if attempt < retries:
-                wait = 3 * (attempt + 1)
-                print(f"    [retry {attempt + 1}/{retries}] {e} (waiting {wait}s)", file=sys.stderr)
-                time.sleep(wait)
-    raise last_exc
+    reply, usage, _ = _send_message_with_retry_diagnostics(
+        base_url, token, user, message, retries, agent_id, session_key
+    )
+    return reply, usage
 
 
 # ---------------------------------------------------------------------------
@@ -912,7 +1026,7 @@ def commit_openviking_session(
         f"{ov_api_url}/api/v1/sessions/{session_id}/commit",
         json=payload,
         headers=headers,
-        timeout=60,
+        timeout=get_openviking_commit_timeout_seconds(),
     )
     if resp.status_code == 404:
         return {
@@ -941,18 +1055,31 @@ def query_ov_task_token_usage(
     fallback_agent_id: str = "main",
     max_wait: int = 60,
     resource_id: str | None = None,
-) -> dict | None:
+    return_diag: bool = False,
+) -> dict | tuple[dict | None, dict]:
     headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
     if not headers:
-        return None
+        result = None
+        diag = {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "missing_headers"}
+        return (result, diag) if return_diag else result
     deadline = time.time() + max_wait
     interval = 2
+    poll_count = 0
+    started = time.monotonic()
+    fallback_used = False
+    final_status = ""
     try:
         while True:
-            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", headers=headers, timeout=30)
+            poll_count += 1
+            resp = requests.get(
+                f"{ov_api_url}/api/v1/tasks/{task_id}",
+                headers=headers,
+                timeout=get_openviking_task_request_timeout_seconds(),
+            )
             resp.raise_for_status()
             data = resp.json()
             status = data.get("result", {}).get("status", "") if isinstance(data.get("result"), dict) else ""
+            final_status = status or final_status
             if status in ("completed", "failed", ""):
                 parsed = _parse_ov_task_result(data)
                 if _is_empty_ov_token_usage(parsed) and resource_id:
@@ -963,8 +1090,13 @@ def query_ov_task_token_usage(
                         fallback_agent_id=fallback_agent_id,
                     )
                     if fallback and not _is_empty_ov_token_usage(fallback):
-                        return fallback
-                return parsed
+                        fallback_used = True
+                        result = fallback
+                        diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": fallback_used, "final_status": status or "completed"}
+                        return (result, diag) if return_diag else result
+                result = parsed
+                diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": fallback_used, "final_status": status or "completed"}
+                return (result, diag) if return_diag else result
             if time.time() >= deadline:
                 if resource_id:
                     fallback = query_ov_latest_task(
@@ -974,13 +1106,20 @@ def query_ov_task_token_usage(
                         fallback_agent_id=fallback_agent_id,
                     )
                     if fallback and not _is_empty_ov_token_usage(fallback):
-                        return fallback
-                return None
+                        fallback_used = True
+                        result = fallback
+                        diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": True, "fallback_used": fallback_used, "final_status": final_status or "timeout"}
+                        return (result, diag) if return_diag else result
+                result = None
+                diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": True, "fallback_used": fallback_used, "final_status": final_status or "timeout"}
+                return (result, diag) if return_diag else result
             time.sleep(interval)
             interval = min(interval * 2, 10)
     except Exception as e:
         print(f"    [ov-task] Error querying task {task_id}: {e}", file=sys.stderr)
-        return None
+        result = None
+        diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": fallback_used, "final_status": "error", "error": str(e)}
+        return (result, diag) if return_diag else result
 
 
 def query_ov_latest_task(
@@ -1042,10 +1181,14 @@ def wait_for_ov_latest_task(
     state_dir: str = "",
     fallback_agent_id: str = "main",
     max_wait: int = 60,
-) -> dict | None:
+    return_diag: bool = False,
+) -> dict | tuple[dict | None, dict]:
     deadline = time.time() + max_wait
     interval = 2
+    poll_count = 0
+    started = time.monotonic()
     while True:
+        poll_count += 1
         result = query_ov_latest_task(
             ov_api_url,
             resource_id=resource_id,
@@ -1053,9 +1196,11 @@ def wait_for_ov_latest_task(
             fallback_agent_id=fallback_agent_id,
         )
         if result:
-            return result
+            diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": True, "final_status": "latest_task"}
+            return (result, diag) if return_diag else result
         if time.time() >= deadline:
-            return None
+            diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": True, "fallback_used": False, "final_status": "timeout"}
+            return (None, diag) if return_diag else None
         time.sleep(interval)
         interval = min(interval * 2, 10)
 
@@ -1704,6 +1849,14 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 ov_token_usage = None
                 query_mode = normalize_ov_task_query_mode(cfg.memory_mode)
                 for ingest_idx, raw_ingest_msg in enumerate(ingest_messages, start=1):
+                    chunk_diag = {
+                        "sample_id": sample_id,
+                        "session_key": meta.get("session_key"),
+                        "session_date_time": meta.get("date_time"),
+                        "chunk_index": ingest_idx,
+                        "chunk_total": len(ingest_messages),
+                        "query_mode": query_mode,
+                    }
                     current_session_key = oc_session_key
                     if oc_session_key and len(ingest_messages) > 1:
                         current_session_key = f"{oc_session_key}-part{ingest_idx}"
@@ -1712,10 +1865,11 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         if cfg.memory_mode == "memcore"
                         else build_ingest_input_message(raw_ingest_msg)
                     )
-                    reply, chunk_usage = send_message_with_retry(
+                    reply, chunk_usage, send_diag = _send_message_with_retry_diagnostics(
                         cfg.gateway.base_url, cfg.gateway.token, user_key,
                         ingest_msg, 2, cfg.agent_id, current_session_key,
                     )
+                    chunk_diag["send"] = send_diag
                     reply_parts.append(reply)
                     usage = _merge_usage_totals(usage, chunk_usage)
                     preview = reply[:80]
@@ -1726,6 +1880,12 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         )
                     else:
                         print(f"    -> {preview}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
+                    print(
+                        f"    [chunk-diag] send attempts={send_diag['attempts']}/{send_diag['retries_configured'] + 1} "
+                        f"elapsed={send_diag['elapsed_seconds']:.1f}s timeout={send_diag['request_timeout_seconds']:.1f}s "
+                        f"slow={str(float(send_diag['elapsed_seconds']) >= get_openviking_chunk_slow_threshold_seconds()).lower()}",
+                        file=sys.stderr,
+                    )
 
                     if cfg.memory_mode == "openviking":
                         commit_key = current_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
@@ -1751,40 +1911,56 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                             state_dir=cfg.gateway.state_dir,
                             fallback_agent_id=cfg.agent_id,
                         )
-                        ingest_task_wait_seconds = max(
-                            int(os.environ.get("LOCOMO_OPENVIKING_INGEST_TASK_WAIT_SECONDS", "900") or 900),
-                            30,
-                        )
+                        ingest_task_wait_seconds = get_openviking_ingest_task_wait_seconds()
                         print(
                             f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
                             f"wait={str(wait_for_commit).lower()} session={ov_session_id}",
                             file=sys.stderr,
                         )
+                        chunk_diag["ov_commit"] = {
+                            "session_id": ov_session_id,
+                            "status": commit_result.get("status") or "unknown",
+                            "task_id": commit_result.get("task_id") or "",
+                            "wait": wait_for_commit,
+                        }
                         chunk_ov_token_usage = None
+                        task_wait_diag = {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"}
                         task_id = commit_result.get("task_id") or ""
                         if task_id:
-                            chunk_ov_token_usage = query_ov_task_token_usage(
+                            chunk_ov_token_usage, task_wait_diag = query_ov_task_token_usage(
                                 cfg.openviking.api_url,
                                 task_id,
                                 state_dir=cfg.gateway.state_dir,
                                 fallback_agent_id=cfg.agent_id,
                                 max_wait=ingest_task_wait_seconds,
                                 resource_id=ov_session_id,
+                                return_diag=True,
                             )
                         if _is_empty_ov_token_usage(chunk_ov_token_usage):
-                            chunk_ov_token_usage = wait_for_ov_latest_task(
+                            chunk_ov_token_usage, latest_task_diag = wait_for_ov_latest_task(
                                 cfg.openviking.api_url,
                                 resource_id=ov_session_id,
                                 state_dir=cfg.gateway.state_dir,
                                 fallback_agent_id=cfg.agent_id,
                                 max_wait=ingest_task_wait_seconds,
+                                return_diag=True,
                             )
+                            task_wait_diag = latest_task_diag
+                        chunk_diag["ov_task_wait"] = task_wait_diag
 
                         if chunk_ov_token_usage:
                             print(
                                 f"    [ov-task] llm={chunk_ov_token_usage['llm_total']:,} "
                                 f"embed={chunk_ov_token_usage['embedding']:,} "
                                 f"memories={chunk_ov_token_usage['memories']}",
+                                file=sys.stderr,
+                            )
+                            print(
+                                f"    [chunk-diag] ov_task polls={task_wait_diag.get('poll_count', 0)} "
+                                f"elapsed={float(task_wait_diag.get('elapsed_seconds', 0.0)):.1f}s "
+                                f"timed_out={str(task_wait_diag.get('timed_out', False)).lower()} "
+                                f"fallback={str(task_wait_diag.get('fallback_used', False)).lower()} "
+                                f"status={task_wait_diag.get('final_status', '')}",
                                 file=sys.stderr,
                             )
                             ov_token_usage = _merge_ov_token_usage(ov_token_usage, chunk_ov_token_usage)
@@ -1804,6 +1980,21 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                                     f"after session {ov_session_id}",
                                     file=sys.stderr,
                                 )
+                                chunk_diag["ov_consistency"] = {
+                                    "ok": bool(consistency.get("ok", False)),
+                                    "missing_record_count": int(consistency.get("missing_record_count", 0) or 0),
+                                }
+                        else:
+                            print(
+                                f"    [chunk-diag] ov_task polls={task_wait_diag.get('poll_count', 0)} "
+                                f"elapsed={float(task_wait_diag.get('elapsed_seconds', 0.0)):.1f}s "
+                                f"timed_out={str(task_wait_diag.get('timed_out', False)).lower()} "
+                                f"fallback={str(task_wait_diag.get('fallback_used', False)).lower()} "
+                                f"status={task_wait_diag.get('final_status', '')} result=empty",
+                                file=sys.stderr,
+                            )
+                    chunk_diag["status"] = "passed"
+                    append_chunk_diagnostic(output_dir, chunk_diag)
                     if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and current_session_key:
                         found = get_session_id_from_key(current_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
                         if found:
@@ -1847,6 +2038,15 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                     "date_time": meta["date_time"], "usage": usage,
                 })
             except Exception as e:
+                append_chunk_diagnostic(
+                    output_dir,
+                    {
+                        "sample_id": sample_id,
+                        "session_key": meta.get("session_key"),
+                        "status": "failed",
+                        "error": str(e),
+                    },
+                )
                 print(f"    -> [FATAL] Ingest failed, aborting: {e}", file=sys.stderr)
                 raise RuntimeError(f"Ingest failed for sample {sample_id} session {meta['session_key']}: {e}") from e
 

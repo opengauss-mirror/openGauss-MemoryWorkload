@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import shutil
 import threading
 import time
 from typing import Sequence
@@ -36,6 +37,9 @@ class ResourceMonitor:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_cpu_counters: tuple[float, ...] | None = None
+        self._last_disk_counters: tuple[float, float] | None = None
+        self._last_net_counters: tuple[float, float, float, float] | None = None
+        self._last_io_timestamp: float | None = None
 
     def setup_writers(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -83,15 +87,94 @@ class ResourceMonitor:
         used_mb = max(0.0, total_mb - available_mb)
         return round(available_mb, 2), round(used_mb, 2)
 
+    def _read_disk_counters(self) -> tuple[float, float]:
+        read_bytes = 0.0
+        write_bytes = 0.0
+        device_prefixes = ("sd", "vd", "xvd", "nvme", "md")
+        for line in Path("/proc/diskstats").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) < 14:
+                continue
+            name = parts[2]
+            if not name.startswith(device_prefixes):
+                continue
+            if name.startswith("nvme") and "p" in name:
+                continue
+            if (name.startswith("sd") or name.startswith("vd") or name.startswith("xvd")) and any(ch.isdigit() for ch in name[2:]):
+                continue
+            read_sectors = float(parts[5])
+            write_sectors = float(parts[9])
+            read_bytes += read_sectors * 512.0
+            write_bytes += write_sectors * 512.0
+        return read_bytes, write_bytes
+
+    def _read_disk_snapshot(self, elapsed_seconds: float | None) -> tuple[float, float, float, float]:
+        read_bytes, write_bytes = self._read_disk_counters()
+        previous = self._last_disk_counters
+        self._last_disk_counters = (read_bytes, write_bytes)
+        read_bw_mb = 0.0
+        write_bw_mb = 0.0
+        if previous is not None and elapsed_seconds and elapsed_seconds > 0:
+            read_bw_mb = max(0.0, read_bytes - previous[0]) / elapsed_seconds / (1024.0 * 1024.0)
+            write_bw_mb = max(0.0, write_bytes - previous[1]) / elapsed_seconds / (1024.0 * 1024.0)
+        disk_free_mb = shutil.disk_usage(self.work_dir).free / (1024.0 * 1024.0)
+        return round(read_bw_mb, 4), round(write_bw_mb, 4), round(read_bw_mb + write_bw_mb, 4), round(disk_free_mb, 2)
+
+    def _read_network_counters(self) -> tuple[float, float, float, float]:
+        for line in Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()[2:]:
+            if ":" not in line:
+                continue
+            iface, payload = line.split(":", 1)
+            if iface.strip() != self.net_interface:
+                continue
+            parts = payload.split()
+            if len(parts) < 16:
+                break
+            recv_bytes = float(parts[0])
+            recv_packets = float(parts[1])
+            sent_bytes = float(parts[8])
+            sent_packets = float(parts[9])
+            return recv_packets, sent_packets, recv_bytes, sent_bytes
+        return 0.0, 0.0, 0.0, 0.0
+
+    def _read_network_snapshot(self, elapsed_seconds: float | None) -> tuple[float, float, float, float]:
+        recv_packets, sent_packets, recv_bytes, sent_bytes = self._read_network_counters()
+        previous = self._last_net_counters
+        self._last_net_counters = (recv_packets, sent_packets, recv_bytes, sent_bytes)
+        recv_pcks_rate = 0.0
+        sent_pcks_rate = 0.0
+        recv_bytes_rate = 0.0
+        sent_bytes_rate = 0.0
+        if previous is not None and elapsed_seconds and elapsed_seconds > 0:
+            recv_pcks_rate = max(0.0, recv_packets - previous[0]) / elapsed_seconds
+            sent_pcks_rate = max(0.0, sent_packets - previous[1]) / elapsed_seconds
+            recv_bytes_rate = max(0.0, recv_bytes - previous[2]) / elapsed_seconds
+            sent_bytes_rate = max(0.0, sent_bytes - previous[3]) / elapsed_seconds
+        return (
+            round(recv_pcks_rate, 4),
+            round(sent_pcks_rate, 4),
+            round(recv_bytes_rate, 4),
+            round(sent_bytes_rate, 4),
+        )
+
     def capture_once(self) -> dict[str, float | str]:
         timestamp = datetime.now().isoformat()
+        now = time.monotonic()
+        elapsed_seconds = None if self._last_io_timestamp is None else max(0.0, now - self._last_io_timestamp)
+        self._last_io_timestamp = now
         user, system, idle = self._read_cpu_percentages()
         mem_free_mb, mem_used_mb = self._read_memory_usage_mb()
+        read_bw_mb, write_bw_mb, disk_bw_mb, disk_free_mb = self._read_disk_snapshot(elapsed_seconds)
+        recv_pcks_rate, sent_pcks_rate, recv_bytes_rate, sent_bytes_rate = self._read_network_snapshot(elapsed_seconds)
         cpu_row = [timestamp, user, system, idle]
         with (self.output_dir / "cpu_status.csv").open("a", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(cpu_row)
         with (self.output_dir / "mem_status.csv").open("a", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow([timestamp, mem_free_mb, mem_used_mb])
+        with (self.output_dir / "disk_status.csv").open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow([timestamp, read_bw_mb, write_bw_mb, disk_bw_mb, disk_free_mb])
+        with (self.output_dir / "net_status.csv").open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow([timestamp, recv_pcks_rate, sent_pcks_rate, recv_bytes_rate, sent_bytes_rate])
         return {
             "timestamp": timestamp,
             "summary_util_user": user,
@@ -99,6 +182,14 @@ class ResourceMonitor:
             "summary_util_idle": idle,
             "mem_free_mb": mem_free_mb,
             "mem_used_mb": mem_used_mb,
+            "read_bw_mb": read_bw_mb,
+            "write_bw_mb": write_bw_mb,
+            "disk_bw_mb": disk_bw_mb,
+            "disk_free_mb": disk_free_mb,
+            "recv_pcks_rate": recv_pcks_rate,
+            "sent_pcks_rate": sent_pcks_rate,
+            "recv_bytes_rate": recv_bytes_rate,
+            "sent_bytes_rate": sent_bytes_rate,
         }
 
     def start_background_sampling(self) -> None:

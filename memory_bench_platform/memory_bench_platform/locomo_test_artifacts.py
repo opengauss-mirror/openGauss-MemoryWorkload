@@ -15,6 +15,7 @@ class LocomoTestArtifacts:
     ingest_record: dict[str, Any] = field(default_factory=dict)
     qa_rows: list[dict[str, str]] = field(default_factory=list)
     pipeline_log: str = ""
+    chunk_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     def artifact_paths(self) -> dict[str, str]:
         payload: dict[str, str] = {}
@@ -24,6 +25,7 @@ class LocomoTestArtifacts:
             "qa_results_csv": self.output_dir / "qa_results.csv",
             "pipeline_log": self.output_dir / "pipeline.log",
             "ingest_record_json": self.output_dir / ".ingest_record.json",
+            "chunk_diagnostics_jsonl": self.output_dir / "chunk_diagnostics.jsonl",
             "report_html": self.output_dir / "report.html",
         }.items():
             if path.exists():
@@ -42,6 +44,7 @@ def load_locomo_test_artifacts(output_dir: Path) -> LocomoTestArtifacts:
         pipeline_log=(output_dir / "pipeline.log").read_text(encoding="utf-8", errors="ignore")
         if (output_dir / "pipeline.log").exists()
         else "",
+        chunk_diagnostics=_load_jsonl_rows(output_dir / "chunk_diagnostics.jsonl"),
     )
 
 
@@ -60,3 +63,21 @@ def _load_csv_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open(encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+    return rows

@@ -68,6 +68,18 @@ def _build_minimal_run(run_dir: Path) -> None:
         "2,900.0,2100.0\n",
         encoding="utf-8",
     )
+    (run_dir / "artifacts" / "monitor" / "disk_status.csv").write_text(
+        "timestamp,read_bw_mb,write_bw_mb,disk_bw_mb,disk_free_mb\n"
+        "1,1.0,2.0,3.0,50000.0\n"
+        "2,2.0,3.0,5.0,49990.0\n",
+        encoding="utf-8",
+    )
+    (run_dir / "artifacts" / "monitor" / "net_status.csv").write_text(
+        "timestamp,recv_pcks_rate,sent_pcks_rate,recv_bytes_rate,sent_bytes_rate\n"
+        "1,10.0,5.0,1000.0,800.0\n"
+        "2,12.0,6.0,1200.0,900.0\n",
+        encoding="utf-8",
+    )
 
 
 def _write_master_log(run_dir: Path, text: str) -> None:
@@ -93,6 +105,22 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
         "2026-01-01T00:00:06,900.0,2100.0\n"
         "2026-01-01T00:00:16,800.0,2200.0\n"
         "2026-01-01T00:00:36,700.0,2300.0\n",
+        encoding="utf-8",
+    )
+    (run_dir / "artifacts" / "monitor" / "disk_status.csv").write_text(
+        "timestamp,read_bw_mb,write_bw_mb,disk_bw_mb,disk_free_mb\n"
+        "2026-01-01T00:00:00,1.0,1.0,2.0,50000.0\n"
+        "2026-01-01T00:00:06,2.0,1.5,3.5,49990.0\n"
+        "2026-01-01T00:00:16,4.0,2.0,6.0,49970.0\n"
+        "2026-01-01T00:00:36,3.0,2.5,5.5,49950.0\n",
+        encoding="utf-8",
+    )
+    (run_dir / "artifacts" / "monitor" / "net_status.csv").write_text(
+        "timestamp,recv_pcks_rate,sent_pcks_rate,recv_bytes_rate,sent_bytes_rate\n"
+        "2026-01-01T00:00:00,10.0,5.0,1000.0,800.0\n"
+        "2026-01-01T00:00:06,20.0,7.0,2000.0,1000.0\n"
+        "2026-01-01T00:00:16,30.0,8.0,3000.0,1100.0\n"
+        "2026-01-01T00:00:36,40.0,9.0,3500.0,1200.0\n",
         encoding="utf-8",
     )
     _write_master_log(
@@ -203,6 +231,8 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert analysis["failure_summary"]["retrieval_miss_count"] == 1
     assert analysis["resource_summary"]["cpu_user_peak"] == 40.0
     assert analysis["resource_summary"]["mem_used_peak_mb"] == 2300.0
+    assert analysis["resource_summary"]["disk_bw_peak_mb"] == 6.0
+    assert analysis["resource_summary"]["net_recv_bytes_peak"] == 3500.0
     assert analysis["resource_timeline"]["sample_count"] == 4
     assert analysis["ingest_summary"]["session_total"] == 2
     assert analysis["ingest_summary"]["zero_memory_sessions"] == 1
@@ -215,6 +245,7 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert analysis["resource_phase_summary"]["ingest"]["cpu_user_avg"] == 20.0
     assert analysis["resource_phase_summary"]["qa"]["cpu_user_avg"] == 30.0
     assert analysis["resource_phase_summary"]["qa"]["mem_used_peak_mb"] == 2200.0
+    assert analysis["resource_phase_summary"]["qa"]["disk_bw_peak_mb"] == 6.0
     assert (run_dir / "reports" / "analysis.json").is_file()
     assert (run_dir / "reports" / "analysis.md").is_file()
     assert (run_dir / "reports" / "run_report.html").is_file()
@@ -226,9 +257,14 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     assert "openviking_memory_written_but_index_unavailable" in report_html
     assert "qa_direct_recall_only" in report_html
     assert "有效模式" in report_html
+    assert "Stage Timing" in report_html
+    assert "Stage Timeline" in report_html
+    assert "ingest_seconds" in report_html
     assert "Chain Diagnostics" in report_html
     assert "CPU Usage Timeline" in report_html
     assert "Memory Usage Timeline" in report_html
+    assert "Disk I/O Timeline" in report_html
+    assert "Network I/O Timeline" in report_html
     assert "Resource Phases" in report_html
     assert "health_check" in report_html
 
@@ -441,6 +477,8 @@ def test_analyze_run_tolerates_missing_cpu_monitor_file(tmp_path: Path):
     _build_minimal_run(run_dir)
     (run_dir / "artifacts" / "monitor" / "cpu_status.csv").unlink()
     (run_dir / "artifacts" / "monitor" / "mem_status.csv").unlink()
+    (run_dir / "artifacts" / "monitor" / "disk_status.csv").unlink()
+    (run_dir / "artifacts" / "monitor" / "net_status.csv").unlink()
     (run_dir / "reports" / "case_results.json").write_text(
         json.dumps(
             [
@@ -480,6 +518,8 @@ def test_analyze_run_falls_back_to_external_monitor_files(tmp_path: Path):
     _build_minimal_run(run_dir)
     (run_dir / "artifacts" / "monitor" / "cpu_status.csv").unlink()
     (run_dir / "artifacts" / "monitor" / "mem_status.csv").unlink()
+    (run_dir / "artifacts" / "monitor" / "disk_status.csv").unlink()
+    (run_dir / "artifacts" / "monitor" / "net_status.csv").unlink()
     artifacts = run_dir / "external_artifacts" / "locomo_test_remote" / "monitor"
     artifacts.mkdir(parents=True, exist_ok=True)
     (run_dir / "run.json").write_text(
@@ -511,11 +551,77 @@ def test_analyze_run_falls_back_to_external_monitor_files(tmp_path: Path):
         "2,750.0,2250.0\n",
         encoding="utf-8",
     )
+    (artifacts / "disk_status.csv").write_text(
+        "timestamp,read_bw_mb,write_bw_mb,disk_bw_mb,disk_free_mb\n"
+        "1,1.0,1.0,2.0,50000.0\n"
+        "2,2.0,2.0,4.0,49990.0\n",
+        encoding="utf-8",
+    )
+    (artifacts / "net_status.csv").write_text(
+        "timestamp,recv_pcks_rate,sent_pcks_rate,recv_bytes_rate,sent_bytes_rate\n"
+        "1,10.0,4.0,1000.0,500.0\n"
+        "2,11.0,5.0,1200.0,700.0\n",
+        encoding="utf-8",
+    )
 
     analysis = analyze_run(run_dir)
 
     assert analysis["resource_summary"]["cpu_user_peak"] == 21.0
     assert analysis["resource_summary"]["mem_used_peak_mb"] == 2250.0
+    assert analysis["resource_summary"]["disk_bw_peak_mb"] == 4.0
+
+
+def test_analyze_run_prefers_external_monitor_files_for_locomo_runner(tmp_path: Path):
+    run_dir = tmp_path / "run-prefer-external-monitor"
+    _build_minimal_run(run_dir)
+    artifacts = run_dir / "external_artifacts" / "locomo_test_remote" / "monitor"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "source_id": "locomo:locomo_test_remote",
+                "source_kind": "external_benchmark_runner",
+                "agent_id": "openclaw",
+                "status": "partial",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "records").mkdir(parents=True, exist_ok=True)
+    (run_dir / "records" / "external_entrypoint.json").write_text(
+        json.dumps({"entrypoint_id": "locomo_test_remote"}),
+        encoding="utf-8",
+    )
+    (artifacts / "cpu_status.csv").write_text(
+        "timestamp,summary_util_user,summary_util_sys,summary_util_idle\n"
+        "1,41.0,4.0,55.0\n"
+        "2,51.0,8.0,41.0\n",
+        encoding="utf-8",
+    )
+    (artifacts / "mem_status.csv").write_text(
+        "timestamp,mem_free_mb,mem_used_mb\n"
+        "1,0.0,120.0\n"
+        "2,0.0,180.0\n",
+        encoding="utf-8",
+    )
+    (artifacts / "disk_status.csv").write_text(
+        "timestamp,read_bw_mb,write_bw_mb,disk_bw_mb,disk_free_mb\n"
+        "1,0.5,0.5,1.0,0.0\n"
+        "2,1.5,1.5,3.0,0.0\n",
+        encoding="utf-8",
+    )
+    (artifacts / "net_status.csv").write_text(
+        "timestamp,recv_pcks_rate,sent_pcks_rate,recv_bytes_rate,sent_bytes_rate\n"
+        "1,1.0,1.0,10.0,20.0\n"
+        "2,2.0,2.0,30.0,40.0\n",
+        encoding="utf-8",
+    )
+
+    analysis = analyze_run(run_dir)
+
+    assert analysis["resource_summary"]["cpu_user_peak"] == 51.0
+    assert analysis["resource_summary"]["mem_used_peak_mb"] == 180.0
 
 
 def test_cli_analyze_run_generates_analysis_files(tmp_path: Path):

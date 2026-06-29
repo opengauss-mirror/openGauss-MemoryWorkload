@@ -100,6 +100,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             "json": str(run_dir / "reports" / "timing_report.json"),
             "html": str(run_dir / "reports" / "timing_report.html"),
             "duration_label_count": len(timing_report.get("duration_distributions", {})),
+            "report": timing_report,
         }
     write_analysis_json(run_dir, analysis)
     write_analysis_markdown(run_dir, _render_analysis_markdown(analysis))
@@ -313,42 +314,92 @@ def _read_memory_summary(csv_path: Path) -> dict[str, Any]:
     }
 
 
+def _read_disk_summary(csv_path: Path) -> dict[str, Any]:
+    if not csv_path.exists():
+        return {"disk_sample_count": 0, "missing_disk": "artifacts/monitor/disk_status.csv"}
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    if not rows:
+        return {"disk_sample_count": 0, "missing_disk": "artifacts/monitor/disk_status.csv"}
+    read_values = [float(row["read_bw_mb"]) for row in rows]
+    write_values = [float(row["write_bw_mb"]) for row in rows]
+    total_values = [float(row["disk_bw_mb"]) for row in rows]
+    free_values = [float(row["disk_free_mb"]) for row in rows]
+    return {
+        "disk_sample_count": len(rows),
+        "disk_read_bw_avg_mb": round(sum(read_values) / len(read_values), 4),
+        "disk_write_bw_avg_mb": round(sum(write_values) / len(write_values), 4),
+        "disk_bw_peak_mb": max(total_values),
+        "disk_free_min_mb": min(free_values),
+    }
+
+
+def _read_network_summary(csv_path: Path) -> dict[str, Any]:
+    if not csv_path.exists():
+        return {"net_sample_count": 0, "missing_net": "artifacts/monitor/net_status.csv"}
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    if not rows:
+        return {"net_sample_count": 0, "missing_net": "artifacts/monitor/net_status.csv"}
+    recv_packets = [float(row["recv_pcks_rate"]) for row in rows]
+    sent_packets = [float(row["sent_pcks_rate"]) for row in rows]
+    recv_bytes = [float(row["recv_bytes_rate"]) for row in rows]
+    sent_bytes = [float(row["sent_bytes_rate"]) for row in rows]
+    return {
+        "net_sample_count": len(rows),
+        "net_recv_packets_avg": round(sum(recv_packets) / len(recv_packets), 4),
+        "net_sent_packets_avg": round(sum(sent_packets) / len(sent_packets), 4),
+        "net_recv_bytes_peak": max(recv_bytes),
+        "net_sent_bytes_peak": max(sent_bytes),
+    }
+
+
 def _read_resource_summary(run_dir: Path) -> dict[str, Any]:
-    cpu_path, mem_path = _resolve_monitor_paths(run_dir)
+    cpu_path, mem_path, disk_path, net_path = _resolve_monitor_paths(run_dir)
     payload = {}
     payload.update(_read_cpu_summary(cpu_path))
     payload.update(_read_memory_summary(mem_path))
+    payload.update(_read_disk_summary(disk_path))
+    payload.update(_read_network_summary(net_path))
     return payload
 
 
-def _resolve_monitor_paths(run_dir: Path) -> tuple[Path, Path]:
+def _resolve_monitor_paths(run_dir: Path) -> tuple[Path, Path, Path, Path]:
     cpu_path = run_dir / "artifacts" / "monitor" / "cpu_status.csv"
     mem_path = run_dir / "artifacts" / "monitor" / "mem_status.csv"
-    if not cpu_path.exists() or not mem_path.exists():
-        fallback_root = _resolve_external_output_dir(run_dir)
-        if fallback_root is not None:
-            fallback_cpu = fallback_root / "monitor" / "cpu_status.csv"
-            fallback_mem = fallback_root / "monitor" / "mem_status.csv"
-            if fallback_cpu.exists():
-                cpu_path = fallback_cpu
-            if fallback_mem.exists():
-                mem_path = fallback_mem
-    return cpu_path, mem_path
+    disk_path = run_dir / "artifacts" / "monitor" / "disk_status.csv"
+    net_path = run_dir / "artifacts" / "monitor" / "net_status.csv"
+    fallback_root = _resolve_external_output_dir(run_dir)
+    if fallback_root is not None:
+        fallback_cpu = fallback_root / "monitor" / "cpu_status.csv"
+        fallback_mem = fallback_root / "monitor" / "mem_status.csv"
+        fallback_disk = fallback_root / "monitor" / "disk_status.csv"
+        fallback_net = fallback_root / "monitor" / "net_status.csv"
+        if fallback_cpu.exists() and fallback_mem.exists():
+            cpu_path = fallback_cpu
+            mem_path = fallback_mem
+        if fallback_disk.exists():
+            disk_path = fallback_disk
+        if fallback_net.exists():
+            net_path = fallback_net
+    return cpu_path, mem_path, disk_path, net_path
 
 
 def _read_resource_timeline(run_dir: Path, chain_diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
-    cpu_path, mem_path = _resolve_monitor_paths(run_dir)
-    if not cpu_path.exists() or not mem_path.exists():
+    cpu_path, mem_path, disk_path, net_path = _resolve_monitor_paths(run_dir)
+    if not cpu_path.exists() or not mem_path.exists() or not disk_path.exists() or not net_path.exists():
         return {"sample_count": 0, "points": [], "phases": []}
     cpu_rows = list(csv.DictReader(cpu_path.open(encoding="utf-8")))
     mem_rows = list(csv.DictReader(mem_path.open(encoding="utf-8")))
-    if not cpu_rows or not mem_rows:
+    disk_rows = list(csv.DictReader(disk_path.open(encoding="utf-8")))
+    net_rows = list(csv.DictReader(net_path.open(encoding="utf-8")))
+    if not cpu_rows or not mem_rows or not disk_rows or not net_rows:
         return {"sample_count": 0, "points": [], "phases": []}
-    count = min(len(cpu_rows), len(mem_rows))
+    count = min(len(cpu_rows), len(mem_rows), len(disk_rows), len(net_rows))
     raw_points: list[dict[str, Any]] = []
     for idx in range(count):
         cpu = cpu_rows[idx]
         mem = mem_rows[idx]
+        disk = disk_rows[idx]
+        net = net_rows[idx]
         raw_points.append(
             {
                 "index": idx,
@@ -358,6 +409,14 @@ def _read_resource_timeline(run_dir: Path, chain_diagnostics: dict[str, Any] | N
                 "cpu_idle": float(cpu.get("summary_util_idle") or 0.0),
                 "mem_free_mb": float(mem.get("mem_free_mb") or 0.0),
                 "mem_used_mb": float(mem.get("mem_used_mb") or 0.0),
+                "disk_read_bw_mb": float(disk.get("read_bw_mb") or 0.0),
+                "disk_write_bw_mb": float(disk.get("write_bw_mb") or 0.0),
+                "disk_bw_mb": float(disk.get("disk_bw_mb") or 0.0),
+                "disk_free_mb": float(disk.get("disk_free_mb") or 0.0),
+                "recv_pcks_rate": float(net.get("recv_pcks_rate") or 0.0),
+                "sent_pcks_rate": float(net.get("sent_pcks_rate") or 0.0),
+                "recv_bytes_rate": float(net.get("recv_bytes_rate") or 0.0),
+                "sent_bytes_rate": float(net.get("sent_bytes_rate") or 0.0),
             }
         )
     start_dt = _parse_resource_timestamp(str(raw_points[0]["timestamp"])) if raw_points else None
@@ -442,6 +501,9 @@ def _summarize_resource_phases(resource_timeline: dict[str, Any]) -> dict[str, A
         cpu_user = [float(point.get("cpu_user", 0.0) or 0.0) for point in phase_points]
         cpu_sys = [float(point.get("cpu_sys", 0.0) or 0.0) for point in phase_points]
         mem_used = [float(point.get("mem_used_mb", 0.0) or 0.0) for point in phase_points]
+        disk_bw = [float(point.get("disk_bw_mb", 0.0) or 0.0) for point in phase_points]
+        recv_bytes = [float(point.get("recv_bytes_rate", 0.0) or 0.0) for point in phase_points]
+        sent_bytes = [float(point.get("sent_bytes_rate", 0.0) or 0.0) for point in phase_points]
         summary[label] = {
             "sample_count": len(phase_points),
             "duration_seconds": round(end_seconds - start_seconds, 3),
@@ -451,17 +513,23 @@ def _summarize_resource_phases(resource_timeline: dict[str, Any]) -> dict[str, A
             "cpu_sys_peak": max(cpu_sys),
             "mem_used_avg_mb": round(sum(mem_used) / len(mem_used), 4),
             "mem_used_peak_mb": max(mem_used),
+            "disk_bw_avg_mb": round(sum(disk_bw) / len(disk_bw), 4),
+            "disk_bw_peak_mb": max(disk_bw),
+            "net_recv_bytes_peak": max(recv_bytes),
+            "net_sent_bytes_peak": max(sent_bytes),
         }
     return summary
 
 
 def _source_artifacts(run_dir: Path, external_result: dict[str, Any] | None) -> dict[str, Any]:
-    cpu_path, mem_path = _resolve_monitor_paths(run_dir)
+    cpu_path, mem_path, disk_path, net_path = _resolve_monitor_paths(run_dir)
     payload = {
         "summary_json": str(run_dir / "reports" / "summary.json"),
         "case_results_json": str(run_dir / "reports" / "case_results.json"),
         "cpu_status_csv": str(cpu_path),
         "mem_status_csv": str(mem_path),
+        "disk_status_csv": str(disk_path),
+        "net_status_csv": str(net_path),
     }
     if external_result is not None:
         payload["external_result_summary_json"] = str(run_dir / "reports" / "external_result_summary.json")
@@ -574,6 +642,97 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
             return "<tr><td colspan='2' class='muted'>无</td></tr>"
         return "".join(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in mapping.items())
 
+    def _format_duration_ms(value: Any) -> str:
+        try:
+            value_ms = float(value)
+        except Exception:
+            return "0 ms"
+        if value_ms >= 60000:
+            return f"{value_ms / 60000:.2f} min"
+        if value_ms >= 1000:
+            return f"{value_ms / 1000:.2f} s"
+        return f"{value_ms:.0f} ms"
+
+    def render_stage_timing_cards(timing_payload: dict[str, Any]) -> str:
+        duration_distributions = timing_payload.get("duration_distributions", {}) if isinstance(timing_payload, dict) else {}
+        if not duration_distributions:
+            return "<section class='card' style='margin-top: 16px;'><h2>Stage Timing</h2><div class='muted'>无阶段耗时数据</div></section>"
+        preferred_order = [
+            "health_check_seconds",
+            "ingest_seconds",
+            "ingest_session_span_ms",
+            "qa_seconds",
+            "judge_seconds",
+            "stats_seconds",
+        ]
+        ordered_labels = [label for label in preferred_order if label in duration_distributions]
+        ordered_labels.extend(sorted(label for label in duration_distributions if label not in ordered_labels))
+        cards = []
+        for label in ordered_labels:
+            payload = duration_distributions.get(label, {}) or {}
+            cards.append(
+                "<div class='mini-card'>"
+                f"<div class='metric-label'>{esc(label)}</div>"
+                f"<div class='metric-value mini'>{_format_duration_ms(payload.get('mean_ms', 0.0))}</div>"
+                f"<div class='muted'>count={esc(payload.get('count', 0))} · p90={_format_duration_ms(payload.get('p90_ms', 0.0))}</div>"
+                "</div>"
+            )
+        return (
+            "<section class='card' style='margin-top: 16px;'><h2>Stage Timing</h2>"
+            "<div class='muted'>按阶段汇总的耗时卡片，主值显示 mean。</div>"
+            "<div class='mini-grid'>"
+            + "".join(cards)
+            + "</div></section>"
+        )
+
+    def render_stage_timeline(timing_payload: dict[str, Any]) -> str:
+        duration_distributions = timing_payload.get("duration_distributions", {}) if isinstance(timing_payload, dict) else {}
+        if not duration_distributions:
+            return "<section class='card' style='margin-top: 16px;'><h2>Stage Timeline</h2><div class='muted'>无阶段时间轴数据</div></section>"
+        stage_items: list[tuple[str, float]] = []
+        for label in ["health_check_seconds", "ingest_seconds", "qa_seconds", "judge_seconds", "stats_seconds"]:
+            payload = duration_distributions.get(label)
+            if not isinstance(payload, dict):
+                continue
+            stage_items.append((label.removesuffix("_seconds"), float(payload.get("mean_ms", 0.0) or 0.0)))
+        if not stage_items:
+            return "<section class='card' style='margin-top: 16px;'><h2>Stage Timeline</h2><div class='muted'>无阶段时间轴数据</div></section>"
+        total_ms = max(sum(duration for _, duration in stage_items), 1.0)
+        cursor = 0.0
+        bars = []
+        ticks = []
+        palette = ["#0f766e", "#2563eb", "#d97706", "#dc2626", "#7c3aed"]
+        for idx, (label, duration_ms) in enumerate(stage_items):
+            width_pct = max(duration_ms / total_ms * 100.0, 1.2)
+            start_pct = cursor / total_ms * 100.0
+            color = palette[idx % len(palette)]
+            bars.append(
+                "<div class='timeline-row'>"
+                f"<div class='timeline-label'>{esc(label)}</div>"
+                "<div class='timeline-track'>"
+                f"<div class='timeline-bar' style='left:{start_pct:.3f}%; width:{width_pct:.3f}%; background:{color};'></div>"
+                "</div>"
+                f"<div class='timeline-value'>{_format_duration_ms(duration_ms)}</div>"
+                "</div>"
+            )
+            ticks.append(
+                "<tr>"
+                f"<td>{esc(label)}</td>"
+                f"<td>{_format_duration_ms(cursor)}</td>"
+                f"<td>{_format_duration_ms(cursor + duration_ms)}</td>"
+                f"<td>{_format_duration_ms(duration_ms)}</td>"
+                "</tr>"
+            )
+            cursor += duration_ms
+        return (
+            "<section class='card' style='margin-top: 16px;'><h2>Stage Timeline</h2>"
+            "<div class='muted'>按 benchmark 生命周期顺序展示阶段跨度。</div>"
+            + "".join(bars)
+            + "<table style='margin-top:16px;'><thead><tr><th>Stage</th><th>Start</th><th>End</th><th>Duration</th></tr></thead><tbody>"
+            + "".join(ticks)
+            + "</tbody></table></section>"
+        )
+
     def render_resource_chart(title: str, points: list[dict[str, Any]], value_key: str, color: str, unit: str) -> str:
         if not points:
             return f"<section class='card' style='margin-top: 16px;'><h2>{title}</h2><div class='muted'>无采样数据</div></section>"
@@ -613,7 +772,12 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     issues = benchmark_diagnostics.get("issues", {}) if isinstance(benchmark_diagnostics, dict) else {}
     direct_recall_mode = int(issues.get("openviking_direct_recall_only_mode", 0) or 0)
     timing_html = ""
+    stage_timing_cards_html = ""
+    stage_timeline_html = ""
     if analysis.get("timing_report"):
+        timing_payload = analysis["timing_report"].get("report", {}) if isinstance(analysis["timing_report"], dict) else {}
+        stage_timing_cards_html = render_stage_timing_cards(timing_payload)
+        stage_timeline_html = render_stage_timeline(timing_payload)
         timing_html = (
             "<section class='card'><h2>Timing Report</h2><table><tbody>"
             + render_mapping(analysis["timing_report"])
@@ -637,6 +801,8 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     timeline_points = timeline.get("points", []) if isinstance(timeline, dict) else []
     cpu_chart = render_resource_chart("CPU Usage Timeline", timeline_points, "cpu_user", "#0f766e", "%")
     mem_chart = render_resource_chart("Memory Usage Timeline", timeline_points, "mem_used_mb", "#2563eb", "MB")
+    disk_chart = render_resource_chart("Disk I/O Timeline", timeline_points, "disk_bw_mb", "#b45309", "MB/s")
+    net_chart = render_resource_chart("Network I/O Timeline", timeline_points, "recv_bytes_rate", "#7c3aed", "B/s")
     qa_mode_html = ""
     if direct_recall_mode > 0:
         qa_mode_html = (
@@ -674,15 +840,23 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     h1, h2 {{ margin: 0 0 12px; }}
     .metric-label {{ color: var(--muted); font-size: 13px; }}
     .metric-value {{ font-size: 28px; font-weight: 700; margin-top: 8px; }}
+    .metric-value.mini {{ font-size: 22px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }}
     .muted {{ color: var(--muted); }}
     ul {{ margin: 0; padding-left: 18px; line-height: 1.8; }}
+    .mini-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }}
+    .mini-card {{ background: #f8fafc; border: 1px solid var(--line); border-radius: 12px; padding: 14px; }}
     .resource-chart {{ width: 100%; height: auto; margin-top: 12px; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; }}
     .phase-marker {{ stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 4 4; }}
     .phase-label {{ fill: #64748b; font-size: 10px; }}
+    .timeline-row {{ display: grid; grid-template-columns: 140px 1fr 110px; gap: 12px; align-items: center; margin-top: 12px; }}
+    .timeline-label, .timeline-value {{ font-size: 13px; }}
+    .timeline-track {{ position: relative; height: 14px; background: #e5edf5; border-radius: 999px; overflow: hidden; }}
+    .timeline-bar {{ position: absolute; top: 0; bottom: 0; border-radius: 999px; }}
     @media (max-width: 960px) {{ .grid, .sections {{ grid-template-columns: 1fr 1fr; }} }}
-    @media (max-width: 680px) {{ .grid, .sections {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 960px) {{ .mini-grid {{ grid-template-columns: 1fr 1fr; }} }}
+    @media (max-width: 680px) {{ .grid, .sections, .mini-grid {{ grid-template-columns: 1fr; }} .timeline-row {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -698,6 +872,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <div class="card"><div class="metric-label">EntryPoint</div><div class="metric-value">{esc(analysis.get("entrypoint_kind"))}</div></div>
     </section>
     {qa_mode_html}
+    {stage_timing_cards_html}
     <section class="sections">
       <section class="card"><h2>Failure Summary</h2><table><tbody>{render_mapping(analysis.get("failure_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Resource Summary</h2><table><tbody>{render_mapping(analysis.get("resource_summary", {}))}</tbody></table></section>
@@ -706,8 +881,11 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <section class="card"><h2>Category Summary</h2><table><tbody>{render_mapping(analysis.get("category_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Artifacts</h2><table><tbody>{render_mapping(analysis.get("source_artifacts", {}))}</tbody></table></section>
     </section>
+    {stage_timeline_html}
     {cpu_chart}
     {mem_chart}
+    {disk_chart}
+    {net_chart}
     {phase_html}
     {timing_html}
     {chain_html}

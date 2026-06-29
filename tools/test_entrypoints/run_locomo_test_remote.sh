@@ -17,6 +17,7 @@ else
 fi
 REMOTE_OUTPUT_DIR="/tmp/locomo_test_output/${RUN_ID}"
 REMOTE_MONITOR_DIR="${REMOTE_OUTPUT_DIR}/monitor"
+REMOTE_PID_FILE="${REMOTE_MONITOR_DIR}/target_pids.json"
 LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openviking-small-stable.toml}"
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"
 OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-${RUN_ID}}"
@@ -79,28 +80,45 @@ echo \$\$ > "\$LOCK_FILE"
 cd "${REMOTE_ROOT}"
 export PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform"
 mkdir -p "${REMOTE_OUTPUT_DIR}" "${REMOTE_MONITOR_DIR}"
+printf '{}\n' > "${REMOTE_PID_FILE}"
 
 (
-python3 - "${REMOTE_MONITOR_DIR}" <<'PY'
+python3 - "${REMOTE_MONITOR_DIR}" "${REMOTE_PID_FILE}" <<'PY'
 from __future__ import annotations
 
 import csv
+import json
+import os
 import signal
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 out_dir = Path(sys.argv[1])
+pid_file = Path(sys.argv[2])
 out_dir.mkdir(parents=True, exist_ok=True)
 cpu_path = out_dir / "cpu_status.csv"
 mem_path = out_dir / "mem_status.csv"
+disk_path = out_dir / "disk_status.csv"
+net_path = out_dir / "net_status.csv"
 with cpu_path.open("w", encoding="utf-8", newline="") as handle:
     csv.writer(handle).writerow(["timestamp", "summary_util_user", "summary_util_sys", "summary_util_idle"])
 with mem_path.open("w", encoding="utf-8", newline="") as handle:
     csv.writer(handle).writerow(["timestamp", "mem_free_mb", "mem_used_mb"])
+with disk_path.open("w", encoding="utf-8", newline="") as handle:
+    csv.writer(handle).writerow(["timestamp", "read_bw_mb", "write_bw_mb", "disk_bw_mb", "disk_free_mb"])
+with net_path.open("w", encoding="utf-8", newline="") as handle:
+    csv.writer(handle).writerow(["timestamp", "recv_pcks_rate", "sent_pcks_rate", "recv_bytes_rate", "sent_bytes_rate"])
 
 running = True
+last_cpu = None
+last_io = None
+last_net = None
+last_ts = None
+clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+cpu_count = os.cpu_count() or 1
 
 def _stop(signum, frame):
     del signum, frame
@@ -110,35 +128,198 @@ def _stop(signum, frame):
 signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
 
-def _read_cpu():
-    cpu_line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
-    parts = cpu_line.split()[1:]
-    values = [float(item) for item in parts[:7]]
-    total = sum(values) or 1.0
-    return round(values[0] / total * 100, 2), round(values[2] / total * 100, 2), round(values[3] / total * 100, 2)
+def _load_target_roots() -> list[int]:
+    try:
+        payload = json.loads(pid_file.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    roots = []
+    if isinstance(payload, dict):
+        for value in payload.values():
+            try:
+                pid = int(value)
+            except Exception:
+                continue
+            if pid > 0 and Path(f"/proc/{pid}").exists():
+                roots.append(pid)
+    return roots
 
-def _read_mem():
-    meminfo = {}
-    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
-        key, value = line.split(":", 1)
-        meminfo[key] = float(value.strip().split()[0])
-    total_mb = meminfo.get("MemTotal", 0.0) / 1024.0
-    available_mb = meminfo.get("MemAvailable", 0.0) / 1024.0
-    used_mb = max(0.0, total_mb - available_mb)
-    return round(available_mb, 2), round(used_mb, 2)
+def _proc_stat(pid: int) -> tuple[int, int] | None:
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except Exception:
+        return None
+    end = text.rfind(")")
+    if end < 0:
+        return None
+    rest = text[end + 2 :].split()
+    if len(rest) < 13:
+        return None
+    try:
+        ppid = int(rest[1])
+        utime = int(rest[11])
+        stime = int(rest[12])
+    except Exception:
+        return None
+    return ppid, utime + stime
+
+def _resolve_tree_pids(roots: Iterable[int]) -> list[int]:
+    root_set = {int(pid) for pid in roots if int(pid) > 0}
+    if not root_set:
+        return []
+    children: dict[int, list[int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        stat = _proc_stat(int(entry.name))
+        if stat is None:
+            continue
+        ppid, _ = stat
+        children.setdefault(ppid, []).append(int(entry.name))
+    resolved = set(root_set)
+    stack = list(root_set)
+    while stack:
+        current = stack.pop()
+        for child in children.get(current, []):
+            if child not in resolved:
+                resolved.add(child)
+                stack.append(child)
+    return sorted(resolved)
+
+def _read_process_cpu_ticks(pids: Iterable[int]) -> tuple[int, int]:
+    user_ticks = 0
+    sys_ticks = 0
+    for pid in pids:
+        try:
+            text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except Exception:
+            continue
+        end = text.rfind(")")
+        if end < 0:
+            continue
+        rest = text[end + 2 :].split()
+        if len(rest) < 13:
+            continue
+        try:
+            user_ticks += int(rest[11])
+            sys_ticks += int(rest[12])
+        except Exception:
+            continue
+    return user_ticks, sys_ticks
+
+def _read_process_rss_mb(pids: Iterable[int]) -> tuple[float, float]:
+    used_mb = 0.0
+    for pid in pids:
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    used_mb += float(line.split(":", 1)[1].strip().split()[0]) / 1024.0
+                    break
+        except Exception:
+            continue
+    return 0.0, round(used_mb, 2)
+
+def _read_process_io_bytes(pids: Iterable[int]) -> tuple[int, int]:
+    read_bytes = 0
+    write_bytes = 0
+    for pid in pids:
+        try:
+            rows = Path(f"/proc/{pid}/io").read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for row in rows:
+            if row.startswith("read_bytes:"):
+                read_bytes += int(row.split(":", 1)[1].strip())
+            elif row.startswith("write_bytes:"):
+                write_bytes += int(row.split(":", 1)[1].strip())
+    return read_bytes, write_bytes
+
+def _read_net():
+    for line in Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()[2:]:
+        if ":" not in line:
+            continue
+        iface, payload = line.split(":", 1)
+        if iface.strip() != "lo":
+            continue
+        parts = payload.split()
+        if len(parts) < 16:
+            break
+        return float(parts[1]), float(parts[9]), float(parts[0]), float(parts[8])
+    return 0.0, 0.0, 0.0, 0.0
 
 while running:
+    roots = _load_target_roots()
+    pids = _resolve_tree_pids(roots)
     ts = datetime.now().isoformat()
-    user, system, idle = _read_cpu()
-    free_mb, used_mb = _read_mem()
+    now = time.monotonic()
+    user_ticks, sys_ticks = _read_process_cpu_ticks(pids)
+    free_mb, used_mb = _read_process_rss_mb(pids)
+    read_bytes, write_bytes = _read_process_io_bytes(pids)
+    recv_pcks, sent_pcks, recv_bytes, sent_bytes = _read_net()
+
+    user = 0.0
+    system = 0.0
+    idle = 100.0
+    read_bw_mb = 0.0
+    write_bw_mb = 0.0
+    recv_pcks_rate = 0.0
+    sent_pcks_rate = 0.0
+    recv_bytes_rate = 0.0
+    sent_bytes_rate = 0.0
+    if last_ts is not None:
+        elapsed = max(0.001, now - last_ts)
+        if last_cpu is not None:
+            delta_user = max(0, user_ticks - last_cpu[0])
+            delta_sys = max(0, sys_ticks - last_cpu[1])
+            total_cpu_pct = (delta_user + delta_sys) / (elapsed * clk_tck * cpu_count) * 100.0
+            user = round(delta_user / (elapsed * clk_tck * cpu_count) * 100.0, 2)
+            system = round(delta_sys / (elapsed * clk_tck * cpu_count) * 100.0, 2)
+            idle = round(max(0.0, 100.0 - total_cpu_pct), 2)
+        if last_io is not None:
+            read_bw_mb = round(max(0, read_bytes - last_io[0]) / elapsed / (1024.0 * 1024.0), 4)
+            write_bw_mb = round(max(0, write_bytes - last_io[1]) / elapsed / (1024.0 * 1024.0), 4)
+        if last_net is not None:
+            recv_pcks_rate = round(max(0.0, recv_pcks - last_net[0]) / elapsed, 4)
+            sent_pcks_rate = round(max(0.0, sent_pcks - last_net[1]) / elapsed, 4)
+            recv_bytes_rate = round(max(0.0, recv_bytes - last_net[2]) / elapsed, 4)
+            sent_bytes_rate = round(max(0.0, sent_bytes - last_net[3]) / elapsed, 4)
+    last_ts = now
+    last_cpu = (user_ticks, sys_ticks)
+    last_io = (read_bytes, write_bytes)
+    last_net = (recv_pcks, sent_pcks, recv_bytes, sent_bytes)
+
     with cpu_path.open("a", encoding="utf-8", newline="") as handle:
         csv.writer(handle).writerow([ts, user, system, idle])
     with mem_path.open("a", encoding="utf-8", newline="") as handle:
         csv.writer(handle).writerow([ts, free_mb, used_mb])
+    with disk_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow([ts, read_bw_mb, write_bw_mb, round(read_bw_mb + write_bw_mb, 4), 0.0])
+    with net_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow([ts, recv_pcks_rate, sent_pcks_rate, recv_bytes_rate, sent_bytes_rate])
     time.sleep(1.0)
 PY
 ) &
 MONITOR_PID=\$!
+
+write_pid_registry() {
+  python3 - "${REMOTE_PID_FILE}" "\$1" "\$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = int(sys.argv[3])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    payload = {}
+if not isinstance(payload, dict):
+    payload = {}
+payload[key] = value
+path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
 
 python3 - "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" "${RUN_ID}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
 import json
@@ -198,6 +379,8 @@ print(json.dumps(payload, ensure_ascii=False))
 PY
 
 nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &
+OPENVIKING_PID=\$!
+write_pid_registry openviking "\${OPENVIKING_PID}"
 for _ in \$(seq 1 60); do
   if curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then
     cat /tmp/"${RUN_ID}"_ov_health.json
@@ -228,6 +411,8 @@ PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.
 # shellcheck disable=SC1090
 source "${OPENCLAW_ENV}" 2>/dev/null || true
 nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" OPENVIKING_BASE_URL="${OPENVIKING_BASE_URL:-http://127.0.0.1:${OPENVIKING_PORT}}" OPENVIKING_API_KEY="${OPENVIKING_API_KEY:-}" openclaw gateway >"${GW_LOG}" 2>&1 &
+OPENCLAW_GATEWAY_PID=\$!
+write_pid_registry openclaw_gateway "\${OPENCLAW_GATEWAY_PID}"
 for _ in \$(seq 1 30); do
   if curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then
     cat /tmp/"${RUN_ID}"_gw_health.json
@@ -242,7 +427,10 @@ if ! curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/dev/null 2>&
   exit 1
 fi
 
-PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"
+PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml" &
+LOCOMO_RUNNER_PID=\$!
+write_pid_registry locomo_runner "\${LOCOMO_RUNNER_PID}"
+wait "\${LOCOMO_RUNNER_PID}"
 INNER
 
 mkdir -p "${LOCAL_OUTPUT_ROOT}"

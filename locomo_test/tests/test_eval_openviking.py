@@ -2,6 +2,7 @@ import json
 
 from locomo_test.config import Config, SessionConfig, SessionPolicy
 from locomo_test.eval import (
+    _send_message_with_retry_diagnostics,
     _process_single_question,
     build_ingest_input_message,
     build_qa_input_message,
@@ -10,6 +11,7 @@ from locomo_test.eval import (
     get_openviking_ingest_max_blocks,
     normalize_ov_task_query_mode,
     query_ov_search_find_memories,
+    query_ov_task_token_usage,
     rerank_ov_recalled_memories,
     run_ingest,
     run_qa,
@@ -104,6 +106,50 @@ def test_should_skip_openviking_qa_commit_defaults_to_true_for_qa_sessions(monke
 def test_should_skip_openviking_qa_commit_can_be_overridden(monkeypatch):
     monkeypatch.setenv("LOCOMO_OPENVIKING_QA_COMMIT", "true")
     assert should_skip_openviking_qa_commit("qa-conv-26-q1") is False
+
+
+def test_send_message_with_retry_diagnostics_reports_attempts(monkeypatch):
+    seen = {"count": 0}
+
+    def _send(*args, **kwargs):
+        seen["count"] += 1
+        if seen["count"] < 2:
+            raise RuntimeError("temporary failure")
+        return "OK", {"total_tokens": 3}
+
+    monkeypatch.setattr("locomo_test.eval.send_message", _send)
+    monkeypatch.setenv("LOCOMO_GATEWAY_RETRY_BACKOFF_SECONDS", "0.01")
+
+    reply, usage, diag = _send_message_with_retry_diagnostics("u", "t", "user", "msg", 2, "agent", "sess")
+
+    assert reply == "OK"
+    assert usage["total_tokens"] == 3
+    assert diag["attempts"] == 2
+    assert diag["retries_configured"] == 2
+    assert diag["elapsed_seconds"] >= 0
+
+
+def test_query_ov_task_token_usage_return_diag_reports_timeout(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"result": {"status": "running"}}
+
+    monkeypatch.setattr("locomo_test.eval._ov_request_headers", lambda **kwargs: {"Authorization": "Bearer x"})
+    monkeypatch.setattr("locomo_test.eval.requests.get", lambda *args, **kwargs: _Resp())
+    monkeypatch.setattr("locomo_test.eval.time.sleep", lambda *_args, **_kwargs: None)
+
+    result, diag = query_ov_task_token_usage(
+        "http://ov",
+        "task-1",
+        max_wait=0,
+        return_diag=True,
+    )
+
+    assert result is None
+    assert diag["timed_out"] is True
 
 
 def test_build_qa_input_message_includes_direct_recall_evidence(monkeypatch):
@@ -232,16 +278,32 @@ def test_run_ingest_commits_openviking_session_after_message(monkeypatch, tmp_pa
     output_dir.mkdir()
 
     monkeypatch.setattr(
-        "locomo_test.eval.send_message_with_retry",
-        lambda *args, **kwargs: ("OK", {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2}),
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
     )
     monkeypatch.setattr(
         "locomo_test.eval.get_session_id_from_key",
         lambda *args, **kwargs: (session_file.name, str(tmp_path)),
     )
     monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: session_file.name)
-    monkeypatch.setattr("locomo_test.eval.wait_for_ov_latest_task", lambda *args, **kwargs: None)
-    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "timeout"},
+        ) if kwargs.get("return_diag") else None,
+    )
+    monkeypatch.setattr(
+        "locomo_test.eval.query_ov_task_token_usage",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
 
     committed = []
 
@@ -291,8 +353,12 @@ def test_run_ingest_retries_session_lookup_before_failing(monkeypatch, tmp_path)
     output_dir.mkdir()
 
     monkeypatch.setattr(
-        "locomo_test.eval.send_message_with_retry",
-        lambda *args, **kwargs: ("OK", {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2}),
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
     )
 
     lookup_calls = {"count": 0}
@@ -305,8 +371,20 @@ def test_run_ingest_retries_session_lookup_before_failing(monkeypatch, tmp_path)
 
     monkeypatch.setattr("locomo_test.eval.get_session_id_from_key", _lookup)
     monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: session_file.name)
-    monkeypatch.setattr("locomo_test.eval.wait_for_ov_latest_task", lambda *args, **kwargs: None)
-    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "timeout"},
+        ) if kwargs.get("return_diag") else None,
+    )
+    monkeypatch.setattr(
+        "locomo_test.eval.query_ov_task_token_usage",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
     monkeypatch.setattr("locomo_test.eval.time.sleep", lambda *args, **kwargs: None)
 
     committed = []
@@ -360,13 +438,29 @@ def test_run_ingest_falls_back_to_latest_session_file_when_index_missing(monkeyp
     output_dir.mkdir()
 
     monkeypatch.setattr(
-        "locomo_test.eval.send_message_with_retry",
-        lambda *args, **kwargs: ("OK", {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2}),
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
     )
     monkeypatch.setattr("locomo_test.eval.get_session_id_from_key", lambda *args, **kwargs: None)
     monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: session_file.name)
-    monkeypatch.setattr("locomo_test.eval.wait_for_ov_latest_task", lambda *args, **kwargs: None)
-    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "timeout"},
+        ) if kwargs.get("return_diag") else None,
+    )
+    monkeypatch.setattr(
+        "locomo_test.eval.query_ov_task_token_usage",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
     monkeypatch.setattr("locomo_test.eval.time.sleep", lambda *args, **kwargs: None)
 
     committed = []
@@ -415,8 +509,12 @@ def test_run_ingest_falls_back_to_session_id_from_openclaw_log(monkeypatch, tmp_
     output_dir.mkdir()
 
     monkeypatch.setattr(
-        "locomo_test.eval.send_message_with_retry",
-        lambda *args, **kwargs: ("OK", {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2}),
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
     )
     monkeypatch.setattr("locomo_test.eval.get_session_id_from_key", lambda *args, **kwargs: None)
     monkeypatch.setattr("locomo_test.eval.time.sleep", lambda *args, **kwargs: None)
@@ -426,8 +524,20 @@ def test_run_ingest_falls_back_to_session_id_from_openclaw_log(monkeypatch, tmp_
         lambda *args, **kwargs: ("from-log-session.jsonl", str(tmp_path)),
     )
     monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: "from-log-session.jsonl")
-    monkeypatch.setattr("locomo_test.eval.wait_for_ov_latest_task", lambda *args, **kwargs: None)
-    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "timeout"},
+        ) if kwargs.get("return_diag") else None,
+    )
+    monkeypatch.setattr(
+        "locomo_test.eval.query_ov_task_token_usage",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
 
     committed = []
 
@@ -1149,16 +1259,32 @@ def test_run_ingest_passes_explicit_keep_recent_count_override(monkeypatch, tmp_
     cfg.openviking.keep_recent_count = 0
 
     monkeypatch.setattr(
-        "locomo_test.eval.send_message_with_retry",
-        lambda *args, **kwargs: ("OK", {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2}),
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
     )
     monkeypatch.setattr(
         "locomo_test.eval.get_session_id_from_key",
         lambda *args, **kwargs: (session_file.name, str(tmp_path)),
     )
     monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: session_file.name)
-    monkeypatch.setattr("locomo_test.eval.wait_for_ov_latest_task", lambda *args, **kwargs: None)
-    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "timeout"},
+        ) if kwargs.get("return_diag") else None,
+    )
+    monkeypatch.setattr(
+        "locomo_test.eval.query_ov_task_token_usage",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
 
     committed = []
 
@@ -1209,8 +1335,12 @@ def test_run_ingest_uses_longer_openviking_task_wait_override(monkeypatch, tmp_p
 
     monkeypatch.setenv("LOCOMO_OPENVIKING_INGEST_TASK_WAIT_SECONDS", "900")
     monkeypatch.setattr(
-        "locomo_test.eval.send_message_with_retry",
-        lambda *args, **kwargs: ("OK", {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2}),
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
     )
     monkeypatch.setattr(
         "locomo_test.eval.get_session_id_from_key",
@@ -1223,11 +1353,17 @@ def test_run_ingest_uses_longer_openviking_task_wait_override(monkeypatch, tmp_p
 
     def _query_task(*args, **kwargs):
         seen["max_wait"] = kwargs.get("max_wait")
-        return None
+        return (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None
 
     def _wait_latest(*args, **kwargs):
         seen["fallback_max_wait"] = kwargs.get("max_wait")
-        return None
+        return (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "timeout"},
+        ) if kwargs.get("return_diag") else None
 
     monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", _query_task)
     monkeypatch.setattr("locomo_test.eval.wait_for_ov_latest_task", _wait_latest)

@@ -21,12 +21,19 @@ def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
     assert 'OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"' in text
     assert 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-/root/.openviking/venv-0.3.24/bin/python}"' in text
     assert 'REMOTE_MONITOR_DIR="${REMOTE_OUTPUT_DIR}/monitor"' in text
+    assert 'REMOTE_PID_FILE="${REMOTE_MONITOR_DIR}/target_pids.json"' in text
     assert 'pick_random_port() {' in text
     assert 'OPENVIKING_PORT="$(pick_random_port)"' in text
     assert 'OPENCLAW_GATEWAY_PORT="$(pick_random_port)"' in text
     assert 'MONITOR_PID=\\$!' in text
     assert 'cpu_status.csv' in text
     assert 'mem_status.csv' in text
+    assert 'disk_status.csv' in text
+    assert 'net_status.csv' in text
+    assert 'write_pid_registry() {' in text
+    assert 'OPENVIKING_PID=\\$!' in text
+    assert 'OPENCLAW_GATEWAY_PID=\\$!' in text
+    assert 'LOCOMO_RUNNER_PID=\\$!' in text
     assert 'env_toml_path = config_path.parent / "env.toml"' in text
     assert '"provider": "openai"' in text
     assert '"backend": "openai"' in text
