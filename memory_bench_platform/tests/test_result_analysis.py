@@ -79,6 +79,22 @@ def _write_master_log(run_dir: Path, text: str) -> None:
 def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     run_dir = tmp_path / "run-1"
     _build_minimal_run(run_dir)
+    (run_dir / "artifacts" / "monitor" / "cpu_status.csv").write_text(
+        "timestamp,summary_util_user,summary_util_sys,summary_util_idle\n"
+        "2026-01-01T00:00:00,10.0,5.0,85.0\n"
+        "2026-01-01T00:00:06,20.0,6.0,74.0\n"
+        "2026-01-01T00:00:16,30.0,7.0,63.0\n"
+        "2026-01-01T00:00:36,40.0,8.0,52.0\n",
+        encoding="utf-8",
+    )
+    (run_dir / "artifacts" / "monitor" / "mem_status.csv").write_text(
+        "timestamp,mem_free_mb,mem_used_mb\n"
+        "2026-01-01T00:00:00,1000.0,2000.0\n"
+        "2026-01-01T00:00:06,900.0,2100.0\n"
+        "2026-01-01T00:00:16,800.0,2200.0\n"
+        "2026-01-01T00:00:36,700.0,2300.0\n",
+        encoding="utf-8",
+    )
     _write_master_log(
         run_dir,
         "[phaseA][session 1/4][direct-ov] session_1 task=t1 session_id=s1 memories=0\n"
@@ -154,6 +170,7 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
             {
                 "issues": {
                     "openviking_memory_written_but_index_unavailable": 1,
+                    "openviking_direct_recall_only_mode": 1,
                 }
             }
         ),
@@ -184,13 +201,20 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
 
     assert analysis["overall_accuracy"] == 0.5
     assert analysis["failure_summary"]["retrieval_miss_count"] == 1
-    assert analysis["resource_summary"]["cpu_user_peak"] == 20.0
-    assert analysis["resource_summary"]["mem_used_peak_mb"] == 2100.0
+    assert analysis["resource_summary"]["cpu_user_peak"] == 40.0
+    assert analysis["resource_summary"]["mem_used_peak_mb"] == 2300.0
+    assert analysis["resource_timeline"]["sample_count"] == 4
     assert analysis["ingest_summary"]["session_total"] == 2
     assert analysis["ingest_summary"]["zero_memory_sessions"] == 1
     assert analysis["benchmark_diagnostics"]["source"] == "locomo_test"
     assert analysis["chain_diagnostics"]["source"] == "locomo_test"
+    assert any("direct recall" in note for note in analysis["analysis_notes"])
     assert analysis["chain_diagnostics"]["timing"]["steps"]["qa_seconds"] == 20.0
+    assert [item["label"] for item in analysis["resource_timeline"]["phases"]] == ["health_check", "ingest", "qa"]
+    assert analysis["resource_phase_summary"]["health_check"]["cpu_user_avg"] == 10.0
+    assert analysis["resource_phase_summary"]["ingest"]["cpu_user_avg"] == 20.0
+    assert analysis["resource_phase_summary"]["qa"]["cpu_user_avg"] == 30.0
+    assert analysis["resource_phase_summary"]["qa"]["mem_used_peak_mb"] == 2200.0
     assert (run_dir / "reports" / "analysis.json").is_file()
     assert (run_dir / "reports" / "analysis.md").is_file()
     assert (run_dir / "reports" / "run_report.html").is_file()
@@ -200,7 +224,13 @@ def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     report_html = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
     assert "memory_recalled_with_consistency_gap" in report_html
     assert "openviking_memory_written_but_index_unavailable" in report_html
+    assert "qa_direct_recall_only" in report_html
+    assert "有效模式" in report_html
     assert "Chain Diagnostics" in report_html
+    assert "CPU Usage Timeline" in report_html
+    assert "Memory Usage Timeline" in report_html
+    assert "Resource Phases" in report_html
+    assert "health_check" in report_html
 
 
 def test_analyze_run_refreshes_external_result_and_summary_from_external_artifacts(tmp_path: Path):
@@ -234,12 +264,102 @@ def test_analyze_run_refreshes_external_result_and_summary_from_external_artifac
     case_results = json.loads((run_dir / "reports" / "case_results.json").read_text(encoding="utf-8"))
 
     assert analysis["overall_accuracy"] == 0.5
-    assert summary["status"] == "failed"
+    assert summary["status"] == "passed"
     assert summary["case_total"] == 2
     assert summary["case_passed"] == 1
     assert summary["case_failed"] == 1
     assert external["summary"]["total_graded"] == 2
     assert len(case_results) == 2
+
+
+def test_analyze_run_preserves_partial_status_for_invalid_locomo_result(tmp_path: Path):
+    run_dir = tmp_path / "run-invalid"
+    _build_minimal_run(run_dir)
+    (run_dir / "records").mkdir(parents=True, exist_ok=True)
+    (run_dir / "records" / "external_entrypoint.json").write_text(
+        json.dumps({"entrypoint_id": "locomo_test_remote", "benchmark_id": "locomo", "agent_id": "openclaw"}),
+        encoding="utf-8",
+    )
+    artifacts = run_dir / "external_artifacts" / "locomo_test_remote"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "qa_results.csv").write_text(
+        "\n".join(
+            [
+                "sample_id,qi,question,expected,response,category,result,reasoning",
+                "conv-1,1,Q1,A1,R1,1,WRONG,bad",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.0,
+                "total_correct": 0,
+                "total_graded": 1,
+                "total_questions": 1,
+                "memory_token_totals": {
+                    "provider": "openviking",
+                    "llm_total": 0,
+                    "embedding": 0,
+                    "memories": 0,
+                },
+                "ov_closure_summary": {
+                    "dominant_state": "qa_direct_recall_only",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "qa_diagnostics.json").write_text(
+        json.dumps({"issues": {"openviking_tokens_all_zero": 1}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "source_id": "locomo:locomo_test_remote",
+                "source_kind": "external_benchmark_runner",
+                "agent_id": "openclaw",
+                "status": "partial",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "reports" / "summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "status": "partial",
+                "case_total": 1,
+                "case_passed": 0,
+                "case_failed": 1,
+                "category_summary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "reports" / "case_results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "case_id": "conv-1-q1",
+                    "question": "Q1",
+                    "expected_answer": "A1",
+                    "response": "R1",
+                    "passed": False,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    analysis = analyze_run(run_dir)
+    external = json.loads((run_dir / "reports" / "external_result_summary.json").read_text(encoding="utf-8"))
+
+    assert external["summary"]["run_validity"]["valid"] is False
+    assert analysis["benchmark_diagnostics"]["run_validity"]["valid"] is False
 
 
 def test_analyze_run_writes_timing_report_for_official_sample0(tmp_path: Path):

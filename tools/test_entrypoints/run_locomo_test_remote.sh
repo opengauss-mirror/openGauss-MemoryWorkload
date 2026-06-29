@@ -7,18 +7,24 @@ REMOTE_CONTAINER="${REMOTE_CONTAINER:-jcp-dev}"
 REMOTE_ROOT="${REMOTE_ROOT:-/tmp/locomo_test}"
 REMOTE_LOCK_DIR="${REMOTE_LOCK_DIR:-/tmp/locomo-entrypoint-locks}"
 RUN_ID="${RUN_ID:-locomo_test_remote_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
 LOCAL_OUTPUT_ROOT="${LOCAL_OUTPUT_ROOT:-/tmp/locomo_test_output}"
-LOCAL_OUTPUT_DIR="${LOCAL_OUTPUT_ROOT}/${RUN_ID}"
+if [ -n "${OUTPUT_DIR}" ]; then
+  LOCAL_OUTPUT_DIR="${OUTPUT_DIR}"
+  LOCAL_OUTPUT_ROOT="$(dirname "${OUTPUT_DIR}")"
+else
+  LOCAL_OUTPUT_DIR="${LOCAL_OUTPUT_ROOT}/${RUN_ID}"
+fi
 REMOTE_OUTPUT_DIR="/tmp/locomo_test_output/${RUN_ID}"
 REMOTE_MONITOR_DIR="${REMOTE_OUTPUT_DIR}/monitor"
 LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openviking-small-stable.toml}"
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"
 OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-${RUN_ID}}"
 OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"
-OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-$(python3 -c 'import sys; s=sum(ord(c) for c in sys.argv[1]); print(28000 + (s % 1000))' "${RUN_ID}")}"
+OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-}"
 OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"
 OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-${RUN_ID}}"
-OPENVIKING_PORT="${OPENVIKING_PORT:-$(python3 -c 'import sys; s=sum(ord(c) for c in sys.argv[1]); print(22000 + (s % 1000))' "${RUN_ID}")}"
+OPENVIKING_PORT="${OPENVIKING_PORT:-}"
 OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"
 OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"
 OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-/root/.openviking/venv-0.3.24/bin/python}"
@@ -27,6 +33,21 @@ GW_LOG="${GW_LOG:-/tmp/${RUN_ID}_openclaw_gateway.log}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+pick_random_port() {
+python3 - <<'PY'
+import random
+
+print(random.randint(30000, 45000))
+PY
+}
+
+if [ -z "${OPENVIKING_PORT}" ]; then
+  OPENVIKING_PORT="$(pick_random_port)"
+fi
+if [ -z "${OPENCLAW_GATEWAY_PORT}" ]; then
+  OPENCLAW_GATEWAY_PORT="$(pick_random_port)"
+fi
 
 TMP_TAR="$(mktemp)"
 trap 'rm -f "${TMP_TAR}"' EXIT
@@ -59,7 +80,8 @@ cd "${REMOTE_ROOT}"
 export PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform"
 mkdir -p "${REMOTE_OUTPUT_DIR}" "${REMOTE_MONITOR_DIR}"
 
-python3 - "${REMOTE_MONITOR_DIR}" <<'PY' &
+(
+python3 - "${REMOTE_MONITOR_DIR}" <<'PY'
 from __future__ import annotations
 
 import csv
@@ -115,7 +137,8 @@ while running:
         csv.writer(handle).writerow([ts, free_mb, used_mb])
     time.sleep(1.0)
 PY
-MONITOR_PID=$!
+) &
+MONITOR_PID=\$!
 
 python3 - "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" "${RUN_ID}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
 import json
@@ -141,9 +164,33 @@ payload = {
 }
 base_ov_conf = Path("/root/.openviking/ov.conf")
 ov_conf = json.loads(base_ov_conf.read_text(encoding="utf-8"))
+env_toml_path = config_path.parent / "env.toml"
+env_cfg = tomllib.loads(env_toml_path.read_text(encoding="utf-8")) if env_toml_path.exists() else {}
+llm_cfg = env_cfg.get("llm", {}) if isinstance(env_cfg, dict) else {}
+chat_cfg = llm_cfg.get("chat", {}) if isinstance(llm_cfg, dict) else {}
+embedding_cfg = llm_cfg.get("embedding", {}) if isinstance(llm_cfg, dict) else {}
 ov_conf.setdefault("server", {})["port"] = ov_port
 ov_conf.setdefault("storage", {})["workspace"] = str(ov_data_dir)
 ov_conf.setdefault("memory", {}).pop("wm_v2_preprocess_enabled", None)
+ov_conf["vlm"] = {
+    "provider": "openai_compatible",
+    "api_key": str(chat_cfg.get("api_key", "")),
+    "model": str(chat_cfg.get("model", "gpt-5.4-mini")),
+    "api_base": str(chat_cfg.get("base_url", "https://codex.jemmy.icu/v1")),
+    "temperature": 0.1,
+    "max_retries": 3,
+}
+ov_conf["embedding"] = {
+    "dense": {
+        "backend": "openai",
+        "provider": "openai",
+        "api_key": str(embedding_cfg.get("api_key", "dummy")),
+        "model": str(embedding_cfg.get("model", "Qwen/Qwen3-Embedding-0.6B")),
+        "api_base": str(embedding_cfg.get("base_url", "http://127.0.0.1:18080/v1")),
+        "dimension": int(embedding_cfg.get("dimension", 1024) or 1024),
+        "input": "text",
+    }
+}
 ov_conf_path.parent.mkdir(parents=True, exist_ok=True)
 ov_data_dir.mkdir(parents=True, exist_ok=True)
 ov_conf_path.write_text(json.dumps(ov_conf, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -165,7 +212,7 @@ if ! curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/dev/null 2>&1; the
   exit 1
 fi
 
-PYTHONPATH="${PYTHONPATH}" python3 -m locomo_test.bootstrap_remote_runtime \
+PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.bootstrap_remote_runtime \
   --base-state-dir /root/.openclaw \
   --base-ov-conf "${OV_CONF_PATH}" \
   --state-dir "${OPENCLAW_STATE_DIR}" \
@@ -195,7 +242,7 @@ if ! curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/dev/null 2>&
   exit 1
 fi
 
-PYTHONPATH="${PYTHONPATH}" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"
+PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"
 INNER
 
 mkdir -p "${LOCAL_OUTPUT_ROOT}"

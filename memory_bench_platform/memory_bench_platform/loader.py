@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .manifests import AgentManifest, BenchmarkManifest
+from .manifests import AgentManifest, BenchmarkManifest, SmokeManifest
 
 
 def _load_yaml(path: Path) -> dict:
@@ -21,11 +21,21 @@ def load_agent_skill(skills_root: Path, agent_id: str) -> AgentManifest:
     return AgentManifest.model_validate(_load_yaml(manifest_path))
 
 
+def load_smoke_skill(skills_root: Path, smoke_id: str) -> SmokeManifest:
+    manifest_path = skills_root / "smoke" / smoke_id / "manifest.yaml"
+    return SmokeManifest.model_validate(_load_yaml(manifest_path))
+
+
 def load_all_skills(skills_root: Path) -> dict[str, list]:
     benchmarks = []
     agents = []
+    smokes = []
     for manifest_path in sorted((skills_root / "benchmarks").glob("*/manifest.yaml")):
         benchmarks.append(BenchmarkManifest.model_validate(_load_yaml(manifest_path)))
     for manifest_path in sorted((skills_root / "agents").glob("*/manifest.yaml")):
         agents.append(AgentManifest.model_validate(_load_yaml(manifest_path)))
-    return {"benchmarks": benchmarks, "agents": agents}
+    smoke_root = skills_root / "smoke"
+    if smoke_root.exists():
+        for manifest_path in sorted(smoke_root.glob("*/manifest.yaml")):
+            smokes.append(SmokeManifest.model_validate(_load_yaml(manifest_path)))
+    return {"benchmarks": benchmarks, "agents": agents, "smokes": smokes}

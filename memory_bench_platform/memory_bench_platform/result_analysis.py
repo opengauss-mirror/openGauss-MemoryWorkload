@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 import html
 import json
 from pathlib import Path
@@ -49,6 +50,28 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
 
     failures = [item for item in case_results if not bool(item.get("passed"))]
     buckets = _bucket_failures(failures)
+    external_output_dir = _resolve_external_output_dir(run_dir)
+    chain_diagnostics: dict[str, Any] = {}
+    timing_report: dict[str, Any] = {}
+    if external_result is not None and external_result.get("source") == "locomo_test" and external_output_dir is not None:
+        chain_diagnostics = diagnose_locomo_test_output(external_output_dir)
+        timing_report = build_locomo_test_timing_report(external_output_dir)
+        write_timing_report_json(run_dir, timing_report)
+        write_timing_report_html(run_dir, render_locomo_test_timing_html(timing_report))
+    elif list((run_dir / "external_artifacts").glob("official_*")):
+        try:
+            chain_diagnostics = diagnose_official_small_run(run_dir)
+        except FileNotFoundError:
+            chain_diagnostics = {}
+        try:
+            timing_report = build_official_small_timing_report(run_dir)
+        except FileNotFoundError:
+            timing_report = {}
+        if timing_report:
+            write_timing_report_json(run_dir, timing_report)
+            write_timing_report_html(run_dir, render_official_small_timing_html(timing_report))
+
+    resource_timeline = _read_resource_timeline(run_dir, chain_diagnostics)
     analysis = {
         "run_id": summary["run_id"],
         "benchmark_id": _extract_benchmark_id(run_record),
@@ -63,41 +86,21 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "failure_summary": _summarize_failures(case_results, buckets),
         "failure_buckets": buckets,
         "resource_summary": _read_resource_summary(run_dir),
+        "resource_timeline": resource_timeline,
+        "resource_phase_summary": _summarize_resource_phases(resource_timeline),
         "ingest_summary": _read_ingest_summary(run_dir),
         "source_artifacts": _source_artifacts(run_dir, external_result),
         "benchmark_diagnostics": _extract_benchmark_diagnostics(external_result),
         "analysis_notes": _build_notes(summary, external_result, buckets, _read_ingest_summary(run_dir)),
     }
-    external_output_dir = _resolve_external_output_dir(run_dir)
-    if external_result is not None and external_result.get("source") == "locomo_test" and external_output_dir is not None:
-        analysis["chain_diagnostics"] = diagnose_locomo_test_output(external_output_dir)
-        timing_report = build_locomo_test_timing_report(external_output_dir)
-        write_timing_report_json(run_dir, timing_report)
-        write_timing_report_html(run_dir, render_locomo_test_timing_html(timing_report))
+    if chain_diagnostics:
+        analysis["chain_diagnostics"] = chain_diagnostics
+    if timing_report:
         analysis["timing_report"] = {
             "json": str(run_dir / "reports" / "timing_report.json"),
             "html": str(run_dir / "reports" / "timing_report.html"),
             "duration_label_count": len(timing_report.get("duration_distributions", {})),
         }
-    elif list((run_dir / "external_artifacts").glob("official_*")):
-        try:
-            analysis["chain_diagnostics"] = diagnose_official_small_run(run_dir)
-        except FileNotFoundError:
-            analysis["chain_diagnostics"] = {}
-
-    if list((run_dir / "external_artifacts").glob("official_*")):
-        try:
-            timing_report = build_official_small_timing_report(run_dir)
-        except FileNotFoundError:
-            timing_report = {}
-        if timing_report:
-            write_timing_report_json(run_dir, timing_report)
-            write_timing_report_html(run_dir, render_official_small_timing_html(timing_report))
-            analysis["timing_report"] = {
-                "json": str(run_dir / "reports" / "timing_report.json"),
-                "html": str(run_dir / "reports" / "timing_report.html"),
-                "duration_label_count": len(timing_report.get("duration_distributions", {})),
-            }
     write_analysis_json(run_dir, analysis)
     write_analysis_markdown(run_dir, _render_analysis_markdown(analysis))
     write_run_report_html(run_dir, _render_analysis_html(analysis))
@@ -156,14 +159,15 @@ def _summary_from_external_result(run_id: str, imported: dict[str, Any]) -> dict
     total_correct = int(summary.get("total_correct", 0) or 0)
     total_graded = int(summary.get("total_graded", 0) or 0)
     ungraded_count = int(summary.get("ungraded_count", max(0, total_questions - total_graded)) or 0)
+    run_validity = summary.get("run_validity", {}) if isinstance(summary, dict) else {}
     if total_questions <= 0:
         status = "failed"
+    elif isinstance(run_validity, dict) and not bool(run_validity.get("valid", True)):
+        status = "partial"
     elif ungraded_count > 0:
         status = "partial"
-    elif total_correct == total_questions:
-        status = "passed"
     else:
-        status = "failed"
+        status = "passed"
     return {
         "run_id": run_id,
         "status": status,
@@ -175,6 +179,7 @@ def _summary_from_external_result(run_id: str, imported: dict[str, Any]) -> dict
             "token_totals": summary.get("token_totals", {}),
             "memory_token_totals": summary.get("memory_token_totals", {}),
             "ungraded_count": ungraded_count,
+            "run_validity": run_validity if isinstance(run_validity, dict) else {},
         },
     }
 
@@ -309,24 +314,14 @@ def _read_memory_summary(csv_path: Path) -> dict[str, Any]:
 
 
 def _read_resource_summary(run_dir: Path) -> dict[str, Any]:
-    cpu_path = run_dir / "artifacts" / "monitor" / "cpu_status.csv"
-    mem_path = run_dir / "artifacts" / "monitor" / "mem_status.csv"
-    if not cpu_path.exists() or not mem_path.exists():
-        fallback_root = _resolve_external_output_dir(run_dir)
-        if fallback_root is not None:
-            fallback_cpu = fallback_root / "monitor" / "cpu_status.csv"
-            fallback_mem = fallback_root / "monitor" / "mem_status.csv"
-            if fallback_cpu.exists():
-                cpu_path = fallback_cpu
-            if fallback_mem.exists():
-                mem_path = fallback_mem
+    cpu_path, mem_path = _resolve_monitor_paths(run_dir)
     payload = {}
     payload.update(_read_cpu_summary(cpu_path))
     payload.update(_read_memory_summary(mem_path))
     return payload
 
 
-def _source_artifacts(run_dir: Path, external_result: dict[str, Any] | None) -> dict[str, Any]:
+def _resolve_monitor_paths(run_dir: Path) -> tuple[Path, Path]:
     cpu_path = run_dir / "artifacts" / "monitor" / "cpu_status.csv"
     mem_path = run_dir / "artifacts" / "monitor" / "mem_status.csv"
     if not cpu_path.exists() or not mem_path.exists():
@@ -338,6 +333,130 @@ def _source_artifacts(run_dir: Path, external_result: dict[str, Any] | None) -> 
                 cpu_path = fallback_cpu
             if fallback_mem.exists():
                 mem_path = fallback_mem
+    return cpu_path, mem_path
+
+
+def _read_resource_timeline(run_dir: Path, chain_diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    cpu_path, mem_path = _resolve_monitor_paths(run_dir)
+    if not cpu_path.exists() or not mem_path.exists():
+        return {"sample_count": 0, "points": [], "phases": []}
+    cpu_rows = list(csv.DictReader(cpu_path.open(encoding="utf-8")))
+    mem_rows = list(csv.DictReader(mem_path.open(encoding="utf-8")))
+    if not cpu_rows or not mem_rows:
+        return {"sample_count": 0, "points": [], "phases": []}
+    count = min(len(cpu_rows), len(mem_rows))
+    raw_points: list[dict[str, Any]] = []
+    for idx in range(count):
+        cpu = cpu_rows[idx]
+        mem = mem_rows[idx]
+        raw_points.append(
+            {
+                "index": idx,
+                "timestamp": cpu.get("timestamp") or mem.get("timestamp") or "",
+                "cpu_user": float(cpu.get("summary_util_user") or 0.0),
+                "cpu_sys": float(cpu.get("summary_util_sys") or 0.0),
+                "cpu_idle": float(cpu.get("summary_util_idle") or 0.0),
+                "mem_free_mb": float(mem.get("mem_free_mb") or 0.0),
+                "mem_used_mb": float(mem.get("mem_used_mb") or 0.0),
+            }
+        )
+    start_dt = _parse_resource_timestamp(str(raw_points[0]["timestamp"])) if raw_points else None
+    for point in raw_points:
+        current_dt = _parse_resource_timestamp(str(point["timestamp"]))
+        if start_dt and current_dt:
+            point["offset_seconds"] = round((current_dt - start_dt).total_seconds(), 3)
+        else:
+            point["offset_seconds"] = float(point["index"])
+    return {
+        "sample_count": count,
+        "points": _sample_timeline_points(raw_points, max_points=180),
+        "phases": _build_phase_markers(chain_diagnostics),
+    }
+
+
+def _parse_resource_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _sample_timeline_points(points: list[dict[str, Any]], *, max_points: int) -> list[dict[str, Any]]:
+    if len(points) <= max_points:
+        return points
+    step = max(1, len(points) // max_points)
+    sampled = [points[idx] for idx in range(0, len(points), step)]
+    if sampled[-1] != points[-1]:
+        sampled.append(points[-1])
+    return sampled
+
+
+def _build_phase_markers(chain_diagnostics: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(chain_diagnostics, dict):
+        return []
+    timing = chain_diagnostics.get("timing") or {}
+    if not isinstance(timing, dict):
+        return []
+    steps = timing.get("steps") or {}
+    if not isinstance(steps, dict):
+        return []
+    order = ["health_check_seconds", "ingest_seconds", "qa_seconds", "judge_seconds", "stats_seconds"]
+    cursor = 0.0
+    phases = []
+    for key in order:
+        if key not in steps:
+            continue
+        duration = float(steps.get(key) or 0.0)
+        phases.append(
+            {
+                "label": key.removesuffix("_seconds"),
+                "start_seconds": round(cursor, 3),
+                "end_seconds": round(cursor + duration, 3),
+            }
+        )
+        cursor += duration
+    return phases
+
+
+def _summarize_resource_phases(resource_timeline: dict[str, Any]) -> dict[str, Any]:
+    points = resource_timeline.get("points", []) if isinstance(resource_timeline, dict) else []
+    phases = resource_timeline.get("phases", []) if isinstance(resource_timeline, dict) else []
+    if not points or not phases:
+        return {}
+    summary: dict[str, Any] = {}
+    for phase in phases:
+        label = str(phase.get("label", "") or "")
+        if not label:
+            continue
+        start_seconds = float(phase.get("start_seconds", 0.0) or 0.0)
+        end_seconds = float(phase.get("end_seconds", 0.0) or 0.0)
+        phase_points = [
+            point
+            for point in points
+            if start_seconds <= float(point.get("offset_seconds", 0.0) or 0.0) < end_seconds
+        ]
+        if not phase_points:
+            continue
+        cpu_user = [float(point.get("cpu_user", 0.0) or 0.0) for point in phase_points]
+        cpu_sys = [float(point.get("cpu_sys", 0.0) or 0.0) for point in phase_points]
+        mem_used = [float(point.get("mem_used_mb", 0.0) or 0.0) for point in phase_points]
+        summary[label] = {
+            "sample_count": len(phase_points),
+            "duration_seconds": round(end_seconds - start_seconds, 3),
+            "cpu_user_avg": round(sum(cpu_user) / len(cpu_user), 4),
+            "cpu_user_peak": max(cpu_user),
+            "cpu_sys_avg": round(sum(cpu_sys) / len(cpu_sys), 4),
+            "cpu_sys_peak": max(cpu_sys),
+            "mem_used_avg_mb": round(sum(mem_used) / len(mem_used), 4),
+            "mem_used_peak_mb": max(mem_used),
+        }
+    return summary
+
+
+def _source_artifacts(run_dir: Path, external_result: dict[str, Any] | None) -> dict[str, Any]:
+    cpu_path, mem_path = _resolve_monitor_paths(run_dir)
     payload = {
         "summary_json": str(run_dir / "reports" / "summary.json"),
         "case_results_json": str(run_dir / "reports" / "case_results.json"),
@@ -376,12 +495,22 @@ def _build_notes(
     notes: list[str] = []
     wrong_count = int(summary.get("case_failed", 0) or 0)
     retrieval_count = len(buckets.get("retrieval_miss", []))
+    benchmark_diagnostics = (
+        external_result.get("benchmark_diagnostics", {})
+        if isinstance(external_result, dict)
+        else {}
+    )
+    issues = benchmark_diagnostics.get("issues", {}) if isinstance(benchmark_diagnostics, dict) else {}
     if wrong_count and retrieval_count >= max(1, wrong_count // 2):
         notes.append("当前失败样本以召回缺失或无信息拒答模式为主。")
     if ingest_summary.get("session_total", 0) and ingest_summary.get("zero_memory_sessions", 0):
         notes.append(
             f"session 级写入异常明显：{ingest_summary['session_total']} 个 session 中有 "
             f"{ingest_summary['zero_memory_sessions']} 个未写入任何 memory。"
+        )
+    if int(issues.get("openviking_direct_recall_only_mode", 0) or 0) > 0:
+        notes.append(
+            "QA 当前以 direct recall 命中 memory 后直接回答为主；这属于已验证的有效模式，不应再按 OV QA token 为 0 解释为链路异常。"
         )
     if external_result is not None:
         notes.append(f"当前分析基于外部结果导入，来源类型为 {external_result.get('source', 'unknown')}。")
@@ -409,6 +538,10 @@ def _render_analysis_markdown(analysis: dict[str, Any]) -> str:
     lines.extend(["", "## Resource Summary", ""])
     for key, value in analysis["resource_summary"].items():
         lines.append(f"- {key}: `{value}`")
+    if analysis.get("resource_phase_summary"):
+        lines.extend(["", "## Resource Phases", ""])
+        for key, value in analysis["resource_phase_summary"].items():
+            lines.append(f"- {key}: `{value}`")
     lines.extend(["", "## Ingest Summary", ""])
     for key, value in analysis["ingest_summary"].items():
         lines.append(f"- {key}: `{value}`")
@@ -441,9 +574,44 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
             return "<tr><td colspan='2' class='muted'>无</td></tr>"
         return "".join(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in mapping.items())
 
+    def render_resource_chart(title: str, points: list[dict[str, Any]], value_key: str, color: str, unit: str) -> str:
+        if not points:
+            return f"<section class='card' style='margin-top: 16px;'><h2>{title}</h2><div class='muted'>无采样数据</div></section>"
+        width = 960
+        height = 220
+        pad = 28
+        values = [float(point.get(value_key, 0.0)) for point in points]
+        max_value = max(max(values), 1.0)
+        x_max = max(float(point.get("offset_seconds", point.get("index", 0))) for point in points) or 1.0
+        poly = []
+        for point in points:
+            x_val = float(point.get("offset_seconds", point.get("index", 0)))
+            y_val = float(point.get(value_key, 0.0))
+            x = pad + (x_val / x_max) * (width - pad * 2)
+            y = height - pad - (y_val / max_value) * (height - pad * 2)
+            poly.append(f"{x:.2f},{y:.2f}")
+        phase_lines = []
+        for phase in (analysis.get("resource_timeline") or {}).get("phases", []):
+            phase_start = float(phase.get("start_seconds", 0.0))
+            x = pad + (phase_start / x_max) * (width - pad * 2) if x_max else pad
+            phase_lines.append(
+                f"<line class='phase-marker' x1='{x:.2f}' y1='{pad}' x2='{x:.2f}' y2='{height-pad}' />"
+                f"<text class='phase-label' x='{x+4:.2f}' y='{pad+12:.2f}'>{esc(phase.get('label'))}</text>"
+            )
+        return (
+            f"<section class='card' style='margin-top: 16px;'><h2>{title}</h2>"
+            f"<div class='muted'>samples={len(points)} max={max_value:.2f}{unit}</div>"
+            f"<svg viewBox='0 0 {width} {height}' class='resource-chart'>"
+            f"<polyline fill='none' stroke='{color}' stroke-width='2' points='{' '.join(poly)}' />"
+            f"{''.join(phase_lines)}</svg></section>"
+        )
+
     notes_html = "".join(f"<li>{esc(item)}</li>" for item in (analysis.get("analysis_notes") or []))
     if not notes_html:
         notes_html = "<li class='muted'>无</li>"
+    benchmark_diagnostics = analysis.get("benchmark_diagnostics") or {}
+    issues = benchmark_diagnostics.get("issues", {}) if isinstance(benchmark_diagnostics, dict) else {}
+    direct_recall_mode = int(issues.get("openviking_direct_recall_only_mode", 0) or 0)
     timing_html = ""
     if analysis.get("timing_report"):
         timing_html = (
@@ -457,6 +625,28 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
             "<section class='card' style='margin-top: 16px;'><h2>Chain Diagnostics</h2><table><tbody>"
             + render_mapping(analysis["chain_diagnostics"])
             + "</tbody></table></section>"
+        )
+    phase_html = ""
+    if analysis.get("resource_phase_summary"):
+        phase_html = (
+            "<section class='card' style='margin-top: 16px;'><h2>Resource Phases</h2><table><tbody>"
+            + render_mapping(analysis["resource_phase_summary"])
+            + "</tbody></table></section>"
+        )
+    timeline = analysis.get("resource_timeline") or {}
+    timeline_points = timeline.get("points", []) if isinstance(timeline, dict) else []
+    cpu_chart = render_resource_chart("CPU Usage Timeline", timeline_points, "cpu_user", "#0f766e", "%")
+    mem_chart = render_resource_chart("Memory Usage Timeline", timeline_points, "mem_used_mb", "#2563eb", "MB")
+    qa_mode_html = ""
+    if direct_recall_mode > 0:
+        qa_mode_html = (
+            "<section class='card' style='margin-bottom: 16px; border-color: #0f766e; background: #ecfdf5;'>"
+            "<h2>QA Mode</h2>"
+            f"<div>检测到 <strong>{direct_recall_mode}</strong> 条 <code>qa_direct_recall_only</code> 样本。</div>"
+            "<div class='muted' style='margin-top:8px;'>"
+            "这表示 QA 主要通过 direct recall 命中 memory 后直接回答，属于当前已验证的有效模式，"
+            "不应再按 OV QA token 为 0 解释为链路异常。"
+            "</div></section>"
         )
 
     return f"""<!doctype html>
@@ -488,6 +678,9 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     th, td {{ padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }}
     .muted {{ color: var(--muted); }}
     ul {{ margin: 0; padding-left: 18px; line-height: 1.8; }}
+    .resource-chart {{ width: 100%; height: auto; margin-top: 12px; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; }}
+    .phase-marker {{ stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 4 4; }}
+    .phase-label {{ fill: #64748b; font-size: 10px; }}
     @media (max-width: 960px) {{ .grid, .sections {{ grid-template-columns: 1fr 1fr; }} }}
     @media (max-width: 680px) {{ .grid, .sections {{ grid-template-columns: 1fr; }} }}
   </style>
@@ -504,6 +697,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <div class="card"><div class="metric-label">Failures</div><div class="metric-value">{esc(analysis.get("case_failed"))}</div></div>
       <div class="card"><div class="metric-label">EntryPoint</div><div class="metric-value">{esc(analysis.get("entrypoint_kind"))}</div></div>
     </section>
+    {qa_mode_html}
     <section class="sections">
       <section class="card"><h2>Failure Summary</h2><table><tbody>{render_mapping(analysis.get("failure_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Resource Summary</h2><table><tbody>{render_mapping(analysis.get("resource_summary", {}))}</tbody></table></section>
@@ -512,6 +706,9 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <section class="card"><h2>Category Summary</h2><table><tbody>{render_mapping(analysis.get("category_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Artifacts</h2><table><tbody>{render_mapping(analysis.get("source_artifacts", {}))}</tbody></table></section>
     </section>
+    {cpu_chart}
+    {mem_chart}
+    {phase_html}
     {timing_html}
     {chain_html}
     <section class="card" style="margin-top: 16px;">

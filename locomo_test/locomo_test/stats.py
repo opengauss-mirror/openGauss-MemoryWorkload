@@ -67,6 +67,13 @@ def run_stats(
             continue
         ov_closure_counts[state] = ov_closure_counts.get(state, 0) + 1
     ov_closure_summary = derive_ov_closure_summary(valid, ov_closure_counts)
+    qa_reindex = {}
+    qa_reindex_path = Path(output_dir) / "qa_reindex.json"
+    if qa_reindex_path.exists():
+        try:
+            qa_reindex = json.loads(qa_reindex_path.read_text(encoding="utf-8"))
+        except Exception:
+            qa_reindex = {}
 
     # Print summary
     print(f"\n{'='*60}", file=sys.stderr)
@@ -127,6 +134,7 @@ def run_stats(
         "memory_token_totals": memory_token_totals or {},
         "ov_token_totals": memory_token_totals if memory_provider == "openviking" else {},
         "ogmem_token_totals": memory_token_totals if memory_provider == "ogmem" else {},
+        "qa_reindex": qa_reindex,
         "ov_closure_counts": ov_closure_counts,
         "ov_closure_summary": ov_closure_summary,
     }

@@ -7,6 +7,10 @@ from locomo_test.stats import run_stats
 def test_run_stats_writes_ov_closure_counts(tmp_path):
     out_dir = tmp_path / "run"
     out_dir.mkdir()
+    (out_dir / "qa_reindex.json").write_text(
+        json.dumps({"ok": True, "target_uri": "viking://user/eval-1/memories"}),
+        encoding="utf-8",
+    )
     csv_path = out_dir / "qa_results.csv"
     csv_path.write_text(
         "\n".join(
@@ -34,7 +38,9 @@ def test_run_stats_writes_ov_closure_counts(tmp_path):
     }
     assert meta["ov_closure_summary"] == {
         "dominant_state": "memory_closed_loop_ready",
+        "has_direct_recall": False,
         "has_memory_written": True,
         "has_token_emitted": True,
         "has_index_unavailable": True,
     }
+    assert meta["qa_reindex"]["ok"] is True

@@ -12,10 +12,12 @@ from .external_report_import import import_external_result
 from .integration import (
     build_cases_from_source,
     execute_external_runner,
+    execute_smoke_skill,
     resolve_benchmark_entrypoint,
     score_benchmark_run,
     validate_agent,
     validate_benchmark,
+    validate_smoke,
 )
 from .loader import load_agent_skill, load_all_skills, load_benchmark_skill
 from .paths import SKILLS_ROOT
@@ -52,11 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--data-path")
     p_run.add_argument("--entrypoint")
     p_run.add_argument("--run-id")
+    p_run.add_argument("--smoke-gate")
     p_run.add_argument("--version-override", action="append", default=[])
 
     p_validate = sub.add_parser("validate")
     p_validate.add_argument("--benchmark")
     p_validate.add_argument("--agent")
+    p_validate.add_argument("--smoke")
     p_validate.add_argument("--memory-backend")
     p_validate.add_argument("--source-path")
     p_validate.add_argument("--data-path")
@@ -72,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--benchmark", required=True)
     p_score.add_argument("--run-dir", required=True)
     p_score.add_argument("--data-path")
+
+    p_run_smoke = sub.add_parser("run-smoke")
+    p_run_smoke.add_argument("--smoke", required=True)
+    p_run_smoke.add_argument("--run-id")
 
     return parser
 
@@ -144,6 +152,39 @@ def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step
     return rows
 
 
+def _write_smoke_result(run_dir: Path, result: dict) -> None:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "smoke_trace.json").write_text(
+        json.dumps(result["probe"], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (reports_dir / "smoke_summary.json").write_text(
+        json.dumps(result["validation"], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (reports_dir / "smoke_report.html").write_text(
+        str(result["report"].get("html", "")),
+        encoding="utf-8",
+    )
+
+
+def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
+    validation = result["validation"]
+    return {
+        "run_id": run_id,
+        "status": "passed" if str(validation.get("status", "")).lower() == "passed" else "failed",
+        "case_total": len(validation.get("stage_results", [])),
+        "case_passed": sum(1 for item in validation.get("stage_results", []) if item.get("passed")),
+        "case_failed": sum(1 for item in validation.get("stage_results", []) if not item.get("passed")),
+        "category_summary": {},
+        "resource_summary": {
+            "smoke_id": smoke_id,
+            "issues": validation.get("issues", []),
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -153,6 +194,7 @@ def main(argv: list[str] | None = None) -> None:
         payload = {
             "benchmarks": [skill.id for skill in loaded["benchmarks"]],
             "agents": [skill.id for skill in loaded["agents"]],
+            "smokes": [skill.id for skill in loaded["smokes"]],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -163,6 +205,8 @@ def main(argv: list[str] | None = None) -> None:
             payload["benchmark"] = validate_benchmark(args.benchmark, args.data_path)
         if args.agent:
             payload["agent"] = validate_agent(args.agent)
+        if args.smoke:
+            payload["smoke"] = validate_smoke(args.smoke)
         if args.memory_backend == "openviking":
             if not args.source_path:
                 raise SystemExit("--source-path is required for --memory-backend openviking")
@@ -185,6 +229,30 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "score-run":
         payload = score_benchmark_run(args.benchmark, Path(args.run_dir), args.data_path)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "run-smoke":
+        run_id = args.run_id or f"{args.smoke}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        storage = RunStorage(Path.cwd() / "runs")
+        run_record = RunRecord(
+            run_id=run_id,
+            source_id=f"smoke:{args.smoke}",
+            source_kind="native_workflow",
+            operator_targets=[],
+            status="running",
+            started_at=datetime.now(),
+        )
+        run_dir = storage.init_run(run_record)
+        result = execute_smoke_skill(args.smoke, run_dir)
+        _write_smoke_result(run_dir, result)
+        summary = _build_smoke_summary(run_id, args.smoke, result)
+        status = summary["status"]
+        write_summary(run_dir, summary)
+        write_case_results(run_dir, result["validation"].get("stage_results", []))
+        run_record.status = status
+        run_record.ended_at = datetime.now()
+        storage.write_run_record(run_dir, run_record)
+        print(str(run_dir))
         return
 
     plan = _plan_from_args(args)
@@ -234,6 +302,35 @@ def main(argv: list[str] | None = None) -> None:
         "records/version_selection.json",
         run_record.version_selection,
     )
+
+    if getattr(args, "smoke_gate", None):
+        smoke_result = execute_smoke_skill(args.smoke_gate, run_dir)
+        _write_smoke_result(run_dir, smoke_result)
+        storage.write_json_record(run_dir, "records/smoke_gate.json", smoke_result)
+        smoke_status = str(smoke_result["validation"].get("status", "")).lower()
+        if smoke_status != "passed":
+            summary_record = ReportSummary(
+                run_id=run_record.run_id,
+                status="failed",
+                case_total=0,
+                case_passed=0,
+                case_failed=0,
+                resource_summary={
+                    "smoke_gate": {
+                        "smoke_id": args.smoke_gate,
+                        "issues": smoke_result["validation"].get("issues", []),
+                    }
+                },
+                category_summary={},
+            )
+            run_record.status = "failed"
+            run_record.ended_at = datetime.now()
+            storage.write_run_record(run_dir, run_record)
+            write_summary(run_dir, summary_record.model_dump(mode="json"))
+            write_case_results(run_dir, smoke_result["validation"].get("stage_results", []))
+            analyze_run(run_dir)
+            print(str(run_dir))
+            return
 
     if entrypoint.entrypoint_kind == "external_runner":
         output_dir = run_dir / "external_artifacts" / entrypoint.entrypoint_id
@@ -298,9 +395,15 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 write_external_result_summary(run_dir, imported)
                 case_results = imported["case_results"]
+                imported_validity = imported["summary"].get("run_validity", {}) if isinstance(imported.get("summary"), dict) else {}
+                is_valid_run = bool(imported_validity.get("valid", True))
                 summary_record = ReportSummary(
                     run_id=run_record.run_id,
-                    status="passed" if runner_result["status"] == "passed" else "failed",
+                    status=(
+                        "partial"
+                        if not is_valid_run
+                        else "passed" if runner_result["status"] == "passed" else "failed"
+                    ),
                     case_total=imported["summary"]["total_questions"],
                     case_passed=imported["summary"]["total_correct"],
                     case_failed=imported["summary"]["total_questions"] - imported["summary"]["total_correct"],
@@ -309,6 +412,7 @@ def main(argv: list[str] | None = None) -> None:
                         "token_totals": imported["summary"].get("token_totals", {}),
                         "memory_token_totals": imported["summary"].get("memory_token_totals", {}),
                         "ungraded_count": imported["summary"].get("ungraded_count", 0),
+                        "run_validity": imported_validity,
                     },
                     category_summary=imported["summary"].get("accuracy_by_category", {}),
                 )

@@ -80,6 +80,12 @@ class EntryPoints(BaseModel):
     teardown: str | None = None
 
 
+class SmokeEntryPoints(BaseModel):
+    probe_builder: str
+    validator: str
+    reporter: str
+
+
 class BenchmarkManifest(BaseModel):
     kind: Literal["benchmark"] = "benchmark"
     id: str
@@ -121,3 +127,15 @@ class AgentManifest(BaseModel):
                 "default software selection should stay machine-readable"
             )
         return data
+
+
+class SmokeManifest(BaseModel):
+    kind: Literal["smoke"] = "smoke"
+    id: str
+    version: str
+    scope: dict[str, Any] = Field(default_factory=dict)
+    entry: SmokeEntryPoints
+    stages: list[str] = Field(default_factory=list)
+    required_evidence: list[str] = Field(default_factory=list)
+    pass_criteria: dict[str, Any] = Field(default_factory=dict)
+    notes: str | None = None

@@ -27,7 +27,10 @@ CaseSource -> Case/Step DAG -> Operator Execution -> Gate/Retry -> Trace/Evidenc
 python3 -m memory_bench_platform.cli list-skills
 python3 -m memory_bench_platform.cli validate --benchmark locomo
 python3 -m memory_bench_platform.cli validate --agent openclaw
+python3 -m memory_bench_platform.cli validate --smoke locomo-openclaw-openviking-minimal
 python3 -m memory_bench_platform.cli run --benchmark locomo --agent generic-cli
+python3 -m memory_bench_platform.cli run-smoke --smoke locomo-openclaw-openviking-minimal
+python3 -m memory_bench_platform.cli run --benchmark locomo --agent openclaw --entrypoint locomo_test_remote --smoke-gate locomo-openclaw-openviking-minimal
 ```
 
 ## External Runner
@@ -88,6 +91,33 @@ Every successful `run` command also writes:
 - `reports/analysis.json`
 - `reports/analysis.md`
 - `reports/run_report.html`
+
+## Smoke Skills
+
+The platform now discovers smoke skills under `skills/smoke/` and supports:
+
+```bash
+python3 -m memory_bench_platform.cli validate --smoke locomo-openclaw-openviking-minimal
+python3 -m memory_bench_platform.cli run-smoke --smoke locomo-openclaw-openviking-minimal
+python3 -m memory_bench_platform.cli run --benchmark locomo --agent openclaw --entrypoint locomo_test_remote --smoke-gate locomo-openclaw-openviking-minimal
+```
+
+Current behavior:
+
+- `validate --smoke` performs static prerequisite validation.
+- `run-smoke` executes the smoke skill and writes:
+  - `reports/smoke_trace.json`
+  - `reports/smoke_summary.json`
+  - `reports/smoke_report.html`
+- `run --smoke-gate <smoke-id>` runs the smoke first and blocks the benchmark
+  if the smoke fails. The blocked run writes `records/smoke_gate.json` and a
+  failed `reports/summary.json` with `case_total = 0`.
+
+The bundled `locomo-openclaw-openviking-minimal` smoke skill uses
+`locomo_test/configs/mini-test.toml` as the minimum runnable chain. Its runtime
+config fills an isolated OpenClaw `state_dir` under the smoke run directory when
+the local `env.toml` leaves `gateway.state_dir` empty, and pins `data_file` to
+the repository LoCoMo small dataset path.
 
 ## External Integration Examples
 

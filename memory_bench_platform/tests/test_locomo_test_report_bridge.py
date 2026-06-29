@@ -45,6 +45,7 @@ def test_write_locomo_test_html_report_generates_summary_and_table(tmp_path):
                 "issues": {
                     "openviking_index_missing_records_max": 8,
                     "openviking_memory_written_but_index_unavailable": 30,
+                    "openviking_direct_recall_only_mode": 35,
                 }
             },
             ensure_ascii=False,
@@ -107,3 +108,5 @@ def test_write_locomo_test_html_report_generates_summary_and_table(tmp_path):
     assert "memory_recalled_with_consistency_gap" in html
     assert "When did Caroline go to the LGBTQ support group?" in html
     assert "What motivated Caroline to pursue counseling?" in html
+    assert "qa_direct_recall_only" in html
+    assert "有效模式" in html

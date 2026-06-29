@@ -109,6 +109,94 @@ def test_external_runner_missing_output_becomes_failed_summary(monkeypatch, tmp_
     assert entry["status"] == "failed"
 
 
+def test_run_smoke_gate_failure_blocks_external_runner(monkeypatch, tmp_path: Path):
+    from memory_bench_platform import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    executed = {"external": False}
+
+    monkeypatch.setattr(
+        cli_module,
+        "_plan_from_args",
+        lambda args: type(
+            "Plan",
+            (),
+            {
+                "run_id": "run-smoke-gated",
+                "benchmark_id": args.benchmark,
+                "agent_id": args.agent,
+                "benchmark_version": None,
+                "agent_version": None,
+                "memory_backend": None,
+                "hardware_profile": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_benchmark_entrypoint",
+        lambda benchmark, entrypoint_id: type(
+            "EntryPoint",
+            (),
+            {
+                "entrypoint_id": "official_small",
+                "entrypoint_kind": "external_runner",
+                "command": ["bash", "dummy.sh"],
+            },
+        )(),
+    )
+
+    def _fake_execute_smoke(smoke_id: str, run_dir: Path):
+        return {
+            "manifest": {"id": smoke_id},
+            "probe": {},
+            "validation": {
+                "status": "failed",
+                "stage_results": [
+                    {
+                        "case_id": "stage-session_bootstrap",
+                        "question": "session_bootstrap",
+                        "label": "failed",
+                        "passed": False,
+                        "response": "gateway_state_dir_empty",
+                    }
+                ],
+                "issues": ["gateway_state_dir_empty"],
+            },
+            "report": {"html": "<html>failed</html>"},
+        }
+
+    def _fake_execute_external(*args, **kwargs):
+        executed["external"] = True
+        return {"status": "passed", "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli_module, "execute_smoke_skill", _fake_execute_smoke)
+    monkeypatch.setattr(cli_module, "execute_external_runner", _fake_execute_external)
+    monkeypatch.setattr(cli_module.Path, "cwd", lambda: tmp_path)
+
+    cli_module.main(
+        [
+            "run",
+            "--benchmark",
+            "locomo",
+            "--agent",
+            "openclaw",
+            "--entrypoint",
+            "official_small",
+            "--smoke-gate",
+            "locomo-openclaw-openviking-minimal",
+        ]
+    )
+
+    run_dir = tmp_path / "runs" / "run-smoke-gated"
+    summary = json.loads((run_dir / "reports" / "summary.json").read_text(encoding="utf-8"))
+    gate = json.loads((run_dir / "records" / "smoke_gate.json").read_text(encoding="utf-8"))
+    assert executed["external"] is False
+    assert summary["status"] == "failed"
+    assert summary["resource_summary"]["smoke_gate"]["issues"] == ["gateway_state_dir_empty"]
+    assert gate["validation"]["status"] == "failed"
+
+
 def test_external_runner_receives_expected_version_env(monkeypatch, tmp_path: Path):
     from memory_bench_platform import cli as cli_module
 

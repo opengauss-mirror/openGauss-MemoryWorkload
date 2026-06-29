@@ -132,8 +132,27 @@ def test_write_qa_diagnostics_writes_run_level_closure_summary(tmp_path):
         "dominant_state": "memory_written_but_index_unavailable",
         "has_memory_written": True,
         "has_token_emitted": True,
+        "has_direct_recall": False,
         "has_index_unavailable": True,
     }
 
     file_data = json.loads((tmp_path / "qa_diagnostics.json").read_text(encoding="utf-8"))
     assert file_data["ov_closure_summary"]["dominant_state"] == "memory_written_but_index_unavailable"
+
+
+def test_check_qa_results_recognizes_direct_recall_only_mode(tmp_path):
+    csv_path = tmp_path / "qa_results.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "sample_id,sample_idx,qi,question,expected,response,category,evidence,input_tokens,output_tokens,cacheRead,cacheWrite,total_tokens,ov_llm_prompt_tokens,ov_llm_completion_tokens,ov_llm_total_tokens,ov_embedding_tokens,ov_memories_extracted,ov_memory_write,ov_memory_edit,ov_missing_records,ov_recall_total,ov_direct_recall_count,ov_recall_hit,ov_memory_written,ov_token_emitted,ov_index_available,ov_closure_state,timestamp,jsonl_filename,result,reasoning",
+                "conv-1,1,1,Q,A,R,2,[],10,5,0,0,15,0,0,0,0,0,0,0,2,5,5,true,false,false,false,qa_direct_recall_only,2026-06-23 13:00:00,session.jsonl,,,",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    issues = check_qa_results(str(tmp_path))
+
+    assert issues["openviking_direct_recall_only_mode"] == 1
+    assert "openviking_tokens_all_zero" not in issues

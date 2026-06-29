@@ -1,0 +1,33 @@
+kind: smoke
+id: locomo-openclaw-openviking-minimal
+version: 0.1.0
+scope:
+  benchmark_ids:
+    - locomo
+  agent_ids:
+    - openclaw
+  memory_backends:
+    - openviking
+entry:
+  probe_builder: scripts/build_probe.py
+  validator: scripts/validate_probe.py
+  reporter: scripts/render_report.py
+stages:
+  - session_bootstrap
+  - message_ingest
+  - session_commit
+  - memory_extraction
+  - reindex_or_consistency
+  - recall_probe
+  - answer_probe
+  - result_parse
+required_evidence:
+  - task_status
+  - memory_diff
+  - search_find_hits
+  - usage_nonzero
+  - artifacts_present
+pass_criteria:
+  all_required_stages_passed: true
+  required_recall_hit: 1
+notes: Minimal smoke skill for validating the LoCoMo + OpenClaw + OpenViking path before full benchmark runs.

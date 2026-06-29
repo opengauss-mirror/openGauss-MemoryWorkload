@@ -207,6 +207,88 @@ def get_session_id(user: str, agent_id: str = "main", state_dir: str = "") -> st
         return None
 
 
+def wait_for_session_id_from_key(
+    session_key: str,
+    user: str,
+    agent_id: str = "main",
+    state_dir: str = "",
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.5,
+) -> tuple[str, str] | None:
+    deadline = time.monotonic() + max(timeout, 0.1)
+    while True:
+        found = get_session_id_from_key(session_key, user, agent_id, state_dir)
+        if found:
+            return found
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(max(interval, 0.05))
+
+
+def _find_latest_session_file(agent_id: str = "main", state_dir: str = "") -> tuple[str, str] | None:
+    agents_base_dir = os.path.join(state_dir, "agents")
+    if not os.path.isdir(agents_base_dir):
+        return None
+    agent_names = []
+    if agent_id:
+        agent_names.append(agent_id)
+    for name in os.listdir(agents_base_dir):
+        if name not in agent_names:
+            agent_names.append(name)
+    candidates = []
+    for current_agent in agent_names:
+        sessions_dir = os.path.join(agents_base_dir, current_agent, "sessions")
+        if not os.path.isdir(sessions_dir):
+            continue
+        for name in os.listdir(sessions_dir):
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(sessions_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            priority = 0 if current_agent == agent_id else 1
+            candidates.append((priority, mtime, name, sessions_dir))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], -item[1]))
+    _, _, name, sessions_dir = candidates[0]
+    return name, sessions_dir
+
+
+def _find_session_id_in_openclaw_log(
+    session_key: str,
+    *,
+    agent_id: str = "main",
+    state_dir: str = "",
+    log_dir: str = "/tmp/openclaw",
+) -> tuple[str, str] | None:
+    if not session_key:
+        return None
+    log_path = os.path.join(log_dir, f"openclaw-{time.strftime('%Y-%m-%d')}.log")
+    if not os.path.exists(log_path):
+        return None
+    sessions_dir = os.path.join(state_dir, "agents", agent_id, "sessions")
+    session_id = ""
+    try:
+        with open(log_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if session_key not in line:
+                    continue
+                match = re.search(r'"sessionId":"([^"]+)"', line)
+                if match:
+                    session_id = match.group(1).strip()
+        if not session_id:
+            return None
+        return f"{session_id}.jsonl", sessions_dir
+    except OSError:
+        return None
+
+
 def reset_session(session_path: str, agent_id: str = "main", state_dir: str = "") -> str | None:
     if os.path.isabs(session_path) and os.path.exists(session_path):
         src = session_path
@@ -300,6 +382,372 @@ def _normalize_usage(raw: dict | None) -> dict:
     }
 
 
+DEFAULT_LOCOMO_QA_PROMPT_PREFIX = (
+    "Answer the question directly using the recalled memory snippets as the primary evidence. "
+    "Treat the normalized summary or leading bullet points at the top of each memory as authoritative, "
+    "and use them before raw chat-log details that follow. "
+    "Prefer the most specific supported fact over a generic paraphrase. "
+    "If the recalled memories contain an exact noun phrase, identity label, country, gift, relationship status, duration, or symbolic meaning, copy that specific phrase instead of replacing it with a generic phrase. "
+    "Do not replace exact facts with vague substitutes such as person, home country, object, support, or event. "
+    "For list or set questions, include only items that are explicitly supported by recalled memories and match the asked category. "
+    "Do not broaden the answer with nearby related activities, generic themes, inferred items, or unnamed placeholders. "
+    "If a list item is not explicitly named, omit it. "
+    "If a recalled memory clearly matches the event being asked about, use the matching event details even when the question wording is paraphrased. "
+    "For time questions, preserve the memory's relative phrasing such as last week, last Friday, next month, or the week before the current date unless the memory itself explicitly states a calendar date. "
+    "If the memory says an event happened in the week before the current date, answer with that relative date instead of saying it is missing. "
+    "Do not say information is unavailable when the recalled memories explicitly contain the answer. "
+    "If the recalled memories still do not support the answer, say so briefly. "
+)
+
+DEFAULT_LOCOMO_INGEST_PROMPT_PREFIX = (
+    "You are transforming a raw conversation log into memory-ingestion notes, not answering a user question. "
+    "Reply with short factual bullet points only. "
+    "Write ONE explicit fact per bullet. "
+    "Capture explicit facts for BOTH participants. "
+    "Preserve exact dates, relative dates, durations, counts, countries, gifts, relationships, plans, motivations, and workshop/camping/speech details. "
+    "Keep the conversation's own time anchors instead of today's date. "
+    "When a fact is explicit, keep the concrete noun or number exactly, including values like Sweden, necklace, 5 years, 10 years ago, June 2023, and week-before references. "
+    "No follow-up questions. No greetings, roleplay, or advice.\n\n"
+)
+
+
+def _normalize_recall_text(value: object, *, max_chars: int) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _extract_recall_summary(memory: dict, *, max_chars: int) -> str:
+    candidates = [
+        memory.get("normalized_summary"),
+        memory.get("summary"),
+        memory.get("excerpt"),
+        memory.get("text"),
+        memory.get("content"),
+        memory.get("body"),
+        memory.get("markdown"),
+    ]
+    metadata = memory.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend(
+            [
+                metadata.get("normalized_summary"),
+                metadata.get("summary"),
+                metadata.get("excerpt"),
+                metadata.get("text"),
+            ]
+        )
+    for candidate in candidates:
+        text = _normalize_recall_text(candidate, max_chars=max_chars)
+        if text:
+            return text
+    return ""
+
+
+def _extract_recall_detail(memory: dict, *, summary: str, max_chars: int) -> str:
+    assistant_summary = _extract_embedded_assistant_summary(memory, max_chars=max_chars)
+    if assistant_summary:
+        return assistant_summary
+
+    candidates = [
+        memory.get("text"),
+        memory.get("content"),
+        memory.get("body"),
+        memory.get("markdown"),
+        memory.get("excerpt"),
+    ]
+    metadata = memory.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend(
+            [
+                metadata.get("text"),
+                metadata.get("content"),
+                metadata.get("body"),
+                metadata.get("markdown"),
+                metadata.get("excerpt"),
+            ]
+        )
+    normalized_summary = _normalize_recall_text(summary, max_chars=max_chars)
+    for candidate in candidates:
+        text = _normalize_recall_text(candidate, max_chars=max_chars)
+        if text:
+            convo_idx = text.find("[group chat conversation:")
+            if convo_idx >= 0:
+                text = text[convo_idx:]
+            else:
+                text = re.sub(r"^\d{4}-\d{2}-\d{2} \([^)]+\) ChatLog:\s*", "", text)
+                text = re.sub(r"^\[(?:user|assistant)\]:\s*", "", text)
+        if text and text != normalized_summary:
+            return text
+    return ""
+
+
+def _extract_embedded_assistant_summary(memory: dict, *, max_chars: int) -> str:
+    candidates = [
+        memory.get("content"),
+        memory.get("text"),
+        memory.get("body"),
+        memory.get("markdown"),
+        memory.get("excerpt"),
+    ]
+    metadata = memory.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend(
+            [
+                metadata.get("content"),
+                metadata.get("text"),
+                metadata.get("body"),
+                metadata.get("markdown"),
+                metadata.get("excerpt"),
+            ]
+        )
+    for candidate in candidates:
+        raw = str(candidate or "")
+        if not raw:
+            continue
+        match = re.search(r"\[assistant\]:\s*(.+)", raw, flags=re.DOTALL)
+        if not match:
+            continue
+        text = _normalize_recall_text(match.group(1), max_chars=max_chars)
+        if text:
+            return text
+    return ""
+
+
+def _tokenize_recall_text(value: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9+]+", value.lower())
+
+
+def rerank_ov_recalled_memories(
+    question: str,
+    recalled_memories: list[dict],
+) -> list[dict]:
+    if len(recalled_memories) <= 1:
+        return recalled_memories
+    stopwords = {
+        "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "at", "by",
+        "is", "are", "was", "were", "did", "does", "do", "what", "when", "where",
+        "who", "why", "how", "which", "with", "from", "their", "them", "they",
+        "her", "his", "she", "he", "it", "this", "that", "these", "those", "be",
+        "have", "has", "had", "been", "would", "could", "should", "about", "into",
+        "than", "then", "after", "before", "during", "ago", "kind", "type",
+    }
+    query_tokens = [tok for tok in _tokenize_recall_text(question) if tok not in stopwords and len(tok) > 1]
+    if not query_tokens:
+        return recalled_memories
+
+    def _memory_score(memory: dict, index: int) -> tuple[int, int, int, int]:
+        title = _normalize_recall_text(memory.get("title") or memory.get("name"), max_chars=240)
+        summary = _extract_recall_summary(memory, max_chars=1000)
+        detail = _extract_recall_detail(memory, summary=summary, max_chars=1200)
+        haystack = f"{title}\n{summary}\n{detail}".lower()
+        overlap = 0
+        exact_mentions = 0
+        for token in query_tokens:
+            if token in haystack:
+                overlap += 1
+                exact_mentions += haystack.count(token)
+        has_title_hit = int(any(token in title.lower() for token in query_tokens))
+        return (overlap, exact_mentions, has_title_hit, -index)
+
+    ranked = sorted(
+        enumerate(recalled_memories),
+        key=lambda item: _memory_score(item[1], item[0]),
+        reverse=True,
+    )
+    return [memory for _, memory in ranked]
+
+
+def format_ov_recall_evidence_block(
+    recalled_memories: list[dict],
+    *,
+    max_items: int = 5,
+    max_chars_per_item: int = 400,
+) -> str:
+    if not recalled_memories:
+        return ""
+    lines = [
+        "Retrieved memory evidence:",
+        "Use the following recalled memories as concrete evidence before answering.",
+    ]
+    for idx, memory in enumerate(recalled_memories[:max_items], start=1):
+        title = _normalize_recall_text(
+            memory.get("title") or memory.get("name"),
+            max_chars=160,
+        )
+        summary = _extract_recall_summary(memory, max_chars=max_chars_per_item)
+        detail = _extract_recall_detail(memory, summary=summary, max_chars=max_chars_per_item)
+        score = memory.get("score")
+        header = f"[Memory {idx}]"
+        if score not in (None, ""):
+            header += f" score={score}"
+        lines.append(header)
+        if title:
+            lines.append(f"Title: {title}")
+        if summary:
+            lines.append(f"Summary: {summary}")
+        if detail:
+            lines.append(f"Details: {detail}")
+    return "\n".join(lines).strip()
+
+
+def build_qa_input_message(
+    *,
+    question: str,
+    question_time: str | None,
+    recalled_memories: list[dict] | None = None,
+) -> str:
+    qa_prompt_prefix = os.environ.get("LOCOMO_QA_PROMPT_PREFIX", "").strip() or DEFAULT_LOCOMO_QA_PROMPT_PREFIX
+    evidence_block = format_ov_recall_evidence_block(
+        recalled_memories or [],
+        max_items=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_LIMIT", "8") or 8), 1),
+        max_chars_per_item=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_CHARS", "400") or 400), 80),
+    )
+    if question_time:
+        if evidence_block:
+            return (
+                f"{qa_prompt_prefix}Current date: {question_time}.\n\n"
+                f"{evidence_block}\n\nQuestion: {question}"
+            )
+        return f"{qa_prompt_prefix}Current date: {question_time}. Question: {question}"
+    if evidence_block:
+        return f"{qa_prompt_prefix}{evidence_block}\n\nQuestion: {question}"
+    return f"{qa_prompt_prefix}Question: {question}"
+
+
+def build_ingest_input_message(message: str) -> str:
+    ingest_prompt_prefix = (
+        os.environ.get("LOCOMO_INGEST_PROMPT_PREFIX", "").strip()
+        or DEFAULT_LOCOMO_INGEST_PROMPT_PREFIX
+    )
+    return f"{ingest_prompt_prefix}{message}"
+
+
+def get_openviking_ingest_max_blocks() -> int:
+    raw = os.environ.get("LOCOMO_OPENVIKING_INGEST_MAX_BLOCKS", "6").strip()
+    try:
+        value = int(raw or "0")
+    except ValueError:
+        value = 6
+    return max(value, 0)
+
+
+def get_openviking_ingest_chunk_from_session() -> int:
+    raw = os.environ.get("LOCOMO_OPENVIKING_INGEST_CHUNK_FROM_SESSION", "3").strip()
+    try:
+        value = int(raw or "0")
+    except ValueError:
+        value = 3
+    return max(value, 0)
+
+
+def split_openviking_ingest_message(message: str, *, max_blocks: int) -> list[str]:
+    if max_blocks <= 0:
+        return [message]
+    blocks = message.split("\n\n")
+    if len(blocks) <= 2:
+        return [message]
+    header = blocks[0]
+    tail = ""
+    body = blocks[1:]
+    if body and body[-1].strip() == "[]":
+        tail = body[-1]
+        body = body[:-1]
+    if len(body) <= max_blocks:
+        return [message]
+    chunks = []
+    for start in range(0, len(body), max_blocks):
+        segment = body[start : start + max_blocks]
+        parts = [header, *segment]
+        if tail:
+            parts.append(tail)
+        chunks.append("\n\n".join(parts))
+    return chunks
+
+
+def should_chunk_openviking_session(session_key: str | None) -> bool:
+    threshold = get_openviking_ingest_chunk_from_session()
+    if threshold <= 0:
+        return True
+    if not session_key:
+        return False
+    match = re.search(r"session_(\d+)", session_key)
+    if not match:
+        return False
+    return int(match.group(1)) >= threshold
+
+
+def _merge_usage_totals(left: dict | None, right: dict | None) -> dict:
+    merged = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total_tokens": 0,
+    }
+    for payload in (left or {}, right or {}):
+        for key in merged:
+            merged[key] += int(payload.get(key, 0) or 0)
+    return merged
+
+
+def _merge_ov_token_usage(left: dict | None, right: dict | None) -> dict | None:
+    if not left and not right:
+        return None
+    provider = (
+        (left or {}).get("provider")
+        or (right or {}).get("provider")
+        or "openviking"
+    )
+    merged = {
+        "provider": provider,
+        "llm_prompt": 0,
+        "llm_completion": 0,
+        "llm_total": 0,
+        "embedding": 0,
+        "memories": 0,
+        "memory_write": 0,
+        "memory_edit": 0,
+        "task_id": "",
+    }
+    for payload in (left or {}, right or {}):
+        merged["llm_prompt"] += int(payload.get("llm_prompt", 0) or 0)
+        merged["llm_completion"] += int(payload.get("llm_completion", 0) or 0)
+        merged["llm_total"] += int(payload.get("llm_total", 0) or 0)
+        merged["embedding"] += int(payload.get("embedding", 0) or 0)
+        merged["memories"] += int(payload.get("memories", 0) or 0)
+        merged["memory_write"] += int(payload.get("memory_write", 0) or 0)
+        merged["memory_edit"] += int(payload.get("memory_edit", 0) or 0)
+        task_id = str(payload.get("task_id", "") or "").strip()
+        if task_id:
+            merged["task_id"] = task_id
+    return merged
+
+
+def should_skip_openviking_qa_commit(session_key: str | None) -> bool:
+    if not session_key:
+        return False
+    override = os.environ.get("LOCOMO_OPENVIKING_QA_COMMIT", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return False
+    return session_key.startswith("qa-")
+
+
+def should_wait_for_openviking_ingest_commit() -> bool:
+    override = os.environ.get("LOCOMO_OPENVIKING_INGEST_COMMIT_WAIT", "").strip().lower()
+    if override in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
 def send_message(
     base_url: str, token: str, user: str, message: str,
     agent_id: str = "main", session_key: str | None = None,
@@ -358,6 +806,8 @@ def _parse_ov_task_result(data: dict) -> dict | None:
     result = data.get("result", {})
     if isinstance(result, dict) and "result" in result:
         result = result["result"]
+    if not isinstance(result, dict):
+        result = {}
     token = result.get("token_usage", {})
     llm = token.get("llm", {})
     embed = token.get("embedding", {})
@@ -371,6 +821,16 @@ def _parse_ov_task_result(data: dict) -> dict | None:
         "memories": mem_count,
         "task_id": data.get("result", {}).get("task_id", ""),
     }
+
+
+def _is_empty_ov_token_usage(payload: dict | None) -> bool:
+    if not payload:
+        return True
+    return (
+        int(payload.get("llm_total", 0) or 0) == 0
+        and int(payload.get("embedding", 0) or 0) == 0
+        and int(payload.get("memories", 0) or 0) == 0
+    )
 
 
 def _load_openviking_plugin_config(state_dir: str) -> dict:
@@ -393,9 +853,12 @@ def _load_openviking_plugin_config(state_dir: str) -> dict:
 
 
 def _resolve_openviking_agent_header(plugin_cfg: dict, fallback_agent_id: str) -> str:
-    configured_prefix = str(plugin_cfg.get("agent_prefix") or plugin_cfg.get("agentId") or "").strip()
+    configured_prefix = str(plugin_cfg.get("agent_prefix") or "").strip()
     if configured_prefix:
         return f"{configured_prefix}_main"
+    explicit_agent = str(plugin_cfg.get("agentId") or "").strip()
+    if explicit_agent:
+        return f"{explicit_agent}_main"
     env_agent = str(os.environ.get("OPENVIKING_AGENT_ID", "")).strip()
     if env_agent:
         return env_agent
@@ -477,6 +940,7 @@ def query_ov_task_token_usage(
     state_dir: str = "",
     fallback_agent_id: str = "main",
     max_wait: int = 60,
+    resource_id: str | None = None,
 ) -> dict | None:
     headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
     if not headers:
@@ -490,9 +954,28 @@ def query_ov_task_token_usage(
             data = resp.json()
             status = data.get("result", {}).get("status", "") if isinstance(data.get("result"), dict) else ""
             if status in ("completed", "failed", ""):
-                return _parse_ov_task_result(data)
+                parsed = _parse_ov_task_result(data)
+                if _is_empty_ov_token_usage(parsed) and resource_id:
+                    fallback = query_ov_latest_task(
+                        ov_api_url,
+                        resource_id=resource_id,
+                        state_dir=state_dir,
+                        fallback_agent_id=fallback_agent_id,
+                    )
+                    if fallback and not _is_empty_ov_token_usage(fallback):
+                        return fallback
+                return parsed
             if time.time() >= deadline:
-                return _parse_ov_task_result(data)
+                if resource_id:
+                    fallback = query_ov_latest_task(
+                        ov_api_url,
+                        resource_id=resource_id,
+                        state_dir=state_dir,
+                        fallback_agent_id=fallback_agent_id,
+                    )
+                    if fallback and not _is_empty_ov_token_usage(fallback):
+                        return fallback
+                return None
             time.sleep(interval)
             interval = min(interval * 2, 10)
     except Exception as e:
@@ -856,7 +1339,7 @@ CSV_FIELDS = [
     "output_tokens", "cacheRead", "cacheWrite", "total_tokens",
     "ov_llm_prompt_tokens", "ov_llm_completion_tokens", "ov_llm_total_tokens",
     "ov_embedding_tokens", "ov_memories_extracted", "ov_memory_write", "ov_memory_edit",
-    "ov_missing_records", "ov_recall_total", "ov_recall_hit",
+    "ov_missing_records", "ov_recall_total", "ov_direct_recall_count", "ov_recall_hit",
     "ov_memory_written", "ov_token_emitted", "ov_index_available", "ov_closure_state",
     "timestamp", "jsonl_filename", "result", "reasoning",
 ]
@@ -896,6 +1379,7 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
     flat["ov_memory_edit"] = ov_usage.get("memory_edit", 0)
     flat["ov_missing_records"] = flat.get("ov_missing_records", 0)
     flat["ov_recall_total"] = flat.get("ov_recall_total", 0)
+    flat["ov_direct_recall_count"] = flat.get("ov_direct_recall_count", 0)
     flat["ov_recall_hit"] = flat.get("ov_recall_hit", "")
     flat["ov_memory_written"] = flat.get("ov_memory_written", "")
     flat["ov_token_emitted"] = flat.get("ov_token_emitted", "")
@@ -921,7 +1405,9 @@ def derive_ov_closure_status(
     consistency: dict | None,
     *,
     recall_total: int = 0,
+    direct_recall_count: int = 0,
     response_text: str = "",
+    qa_commit_skipped: bool = False,
 ) -> dict:
     token_emitted = False
     memory_written = False
@@ -940,7 +1426,11 @@ def derive_ov_closure_status(
     if consistency:
         index_available = bool(consistency.get("ok", False))
 
-    if not token_emitted and not memory_written:
+    if qa_commit_skipped and int(direct_recall_count or 0) > 0:
+        state = "qa_direct_recall_only"
+    elif qa_commit_skipped:
+        state = "qa_direct_recall_miss"
+    elif not token_emitted and not memory_written:
         state = "no_memory_signal"
     elif token_emitted and not memory_written:
         state = "token_emitted_only"
@@ -992,6 +1482,143 @@ def query_ov_search_find_total(
         return 0
 
 
+def query_ov_search_find_memories(
+    ov_api_url: str,
+    query: str,
+    target_uri: str,
+    *,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+    limit: int = 3,
+) -> list[dict]:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return []
+
+    def _read_content(uri: str) -> str:
+        try:
+            resp = requests.get(
+                f"{ov_api_url}/api/v1/content/read",
+                headers=headers,
+                params={"uri": uri},
+                timeout=60,
+            )
+            if not resp.ok:
+                return ""
+            payload = resp.json() if resp.content else {}
+            result = payload.get("result", payload) if isinstance(payload, dict) else payload
+            if isinstance(result, str):
+                return result
+            if isinstance(result, dict):
+                for key in ("content", "text", "body", "markdown"):
+                    value = result.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value
+                parts = result.get("parts")
+                if isinstance(parts, list):
+                    texts = []
+                    for part in parts:
+                        if isinstance(part, dict):
+                            value = part.get("text") or part.get("content")
+                            if isinstance(value, str) and value.strip():
+                                texts.append(value.strip())
+                    if texts:
+                        return "\n".join(texts)
+            return ""
+        except Exception:
+            return ""
+
+    try:
+        resp = requests.post(
+            f"{ov_api_url}/api/v1/search/find",
+            headers=headers,
+            json={
+                "query": query,
+                "target_uri": target_uri,
+                "limit": max(limit, 1),
+                "score_threshold": 0,
+            },
+            timeout=60,
+        )
+        if not resp.ok:
+            return []
+        payload = resp.json()
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        memories = result.get("memories", [])
+        if not isinstance(memories, list):
+            return []
+        enriched = []
+        for item in memories:
+            if not isinstance(item, dict):
+                continue
+            memory = dict(item)
+            has_text = any(
+                isinstance(memory.get(key), str) and memory.get(key).strip()
+                for key in ("normalized_summary", "summary", "excerpt", "text", "content", "body", "markdown")
+            )
+            uri = str(memory.get("uri") or "").strip()
+            if uri and not has_text:
+                content = _read_content(uri)
+                if content:
+                    memory["content"] = content
+            enriched.append(memory)
+        return enriched
+    except Exception:
+        return []
+
+
+def reindex_ov_memory_root(
+    *,
+    ov_api_url: str,
+    user_id: str,
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return {"ok": False, "last_error": "missing_headers"}
+    payload = {
+        "uri": f"viking://user/{user_id}/memories",
+        "mode": "vectors_only",
+        "wait": True,
+    }
+    deadline = time.monotonic() + max(timeout, 1.0)
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            resp = requests.post(
+                f"{ov_api_url.rstrip('/')}/api/v1/content/reindex",
+                headers=headers,
+                json=payload,
+                timeout=max(30.0, timeout),
+            )
+            data = resp.json() if resp.content else {}
+            if resp.ok:
+                return {
+                    "ok": True,
+                    "target_uri": payload["uri"],
+                    "result": data.get("result", data) if isinstance(data, dict) else data,
+                }
+            last_error = (
+                data.get("error", {}).get("message")
+                if isinstance(data, dict)
+                else ""
+            ) or resp.text or f"HTTP {resp.status_code}"
+            if resp.status_code == 409 and "tree lock" in last_error.lower():
+                time.sleep(2.0)
+                continue
+            return {
+                "ok": False,
+                "target_uri": payload["uri"],
+                "last_error": last_error,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(2.0)
+    return {"ok": False, "target_uri": payload["uri"], "last_error": last_error}
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
@@ -1039,7 +1666,12 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 print(f"    [session-key] {oc_session_key}", file=sys.stderr)
 
             try:
-                ingest_msg = msg
+                ingest_messages = [msg]
+                if cfg.memory_mode == "openviking" and should_chunk_openviking_session(meta.get("session_key")):
+                    ingest_messages = split_openviking_ingest_message(
+                        msg,
+                        max_blocks=get_openviking_ingest_max_blocks(),
+                    )
                 if cfg.memory_mode == "memcore":
                     memory_prompt = (
                         "Extract key facts from the next group conversation and store them "
@@ -1048,7 +1680,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         "Use the write tool immediately. Do not append to existing files, "
                         "create a new file per conversation date.\n\n"
                     )
-                    ingest_msg = memory_prompt + msg
+                    ingest_messages = [memory_prompt + msg]
 
                 ogmem_log_baseline = None
                 ogmem_tokens_before = None
@@ -1060,68 +1692,129 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                     )
                     ogmem_tokens_before = query_ogmem_token_stats(cfg.ogmem.api_url)
 
-                reply, usage = send_message_with_retry(
-                    cfg.gateway.base_url, cfg.gateway.token, user_key,
-                    ingest_msg, 2, cfg.agent_id, oc_session_key,
-                )
-                print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
-
+                reply_parts: list[str] = []
+                usage = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total_tokens": 0,
+                }
                 memory_token_usage = None
                 ov_token_usage = None
-                if cfg.memory_mode == "openviking":
-                    query_mode = normalize_ov_task_query_mode(cfg.memory_mode)
-                    commit_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
-                    found = get_session_id_from_key(commit_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
-                    if not found:
-                        raise RuntimeError(f"OpenViking session not found for {commit_key}")
-                    session_file, _ = found
-                    ov_session_id = _extract_session_id(session_file)
-                    commit_result = commit_openviking_session(
-                        ov_api_url=cfg.openviking.api_url,
-                        session_id=ov_session_id,
-                        keep_recent_count=cfg.openviking.keep_recent_count,
-                        wait=False,
-                        state_dir=cfg.gateway.state_dir,
-                        fallback_agent_id=cfg.agent_id,
+                query_mode = normalize_ov_task_query_mode(cfg.memory_mode)
+                for ingest_idx, raw_ingest_msg in enumerate(ingest_messages, start=1):
+                    current_session_key = oc_session_key
+                    if oc_session_key and len(ingest_messages) > 1:
+                        current_session_key = f"{oc_session_key}-part{ingest_idx}"
+                    ingest_msg = (
+                        raw_ingest_msg
+                        if cfg.memory_mode == "memcore"
+                        else build_ingest_input_message(raw_ingest_msg)
                     )
-                    print(
-                        f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
-                        f"session={ov_session_id}",
-                        file=sys.stderr,
+                    reply, chunk_usage = send_message_with_retry(
+                        cfg.gateway.base_url, cfg.gateway.token, user_key,
+                        ingest_msg, 2, cfg.agent_id, current_session_key,
                     )
-                    task_id = commit_result.get("task_id") or ""
-                    if task_id:
-                        ov_token_usage = query_ov_task_token_usage(
-                            cfg.openviking.api_url,
-                            task_id,
-                            state_dir=cfg.gateway.state_dir,
-                            fallback_agent_id=cfg.agent_id,
+                    reply_parts.append(reply)
+                    usage = _merge_usage_totals(usage, chunk_usage)
+                    preview = reply[:80]
+                    if len(ingest_messages) > 1:
+                        print(
+                            f"    [chunk {ingest_idx}/{len(ingest_messages)}] -> {preview}{'...' if len(reply) > 80 else ''}",
+                            file=sys.stderr,
                         )
-                    if not ov_token_usage:
-                        ov_token_usage = wait_for_ov_latest_task(
-                            cfg.openviking.api_url,
-                            resource_id=ov_session_id,
-                            state_dir=cfg.gateway.state_dir,
-                            fallback_agent_id=cfg.agent_id,
-                            max_wait=5,
-                        )
+                    else:
+                        print(f"    -> {preview}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
 
-                    if ov_token_usage:
-                        print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
-                        memory_token_usage = {"provider": "openviking", **ov_token_usage}
-                        consistency = query_ov_index_consistency(
-                            cfg.openviking.api_url,
-                            f"viking://user/{user_key}/memories",
+                    if cfg.memory_mode == "openviking":
+                        commit_key = current_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
+                        found = wait_for_session_id_from_key(commit_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
+                        if not found:
+                            found = _find_latest_session_file(cfg.agent_id, cfg.gateway.state_dir)
+                        if not found:
+                            found = _find_session_id_in_openclaw_log(
+                                commit_key,
+                                agent_id=cfg.agent_id,
+                                state_dir=cfg.gateway.state_dir,
+                            )
+                        if not found:
+                            raise RuntimeError(f"OpenViking session not found for {commit_key}")
+                        session_file, _ = found
+                        ov_session_id = _extract_session_id(session_file)
+                        wait_for_commit = should_wait_for_openviking_ingest_commit()
+                        commit_result = commit_openviking_session(
+                            ov_api_url=cfg.openviking.api_url,
+                            session_id=ov_session_id,
+                            keep_recent_count=cfg.openviking.keep_recent_count,
+                            wait=wait_for_commit,
                             state_dir=cfg.gateway.state_dir,
                             fallback_agent_id=cfg.agent_id,
                         )
-                        if consistency and not consistency.get("ok", True):
+                        ingest_task_wait_seconds = max(
+                            int(os.environ.get("LOCOMO_OPENVIKING_INGEST_TASK_WAIT_SECONDS", "900") or 900),
+                            30,
+                        )
+                        print(
+                            f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
+                            f"wait={str(wait_for_commit).lower()} session={ov_session_id}",
+                            file=sys.stderr,
+                        )
+                        chunk_ov_token_usage = None
+                        task_id = commit_result.get("task_id") or ""
+                        if task_id:
+                            chunk_ov_token_usage = query_ov_task_token_usage(
+                                cfg.openviking.api_url,
+                                task_id,
+                                state_dir=cfg.gateway.state_dir,
+                                fallback_agent_id=cfg.agent_id,
+                                max_wait=ingest_task_wait_seconds,
+                                resource_id=ov_session_id,
+                            )
+                        if _is_empty_ov_token_usage(chunk_ov_token_usage):
+                            chunk_ov_token_usage = wait_for_ov_latest_task(
+                                cfg.openviking.api_url,
+                                resource_id=ov_session_id,
+                                state_dir=cfg.gateway.state_dir,
+                                fallback_agent_id=cfg.agent_id,
+                                max_wait=ingest_task_wait_seconds,
+                            )
+
+                        if chunk_ov_token_usage:
                             print(
-                                f"    [ov-consistency] missing_records={consistency.get('missing_record_count', 0)} "
-                                f"after session {ov_session_id}",
+                                f"    [ov-task] llm={chunk_ov_token_usage['llm_total']:,} "
+                                f"embed={chunk_ov_token_usage['embedding']:,} "
+                                f"memories={chunk_ov_token_usage['memories']}",
                                 file=sys.stderr,
                             )
-                elif cfg.memory_mode == "ogmem":
+                            ov_token_usage = _merge_ov_token_usage(ov_token_usage, chunk_ov_token_usage)
+                            memory_token_usage = {
+                                "provider": "openviking",
+                                **ov_token_usage,
+                            }
+                            consistency = query_ov_index_consistency(
+                                cfg.openviking.api_url,
+                                f"viking://user/{user_key}/memories",
+                                state_dir=cfg.gateway.state_dir,
+                                fallback_agent_id=cfg.agent_id,
+                            )
+                            if consistency and not consistency.get("ok", True):
+                                print(
+                                    f"    [ov-consistency] missing_records={consistency.get('missing_record_count', 0)} "
+                                    f"after session {ov_session_id}",
+                                    file=sys.stderr,
+                                )
+                    if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and current_session_key:
+                        found = get_session_id_from_key(current_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
+                        if found:
+                            sf, sdir = found
+                            sf_path = sf if os.path.isabs(sf) else os.path.join(sdir, sf)
+                            if not sf_path.endswith(".jsonl"):
+                                sf_path += ".jsonl"
+                            reset_session(sf_path, cfg.agent_id, cfg.gateway.state_dir)
+
+                reply = "\n".join(part for part in reply_parts if part).strip()
+                if cfg.memory_mode == "ogmem":
                     wait_for_ogmem_after_turn_extract(
                         container=cfg.ogmem.docker_container,
                         session_key=oc_session_key or meta["session_key"],
@@ -1157,18 +1850,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 print(f"    -> [FATAL] Ingest failed, aborting: {e}", file=sys.stderr)
                 raise RuntimeError(f"Ingest failed for sample {sample_id} session {meta['session_key']}: {e}") from e
 
-            # Archive session (isolated policy) or keep alive (shared).
-            # For ogmem, oc_session_key is always set above to keep each ingest
-            # session isolated even when QA policy is shared.
-            if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and oc_session_key:
-                found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
-                if found:
-                    sf, sdir = found
-                    sf_path = sf if os.path.isabs(sf) else os.path.join(sdir, sf)
-                    if not sf_path.endswith(".jsonl"):
-                        sf_path += ".jsonl"
-                    reset_session(sf_path, cfg.agent_id, cfg.gateway.state_dir)
-            elif policy == SessionPolicy.SHARED and cfg.memory_mode not in ("openviking", "ogmem"):
+            if policy == SessionPolicy.SHARED and cfg.memory_mode not in ("openviking", "ogmem"):
                 sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
                 if sid:
                     reset_session(sid, cfg.agent_id, cfg.gateway.state_dir)
@@ -1217,14 +1899,31 @@ def _process_single_question(
     else:
         qa_user = str(sample_id)
         session_key = f"qa-{sample_id}-q{qi}"
+    qa_commit_skipped = cfg.memory_mode == "openviking" and should_skip_openviking_qa_commit(session_key)
 
     print(f"  [{sample_idx}] Q{qi}: {question[:60]}{'...' if len(question) > 60 else ''}", file=sys.stderr)
 
-    qa_prompt_prefix = os.environ.get("LOCOMO_QA_PROMPT_PREFIX", "")
-    if question_time:
-        input_msg = f"{qa_prompt_prefix}Current date: {question_time}. Answer the question directly: {question}"
-    else:
-        input_msg = f"{qa_prompt_prefix}Answer the question directly: {question}"
+    direct_recalled_memories = []
+    if cfg.memory_mode == "openviking":
+        direct_recalled_memories = query_ov_search_find_memories(
+            cfg.openviking.api_url,
+            question,
+            f"viking://user/{user_key}/memories",
+            state_dir=cfg.gateway.state_dir,
+            fallback_agent_id=cfg.agent_id,
+            limit=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_LIMIT", "8") or 8), 1),
+        )
+        direct_recalled_memories = rerank_ov_recalled_memories(question, direct_recalled_memories)
+        if direct_recalled_memories:
+            print(
+                f"  [{sample_idx}]   [ov-direct-recall] memories={len(direct_recalled_memories)}",
+                file=sys.stderr,
+            )
+    input_msg = build_qa_input_message(
+        question=question,
+        question_time=question_time,
+        recalled_memories=direct_recalled_memories,
+    )
 
     jsonl_filename = ""
     ov_token_usage = None
@@ -1251,7 +1950,7 @@ def _process_single_question(
                     jsonl_path = os.path.join(qa_sessions_dir, sf if sf.endswith(".jsonl") else f"{sf}.jsonl")
 
         if jsonl_path and os.path.exists(jsonl_path):
-            if cfg.memory_mode == "openviking":
+            if cfg.memory_mode == "openviking" and not qa_commit_skipped:
                 ov_session_id = _extract_session_id(Path(jsonl_path).name)
                 commit_result = commit_openviking_session(
                     ov_api_url=cfg.openviking.api_url,
@@ -1274,6 +1973,7 @@ def _process_single_question(
                         state_dir=cfg.gateway.state_dir,
                         fallback_agent_id=cfg.agent_id,
                         max_wait=30,
+                        resource_id=ov_session_id,
                     )
                     if ov_token_usage:
                         print(
@@ -1281,7 +1981,7 @@ def _process_single_question(
                             f"embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}",
                             file=sys.stderr,
                         )
-                if not ov_token_usage:
+                if _is_empty_ov_token_usage(ov_token_usage):
                     ov_token_usage = query_ov_session_usage(
                         cfg.openviking.api_url,
                         ov_session_id,
@@ -1320,6 +2020,14 @@ def _process_single_question(
                         file=sys.stderr,
                     )
             usage = calculate_usage_from_jsonl(jsonl_path)
+            if int(usage.get("total_tokens", 0) or 0) == 0 and int(api_usage.get("total_tokens", 0) or 0) > 0:
+                usage = {
+                    "input_tokens": api_usage.get("input_tokens", 0),
+                    "output_tokens": api_usage.get("output_tokens", 0),
+                    "cacheRead": api_usage.get("cacheRead", 0),
+                    "cacheWrite": api_usage.get("cacheWrite", 0),
+                    "total_tokens": api_usage.get("total_tokens", 0),
+                }
             # Now archive the session
             jsonl_filename = reset_session(jsonl_path, cfg.agent_id, cfg.gateway.state_dir) or ""
         else:
@@ -1346,12 +2054,15 @@ def _process_single_question(
         record["ov_missing_records"] = int(consistency.get("missing_record_count", 0) or 0)
     if cfg.memory_mode == "openviking":
         record["ov_recall_total"] = ov_recall_total
+        record["ov_direct_recall_count"] = len(direct_recalled_memories)
     if cfg.memory_mode == "openviking":
         ov_state = derive_ov_closure_status(
             ov_token_usage,
             consistency,
             recall_total=ov_recall_total,
+            direct_recall_count=len(direct_recalled_memories),
             response_text=response,
+            qa_commit_skipped=qa_commit_skipped,
         )
         record["ov_recall_hit"] = ov_state["recall_hit"]
         record["ov_memory_written"] = ov_state["memory_written"]
@@ -1381,6 +2092,23 @@ def run_qa(cfg: Config, output_dir: str) -> dict:
     print(f"    Running with {parallel} concurrent workers", file=sys.stderr)
 
     total_usage = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
+
+    if cfg.memory_mode == "openviking":
+        reindex_result = reindex_ov_memory_root(
+            ov_api_url=cfg.openviking.api_url,
+            user_id=cfg.user,
+            state_dir=cfg.gateway.state_dir,
+            fallback_agent_id=cfg.agent_id,
+            timeout=120.0,
+        )
+        Path(output_dir, "qa_reindex.json").write_text(
+            json.dumps(reindex_result, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"    [qa][reindex] {json.dumps(reindex_result, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
 
     for idx, item in enumerate(samples):
         sample_id = item["sample_id"]

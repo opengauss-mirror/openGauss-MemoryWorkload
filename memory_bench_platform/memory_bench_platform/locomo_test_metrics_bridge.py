@@ -25,10 +25,19 @@ def check_locomo_qa_results(output_dir: str) -> dict[str, Any]:
         issues["empty_or_error_responses"] = empty_responses
 
     ov_token_col = "ov_llm_total_tokens"
+    direct_recall_only_rows = sum(
+        1
+        for row in rows
+        if str(row.get("ov_closure_state") or "").strip() == "qa_direct_recall_only"
+        and int((row.get("ov_direct_recall_count") or "0").strip() or 0) > 0
+    )
     if rows and ov_token_col in rows[0]:
         ov_zero = sum(1 for row in rows if int((row.get(ov_token_col) or "0").strip() or 0) == 0)
         if ov_zero == len(rows):
-            issues["openviking_tokens_all_zero"] = ov_zero
+            if direct_recall_only_rows == len(rows) and direct_recall_only_rows > 0:
+                issues["openviking_direct_recall_only_mode"] = direct_recall_only_rows
+            else:
+                issues["openviking_tokens_all_zero"] = ov_zero
 
     ov_missing_col = "ov_missing_records"
     if rows and ov_missing_col in rows[0]:
@@ -80,6 +89,7 @@ def summarize_locomo_qa_results(output_dir: str) -> dict[str, Any]:
             "dominant_state": dominant_state,
             "has_memory_written": _has_true("ov_memory_written"),
             "has_token_emitted": _has_true("ov_token_emitted"),
+            "has_direct_recall": any(int((row.get("ov_direct_recall_count") or "0").strip() or 0) > 0 for row in valid),
             "has_index_unavailable": any(
                 str((row.get("ov_index_available") or "")).strip().lower() == "false"
                 for row in valid
@@ -110,6 +120,7 @@ def derive_locomo_ov_closure_summary(rows: list[dict], counts: dict[str, int]) -
         "dominant_state": dominant_state,
         "has_memory_written": _has_true("ov_memory_written"),
         "has_token_emitted": _has_true("ov_token_emitted"),
+        "has_direct_recall": any(int((row.get("ov_direct_recall_count") or "0").strip() or 0) > 0 for row in rows),
         "has_index_unavailable": any(
             str((row.get("ov_index_available") or "")).strip().lower() == "false"
             for row in rows

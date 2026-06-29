@@ -18,3 +18,9 @@ ingest = true
 qa = true
 judge = true
 stats = true
+
+[openviking]
+keep_recent_count = 0
+
+[openclaw]
+timeout_seconds = 900

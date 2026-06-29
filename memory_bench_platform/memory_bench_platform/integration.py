@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .loader import load_all_skills
-from .manifests import AgentManifest, BenchmarkManifest
+from .manifests import AgentManifest, BenchmarkManifest, SmokeManifest
 from .paths import PROJECT_ROOT, SKILLS_ROOT
 from .protocol import EntryPointRecord, RenderedTaskInput
 
@@ -32,6 +32,14 @@ def get_agent_manifest(skill_id: str) -> AgentManifest:
     raise FileNotFoundError(f"agent skill not found: {skill_id}")
 
 
+def get_smoke_manifest(skill_id: str) -> SmokeManifest:
+    loaded = load_all_skills(SKILLS_ROOT)
+    for manifest in loaded["smokes"]:
+        if manifest.id == skill_id:
+            return manifest
+    raise FileNotFoundError(f"smoke skill not found: {skill_id}")
+
+
 def _script_for_manifest(manifest_path: Path, relative_script: str) -> Path:
     return manifest_path.parent / relative_script
 
@@ -46,6 +54,46 @@ def run_json_script(script_path: Path, *, args: list[str] | None = None, stdin_p
         check=True,
     )
     return json.loads(proc.stdout or "{}")
+
+
+def validate_smoke(skill_id: str) -> dict:
+    manifest = get_smoke_manifest(skill_id)
+    manifest_path = _manifest_path("smoke", skill_id)
+    probe = run_json_script(_script_for_manifest(manifest_path, manifest.entry.probe_builder))
+    payload = run_json_script(
+        _script_for_manifest(manifest_path, manifest.entry.validator),
+        stdin_payload=probe,
+    )
+    return {"probe": probe, "validation": payload}
+
+
+def execute_smoke_skill(skill_id: str, run_dir: Path) -> dict[str, Any]:
+    manifest = get_smoke_manifest(skill_id)
+    manifest_path = _manifest_path("smoke", skill_id)
+    probe = run_json_script(
+        _script_for_manifest(manifest_path, manifest.entry.probe_builder),
+        args=[str(run_dir)],
+    )
+    validation = run_json_script(
+        _script_for_manifest(manifest_path, manifest.entry.validator),
+        args=[str(run_dir)],
+        stdin_payload=probe,
+    )
+    report = run_json_script(
+        _script_for_manifest(manifest_path, manifest.entry.reporter),
+        stdin_payload={
+            "probe": probe,
+            "validation": validation,
+            "manifest": manifest.model_dump(mode="json"),
+            "run_dir": str(run_dir),
+        },
+    )
+    return {
+        "manifest": manifest.model_dump(mode="json"),
+        "probe": probe,
+        "validation": validation,
+        "report": report,
+    }
 
 
 def validate_benchmark(skill_id: str, source_path: str | None = None) -> dict:

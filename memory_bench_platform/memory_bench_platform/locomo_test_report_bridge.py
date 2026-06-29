@@ -22,6 +22,7 @@ def render_locomo_test_html_report(output_dir: Path) -> str:
     closure_summary = meta.get("ov_closure_summary", {}) or {}
     issues = diagnostics.get("issues", {}) or {}
     token_totals = meta.get("memory_token_totals", {}) or {}
+    direct_recall_mode = int(issues.get("openviking_direct_recall_only_mode", 0) or 0)
 
     focus_rows = [
         row for row in rows
@@ -113,6 +114,16 @@ def render_locomo_test_html_report(output_dir: Path) -> str:
   <div class="wrap">
     <h1>{title}</h1>
     <div class="muted">LoCoMo / OpenClaw / OpenViking 测试报告</div>
+    {
+        "<div class='card' style='margin-top:16px; border-color:#0f766e; background:rgba(15,118,110,.10)'>"
+        "<h2>QA Mode</h2>"
+        f"<div class='ok'>检测到 {direct_recall_mode} 条 `qa_direct_recall_only` 样本。"
+        "这表示 QA 主要通过 direct recall 命中 memory 后直接回答，属于当前已验证的有效模式，"
+        "不应再按 `openviking_tokens_all_zero` 解释为链路异常。</div>"
+        "</div>"
+        if direct_recall_mode
+        else ""
+    }
 
     <div class="grid">
       <div class="card"><div class="muted">Overall Accuracy</div><div class="metric ok">{accuracy}</div></div>

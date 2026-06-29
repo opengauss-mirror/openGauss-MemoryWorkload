@@ -39,6 +39,7 @@ def test_import_external_result_reads_locomo_diagnostics_when_present(tmp_path: 
                 "total_correct": 26,
                 "total_graded": 35,
                 "total_questions": 35,
+                "qa_reindex": {"ok": True, "target_uri": "viking://user/eval-1/memories"},
                 "ov_closure_summary": {
                     "dominant_state": "memory_recalled_with_consistency_gap",
                     "has_memory_written": True,
@@ -76,7 +77,54 @@ def test_import_external_result_reads_locomo_diagnostics_when_present(tmp_path: 
     assert result["benchmark_diagnostics"]["source"] == "locomo_test"
     assert result["benchmark_diagnostics"]["ov_closure_counts"]["no_memory_signal"] == 5
     assert result["benchmark_diagnostics"]["issues"]["openviking_memory_written_but_index_unavailable"] == 30
+    assert result["benchmark_diagnostics"]["qa_reindex"]["ok"] is True
     assert result["benchmark_diagnostics"]["artifacts"]["report_html"].endswith("report.html")
+
+
+def test_import_external_result_marks_invalid_locomo_run_when_memory_extraction_missing(tmp_path: Path):
+    (tmp_path / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.0,
+                "total_correct": 0,
+                "total_graded": 35,
+                "total_questions": 35,
+                "memory_token_totals": {
+                    "provider": "openviking",
+                    "llm_total": 0,
+                    "embedding": 0,
+                    "memories": 0,
+                },
+                "ov_closure_summary": {
+                    "dominant_state": "qa_direct_recall_only",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "qa_diagnostics.json").write_text(
+        json.dumps(
+            {
+                "issues": {
+                    "openviking_tokens_all_zero": 35,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "qa_results.csv").write_text(
+        "sample_id,qi,question,expected,response,category,result,reasoning\n"
+        "conv-1,1,Q1,A1,R1,1,WRONG,bad\n",
+        encoding="utf-8",
+    )
+
+    result = import_external_result(tmp_path)
+
+    assert result["summary"]["run_validity"]["valid"] is False
+    assert result["summary"]["run_validity"]["reasons"] == [
+        "openviking_memory_extraction_unavailable"
+    ]
+    assert result["benchmark_diagnostics"]["run_validity"]["valid"] is False
 
 
 def test_import_external_result_falls_back_to_csv_only(tmp_path: Path):
