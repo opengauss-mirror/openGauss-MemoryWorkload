@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import threading
 import time
+from typing import Sequence
 
 
 @dataclass
@@ -34,6 +35,7 @@ class ResourceMonitor:
         self.sample_interval_seconds = sample_interval_seconds
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_cpu_counters: tuple[float, ...] | None = None
 
     def setup_writers(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -46,15 +48,30 @@ class ResourceMonitor:
         for writer in writers:
             writer.create()
 
-    def _read_cpu_percentages(self) -> tuple[float, float, float]:
+    def _read_cpu_counters(self) -> tuple[float, ...]:
         cpu_line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
         parts = cpu_line.split()[1:]
-        values = [float(item) for item in parts[:7]]
-        total = sum(values) or 1.0
-        user = values[0] / total * 100
-        system = values[2] / total * 100
-        idle = values[3] / total * 100
+        return tuple(float(item) for item in parts[:7])
+
+    def _compute_cpu_percentages(
+        self,
+        previous: Sequence[float],
+        current: Sequence[float],
+    ) -> tuple[float, float, float]:
+        deltas = [max(0.0, float(cur) - float(prev)) for prev, cur in zip(previous, current)]
+        total = sum(deltas) or 1.0
+        user = deltas[0] / total * 100
+        system = deltas[2] / total * 100
+        idle = deltas[3] / total * 100
         return round(user, 2), round(system, 2), round(idle, 2)
+
+    def _read_cpu_percentages(self) -> tuple[float, float, float]:
+        current = self._read_cpu_counters()
+        previous = self._last_cpu_counters
+        self._last_cpu_counters = current
+        if previous is None:
+            return 0.0, 0.0, 100.0
+        return self._compute_cpu_percentages(previous, current)
 
     def _read_memory_usage_mb(self) -> tuple[float, float]:
         meminfo = {}
