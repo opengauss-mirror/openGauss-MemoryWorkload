@@ -10,6 +10,7 @@ from pathlib import Path
 from .backends import validate_openviking_source
 from .external_report_import import import_external_result
 from .integration import (
+    build_run_contract,
     build_cases_from_source,
     execute_external_runner,
     execute_smoke_skill,
@@ -194,6 +195,7 @@ def main(argv: list[str] | None = None) -> None:
         payload = {
             "benchmarks": [skill.id for skill in loaded["benchmarks"]],
             "agents": [skill.id for skill in loaded["agents"]],
+            "memories": [skill.id for skill in loaded["memories"]],
             "smokes": [skill.id for skill in loaded["smokes"]],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -216,6 +218,12 @@ def main(argv: list[str] | None = None) -> None:
                 api_key=args.api_key,
                 vlm_model=args.vlm_model,
                 embedding_model=args.embedding_model,
+            )
+        if args.benchmark and args.agent:
+            payload["run_contract"] = build_run_contract(
+                args.benchmark,
+                args.agent,
+                args.memory_backend,
             )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -259,12 +267,23 @@ def main(argv: list[str] | None = None) -> None:
     version_overrides = _parse_version_overrides(getattr(args, "version_override", []))
 
     if args.command == "plan-run":
-        print(json.dumps(asdict(plan), ensure_ascii=False, indent=2))
+        payload = asdict(plan)
+        payload["run_contract"] = build_run_contract(
+            args.benchmark,
+            args.agent,
+            args.memory_backend,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
     storage = RunStorage(Path.cwd() / "runs")
     benchmark_manifest = load_benchmark_skill(SKILLS_ROOT, args.benchmark)
     agent_manifest = load_agent_skill(SKILLS_ROOT, args.agent)
+    run_contract = build_run_contract(
+        args.benchmark,
+        args.agent,
+        args.memory_backend,
+    )
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
     source_kind = "external_benchmark_runner" if entrypoint.entrypoint_kind == "external_runner" else "benchmark_case_source"
     run_record = RunRecord(
@@ -277,7 +296,7 @@ def main(argv: list[str] | None = None) -> None:
         agent_id=plan.agent_id,
         agent_skill_version=agent_manifest.version,
         agent_version=plan.agent_version,
-        memory_backend=plan.memory_backend,
+        memory_backend=str(run_contract["selection"].get("memory_id") or plan.memory_backend or ""),
         hardware_profile=plan.hardware_profile,
         benchmark_version_policy=benchmark_manifest.version_policy.model_dump(mode="json"),
         agent_version_policy=agent_manifest.version_policy.model_dump(mode="json"),
@@ -302,6 +321,7 @@ def main(argv: list[str] | None = None) -> None:
         "records/version_selection.json",
         run_record.version_selection,
     )
+    storage.write_json_record(run_dir, "records/run_contract.json", run_contract)
 
     if getattr(args, "smoke_gate", None):
         smoke_result = execute_smoke_skill(args.smoke_gate, run_dir)

@@ -14,8 +14,8 @@ from .official_small_timing import (
     render_official_small_timing_html,
 )
 from .external_report_import import import_external_result
-from .locomo_test_diagnostics import diagnose_locomo_test_output
-from .locomo_test_timing import build_locomo_test_timing_report, render_locomo_test_timing_html
+from .adapters.locomo.diagnostics import diagnose_locomo_test_output
+from .adapters.locomo.timing import build_locomo_test_timing_report, render_locomo_test_timing_html
 from .reporter import write_analysis_json, write_analysis_markdown
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .reporter import write_run_report_html, write_timing_report_html, write_timing_report_json

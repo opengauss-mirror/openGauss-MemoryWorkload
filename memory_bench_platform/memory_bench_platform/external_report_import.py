@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .locomo_test_artifacts import load_locomo_test_artifacts
+from .adapters.locomo.artifacts import load_locomo_test_artifacts
 
 def import_external_result(run_dir: Path) -> dict[str, Any]:
     bundle = load_locomo_test_artifacts(run_dir)

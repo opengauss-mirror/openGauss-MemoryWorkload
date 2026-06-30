@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import subprocess
 import sys
@@ -7,9 +8,21 @@ from pathlib import Path
 from typing import Any
 
 from .loader import load_all_skills
-from .manifests import AgentManifest, BenchmarkManifest, SmokeManifest
+from .manifests import AgentManifest, BenchmarkManifest, MemoryManifest, SmokeManifest
 from .paths import PROJECT_ROOT, SKILLS_ROOT
 from .protocol import EntryPointRecord, RenderedTaskInput
+
+
+@dataclass(frozen=True)
+class RunSkillBundle:
+    skills_root: Path
+    benchmark: BenchmarkManifest
+    agent: AgentManifest
+    memory: MemoryManifest | None = None
+
+    @property
+    def memory_id(self) -> str | None:
+        return self.memory.id if self.memory is not None else None
 
 
 def _manifest_path(kind: str, skill_id: str) -> Path:
@@ -30,6 +43,14 @@ def get_agent_manifest(skill_id: str) -> AgentManifest:
         if manifest.id == skill_id:
             return manifest
     raise FileNotFoundError(f"agent skill not found: {skill_id}")
+
+
+def get_memory_manifest(skill_id: str) -> MemoryManifest:
+    loaded = load_all_skills(SKILLS_ROOT)
+    for manifest in loaded["memories"]:
+        if manifest.id == skill_id:
+            return manifest
+    raise FileNotFoundError(f"memory skill not found: {skill_id}")
 
 
 def get_smoke_manifest(skill_id: str) -> SmokeManifest:
@@ -113,6 +134,87 @@ def validate_agent(skill_id: str) -> dict:
     if not script:
         raise ValueError(f"agent skill {skill_id} has no healthcheck or runner")
     return run_json_script(_script_for_manifest(manifest_path, script))
+
+
+def resolve_run_skill_bundle(
+    benchmark_id: str,
+    agent_id: str,
+    memory_id: str | None = None,
+    *,
+    skills_root: Path = SKILLS_ROOT,
+) -> RunSkillBundle:
+    loaded = load_all_skills(skills_root)
+    benchmark = _find_manifest_by_id(loaded["benchmarks"], benchmark_id, kind="benchmark")
+    agent = _find_manifest_by_id(loaded["agents"], agent_id, kind="agent")
+    resolved_memory_id = memory_id or str(agent.runtime.get("default_memory_skill", "") or "").strip() or None
+    memory = None
+    if resolved_memory_id:
+        memory = _find_manifest_by_id(loaded["memories"], resolved_memory_id, kind="memory")
+    bundle = RunSkillBundle(
+        skills_root=skills_root,
+        benchmark=benchmark,
+        agent=agent,
+        memory=memory,
+    )
+    _validate_run_skill_bundle(bundle)
+    return bundle
+
+
+def build_run_contract(
+    benchmark_id: str,
+    agent_id: str,
+    memory_id: str | None = None,
+    *,
+    skills_root: Path = SKILLS_ROOT,
+) -> dict[str, Any]:
+    bundle = resolve_run_skill_bundle(
+        benchmark_id,
+        agent_id,
+        memory_id,
+        skills_root=skills_root,
+    )
+    benchmark = bundle.benchmark
+    agent = bundle.agent
+    memory = bundle.memory
+    benchmark_execution = benchmark.execution or {}
+    memory_runtime = memory.runtime if memory is not None else {}
+    memory_ingest = memory.ingest if memory is not None else {}
+    memory_recall = memory.recall if memory is not None else {}
+    memory_completion = memory.completion if memory is not None else {}
+
+    return {
+        "selection": {
+            "benchmark_id": benchmark.id,
+            "agent_id": agent.id,
+            "memory_id": bundle.memory_id,
+        },
+        "execution": {
+            "benchmark_mode": benchmark_execution.get("mode"),
+            "task_isolation": benchmark_execution.get("task_isolation"),
+            "requires_stateful_agent": bool(benchmark_execution.get("requires_stateful_agent")),
+            "benchmark_ingest_unit": benchmark_execution.get("ingest_unit"),
+            "entrypoints": benchmark_execution.get("entrypoints", {}),
+        },
+        "agent_runtime": {
+            "mode": agent.runtime.get("mode"),
+            "protocol_mode": agent.io.get("protocol_mode"),
+            "startup_required": bool(agent.lifecycle.get("startup_required")),
+            "default_memory_skill": agent.runtime.get("default_memory_skill"),
+        },
+        "memory_runtime": {
+            "enabled": memory is not None,
+            "benchmark_unit": memory_runtime.get("benchmark_unit"),
+            "ingest_benchmark_unit": memory_ingest.get("benchmark_unit"),
+            "recall_mode": memory_recall.get("mode"),
+            "accept_signal": memory_completion.get("accept_signal"),
+            "complete_signal": memory_completion.get("complete_signal"),
+        },
+        "version_targets": {
+            "benchmark": [target.model_dump(mode="json") for target in benchmark.version_policy.targets],
+            "agent": [target.model_dump(mode="json") for target in agent.version_policy.targets],
+            "memory": [target.model_dump(mode="json") for target in memory.version_policy.targets] if memory else [],
+        },
+    }
 
 
 def build_benchmark_tasks(skill_id: str, source_path: str | None = None) -> dict:
@@ -215,3 +317,39 @@ def execute_external_runner(
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
+
+
+def _find_manifest_by_id(manifests: list[Any], skill_id: str, *, kind: str) -> Any:
+    for manifest in manifests:
+        if manifest.id == skill_id:
+            return manifest
+    raise FileNotFoundError(f"{kind} skill not found: {skill_id}")
+
+
+def _validate_run_skill_bundle(bundle: RunSkillBundle) -> None:
+    benchmark_execution = bundle.benchmark.execution or {}
+    requires_stateful_agent = bool(benchmark_execution.get("requires_stateful_agent"))
+    protocol_mode = str(bundle.agent.io.get("protocol_mode", "") or "")
+    if requires_stateful_agent and protocol_mode != "stateful_session":
+        raise ValueError(
+            f"benchmark {bundle.benchmark.id} requires stateful agent, "
+            f"but agent {bundle.agent.id} protocol_mode={protocol_mode!r}"
+        )
+
+    if bundle.memory is None:
+        return
+
+    benchmark_ingest_unit = str(benchmark_execution.get("ingest_unit", "") or "").strip()
+    memory_runtime_unit = str(bundle.memory.runtime.get("benchmark_unit", "") or "").strip()
+    memory_ingest_unit = str(bundle.memory.ingest.get("benchmark_unit", "") or "").strip()
+
+    if benchmark_ingest_unit and memory_runtime_unit and benchmark_ingest_unit != memory_runtime_unit:
+        raise ValueError(
+            f"benchmark {bundle.benchmark.id} ingest_unit={benchmark_ingest_unit!r} "
+            f"but memory {bundle.memory.id} runtime.benchmark_unit={memory_runtime_unit!r}"
+        )
+    if benchmark_ingest_unit and memory_ingest_unit and benchmark_ingest_unit != memory_ingest_unit:
+        raise ValueError(
+            f"benchmark {bundle.benchmark.id} ingest_unit={benchmark_ingest_unit!r} "
+            f"but memory {bundle.memory.id} ingest.benchmark_unit={memory_ingest_unit!r}"
+        )

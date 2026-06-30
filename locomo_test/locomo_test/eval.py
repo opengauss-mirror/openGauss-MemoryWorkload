@@ -17,7 +17,68 @@ from threading import Lock
 
 import requests
 
+from . import openviking_backend as ov_backend
 from .config import Config, SessionPolicy
+from .memory_backend_adapter import OpenVikingMemoryBackend
+from .recall_rendering import (
+    augment_ov_recall_with_named_person_entities as _augment_ov_recall_with_named_person_entities,
+    build_ingest_input_message,
+    build_qa_input_message,
+    format_ov_recall_evidence_block,
+    rerank_ov_recalled_memories,
+)
+from .session_store import (
+    calculate_usage_from_jsonl,
+    find_latest_session_file,
+    find_session_id_in_openclaw_log,
+    get_session_id,
+    get_session_id_from_key,
+    is_already_ingested,
+    load_ingest_record,
+    mark_ingested,
+    reset_session,
+    save_ingest_record,
+    wait_for_session_id_from_key,
+)
+
+_find_latest_session_file = find_latest_session_file
+_find_session_id_in_openclaw_log = find_session_id_in_openclaw_log
+
+
+def _build_openviking_memory_backend(cfg: Config, *, user_id: str | None = None) -> OpenVikingMemoryBackend:
+    return OpenVikingMemoryBackend(
+        api_url=cfg.openviking.api_url,
+        state_dir=cfg.gateway.state_dir,
+        user_id=user_id or cfg.user,
+        agent_id=cfg.agent_id,
+        keep_recent_count=cfg.openviking.keep_recent_count,
+        commit_session_fn=commit_openviking_session,
+        query_task_usage_fn=query_ov_task_token_usage,
+        wait_latest_task_fn=wait_for_ov_latest_task,
+        query_session_usage_fn=query_ov_session_usage,
+        consistency_fn=query_ov_index_consistency,
+        search_memories_fn=query_ov_search_find_memories,
+        search_total_fn=query_ov_search_find_total,
+    )
+
+
+def wait_for_session_id_from_key(
+    session_key: str,
+    user: str,
+    agent_id: str = "main",
+    state_dir: str = "",
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.5,
+) -> tuple[str, str] | None:
+    deadline = time.monotonic() + max(timeout, 0.1)
+    while True:
+        found = get_session_id_from_key(session_key, user, agent_id, state_dir)
+        if found:
+            return found
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(max(interval, 0.05))
 
 # ---------------------------------------------------------------------------
 # LoCoMo JSON parsing
@@ -137,199 +198,6 @@ def get_sample_question_time(sample: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Ingest record (avoid duplicate ingestion)
-# ---------------------------------------------------------------------------
-
-def load_ingest_record(record_path: str) -> dict:
-    try:
-        with open(record_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, IOError):
-        return {}
-
-
-def save_ingest_record(record: dict, record_path: str) -> None:
-    try:
-        with open(record_path, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2, ensure_ascii=False)
-    except IOError as e:
-        print(f"Warning: Error saving ingest record: {e}", file=sys.stderr)
-
-
-def is_already_ingested(agent_id: str, user_key: str, sample_id, session_key: str, record: dict) -> bool:
-    key = f"{agent_id}:{user_key}:{sample_id}:{session_key}"
-    return key in record and record[key].get("success", False)
-
-
-def mark_ingested(agent_id: str, user_key: str, sample_id, session_key: str, record: dict, meta: dict | None = None):
-    key = f"{agent_id}:{user_key}:{sample_id}:{session_key}"
-    record[key] = {"success": True, "timestamp": int(time.time()), "meta": meta or {}}
-
-
-# ---------------------------------------------------------------------------
-# OpenClaw state dir helpers
-# ---------------------------------------------------------------------------
-
-def get_session_id_from_key(session_key: str, user: str, agent_id: str = "main", state_dir: str = "") -> tuple[str, str] | None:
-    """Find session file by key. Returns (session_file, sessions_dir) or None."""
-    agents_base_dir = os.path.join(state_dir, "agents")
-    if not os.path.exists(agents_base_dir):
-        return None
-    for agent_name in os.listdir(agents_base_dir):
-        agent_dir = os.path.join(agents_base_dir, agent_name)
-        if not os.path.isdir(agent_dir):
-            continue
-        sessions_dir = os.path.join(agent_dir, "sessions")
-        sessions_file = os.path.join(sessions_dir, "sessions.json")
-        if not os.path.exists(sessions_file):
-            continue
-        try:
-            with open(sessions_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for key, value in data.items():
-                if session_key in key and isinstance(value, dict):
-                    sf = value.get("sessionFile")
-                    if sf:
-                        return sf, sessions_dir
-        except (json.JSONDecodeError, IOError):
-            continue
-    return None
-
-
-def get_session_id(user: str, agent_id: str = "main", state_dir: str = "") -> str | None:
-    sessions_file = os.path.join(state_dir, "agents", agent_id, "sessions", "sessions.json")
-    try:
-        with open(sessions_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        key = f"agent:{agent_id}:openresponses-user:{user}"
-        return data.get(key, {}).get("sessionId")
-    except (FileNotFoundError, json.JSONDecodeError, IOError):
-        return None
-
-
-def wait_for_session_id_from_key(
-    session_key: str,
-    user: str,
-    agent_id: str = "main",
-    state_dir: str = "",
-    *,
-    timeout: float = 10.0,
-    interval: float = 0.5,
-) -> tuple[str, str] | None:
-    deadline = time.monotonic() + max(timeout, 0.1)
-    while True:
-        found = get_session_id_from_key(session_key, user, agent_id, state_dir)
-        if found:
-            return found
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(max(interval, 0.05))
-
-
-def _find_latest_session_file(agent_id: str = "main", state_dir: str = "") -> tuple[str, str] | None:
-    agents_base_dir = os.path.join(state_dir, "agents")
-    if not os.path.isdir(agents_base_dir):
-        return None
-    agent_names = []
-    if agent_id:
-        agent_names.append(agent_id)
-    for name in os.listdir(agents_base_dir):
-        if name not in agent_names:
-            agent_names.append(name)
-    candidates = []
-    for current_agent in agent_names:
-        sessions_dir = os.path.join(agents_base_dir, current_agent, "sessions")
-        if not os.path.isdir(sessions_dir):
-            continue
-        for name in os.listdir(sessions_dir):
-            if not name.endswith(".jsonl"):
-                continue
-            path = os.path.join(sessions_dir, name)
-            if not os.path.isfile(path):
-                continue
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            priority = 0 if current_agent == agent_id else 1
-            candidates.append((priority, mtime, name, sessions_dir))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item[0], -item[1]))
-    _, _, name, sessions_dir = candidates[0]
-    return name, sessions_dir
-
-
-def _find_session_id_in_openclaw_log(
-    session_key: str,
-    *,
-    agent_id: str = "main",
-    state_dir: str = "",
-    log_dir: str = "/tmp/openclaw",
-) -> tuple[str, str] | None:
-    if not session_key:
-        return None
-    log_path = os.path.join(log_dir, f"openclaw-{time.strftime('%Y-%m-%d')}.log")
-    if not os.path.exists(log_path):
-        return None
-    sessions_dir = os.path.join(state_dir, "agents", agent_id, "sessions")
-    session_id = ""
-    try:
-        with open(log_path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                if session_key not in line:
-                    continue
-                match = re.search(r'"sessionId":"([^"]+)"', line)
-                if match:
-                    session_id = match.group(1).strip()
-        if not session_id:
-            return None
-        return f"{session_id}.jsonl", sessions_dir
-    except OSError:
-        return None
-
-
-def reset_session(session_path: str, agent_id: str = "main", state_dir: str = "") -> str | None:
-    if os.path.isabs(session_path) and os.path.exists(session_path):
-        src = session_path
-    else:
-        sessions_dir = os.path.join(state_dir, "agents", agent_id, "sessions")
-        src = os.path.join(sessions_dir, f"{session_path}.jsonl")
-    if not os.path.exists(src):
-        return None
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    dst = f"{src}.{timestamp}"
-    try:
-        os.rename(src, dst)
-        print(f"    [backup] renamed {os.path.basename(src)} -> {os.path.basename(dst)}", file=sys.stderr)
-        return os.path.basename(dst)
-    except IOError:
-        return None
-
-
-def calculate_usage_from_jsonl(jsonl_path: str) -> dict:
-    usage = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
-    if not os.path.exists(jsonl_path):
-        return usage
-    try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                entry = json.loads(line)
-                if entry.get("type") == "message" and entry.get("message", {}).get("role") == "assistant":
-                    eu = _normalize_usage(entry.get("message", {}).get("usage", {}))
-                    usage["input_tokens"] += eu.get("input_tokens", 0)
-                    usage["output_tokens"] += eu.get("output_tokens", 0)
-                    usage["cacheRead"] += eu.get("cacheRead", 0)
-                    usage["cacheWrite"] += eu.get("cacheWrite", 0)
-                    usage["total_tokens"] += eu.get("total_tokens", 0)
-    except (json.JSONDecodeError, IOError):
-        pass
-    return usage
-
-
-# ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
 
@@ -382,244 +250,24 @@ def _normalize_usage(raw: dict | None) -> dict:
     }
 
 
-DEFAULT_LOCOMO_QA_PROMPT_PREFIX = (
-    "Answer the question directly using the recalled memory snippets as the primary evidence. "
-    "Treat the normalized summary or leading bullet points at the top of each memory as authoritative, "
-    "and use them before raw chat-log details that follow. "
-    "Prefer the most specific supported fact over a generic paraphrase. "
-    "If the recalled memories contain an exact noun phrase, identity label, country, gift, relationship status, duration, or symbolic meaning, copy that specific phrase instead of replacing it with a generic phrase. "
-    "Do not replace exact facts with vague substitutes such as person, home country, object, support, or event. "
-    "For list or set questions, include only items that are explicitly supported by recalled memories and match the asked category. "
-    "Do not broaden the answer with nearby related activities, generic themes, inferred items, or unnamed placeholders. "
-    "If a list item is not explicitly named, omit it. "
-    "If a recalled memory clearly matches the event being asked about, use the matching event details even when the question wording is paraphrased. "
-    "For time questions, preserve the memory's relative phrasing such as last week, last Friday, next month, or the week before the current date unless the memory itself explicitly states a calendar date. "
-    "If the memory says an event happened in the week before the current date, answer with that relative date instead of saying it is missing. "
-    "Do not say information is unavailable when the recalled memories explicitly contain the answer. "
-    "If the recalled memories still do not support the answer, say so briefly. "
-)
-
-DEFAULT_LOCOMO_INGEST_PROMPT_PREFIX = (
-    "You are transforming a raw conversation log into memory-ingestion notes, not answering a user question. "
-    "Reply with short factual bullet points only. "
-    "Write ONE explicit fact per bullet. "
-    "Capture explicit facts for BOTH participants. "
-    "Preserve exact dates, relative dates, durations, counts, countries, gifts, relationships, plans, motivations, and workshop/camping/speech details. "
-    "Keep the conversation's own time anchors instead of today's date. "
-    "When a fact is explicit, keep the concrete noun or number exactly, including values like Sweden, necklace, 5 years, 10 years ago, June 2023, and week-before references. "
-    "No follow-up questions. No greetings, roleplay, or advice.\n\n"
-)
-
-
-def _normalize_recall_text(value: object, *, max_chars: int) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    text = re.sub(r"\s+", " ", text)
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return text[: max_chars - 3].rstrip() + "..."
-
-
-def _extract_recall_summary(memory: dict, *, max_chars: int) -> str:
-    candidates = [
-        memory.get("normalized_summary"),
-        memory.get("summary"),
-        memory.get("excerpt"),
-        memory.get("text"),
-        memory.get("content"),
-        memory.get("body"),
-        memory.get("markdown"),
-    ]
-    metadata = memory.get("metadata")
-    if isinstance(metadata, dict):
-        candidates.extend(
-            [
-                metadata.get("normalized_summary"),
-                metadata.get("summary"),
-                metadata.get("excerpt"),
-                metadata.get("text"),
-            ]
-        )
-    for candidate in candidates:
-        text = _normalize_recall_text(candidate, max_chars=max_chars)
-        if text:
-            return text
-    return ""
-
-
-def _extract_recall_detail(memory: dict, *, summary: str, max_chars: int) -> str:
-    assistant_summary = _extract_embedded_assistant_summary(memory, max_chars=max_chars)
-    if assistant_summary:
-        return assistant_summary
-
-    candidates = [
-        memory.get("text"),
-        memory.get("content"),
-        memory.get("body"),
-        memory.get("markdown"),
-        memory.get("excerpt"),
-    ]
-    metadata = memory.get("metadata")
-    if isinstance(metadata, dict):
-        candidates.extend(
-            [
-                metadata.get("text"),
-                metadata.get("content"),
-                metadata.get("body"),
-                metadata.get("markdown"),
-                metadata.get("excerpt"),
-            ]
-        )
-    normalized_summary = _normalize_recall_text(summary, max_chars=max_chars)
-    for candidate in candidates:
-        text = _normalize_recall_text(candidate, max_chars=max_chars)
-        if text:
-            convo_idx = text.find("[group chat conversation:")
-            if convo_idx >= 0:
-                text = text[convo_idx:]
-            else:
-                text = re.sub(r"^\d{4}-\d{2}-\d{2} \([^)]+\) ChatLog:\s*", "", text)
-                text = re.sub(r"^\[(?:user|assistant)\]:\s*", "", text)
-        if text and text != normalized_summary:
-            return text
-    return ""
-
-
-def _extract_embedded_assistant_summary(memory: dict, *, max_chars: int) -> str:
-    candidates = [
-        memory.get("content"),
-        memory.get("text"),
-        memory.get("body"),
-        memory.get("markdown"),
-        memory.get("excerpt"),
-    ]
-    metadata = memory.get("metadata")
-    if isinstance(metadata, dict):
-        candidates.extend(
-            [
-                metadata.get("content"),
-                metadata.get("text"),
-                metadata.get("body"),
-                metadata.get("markdown"),
-                metadata.get("excerpt"),
-            ]
-        )
-    for candidate in candidates:
-        raw = str(candidate or "")
-        if not raw:
-            continue
-        match = re.search(r"\[assistant\]:\s*(.+)", raw, flags=re.DOTALL)
-        if not match:
-            continue
-        text = _normalize_recall_text(match.group(1), max_chars=max_chars)
-        if text:
-            return text
-    return ""
-
-
-def _tokenize_recall_text(value: str) -> list[str]:
-    return re.findall(r"[A-Za-z0-9+]+", value.lower())
-
-
-def _question_targets_person_profile(question: str) -> bool:
-    lowered = (question or "").lower()
-    cues = (
-        "identity",
-        "relationship status",
-        "relationship",
-        "status",
-        "married",
-        "husband",
-        "wife",
-        "single parent",
-        "single",
-        "career",
-        "education",
-        "field",
-        "pursue",
-        "home country",
-        "country",
-        "friends",
-        "breakup",
-        "transition",
-        "transgender",
-        "family",
-        "kids",
-    )
-    return any(cue in lowered for cue in cues)
-
-
-def _extract_person_name_candidates(question: str) -> list[str]:
-    stopwords = {
-        "What", "When", "Where", "Why", "How", "Which", "Who",
-        "Did", "Does", "Do", "Is", "Are", "Was", "Were",
-    }
-    names: list[str] = []
-    for token in re.findall(r"\b[A-Z][a-z]+\b", question or ""):
-        if token in stopwords or token in names:
-            continue
-        names.append(token)
-    return names
-
-
 def _ov_read_content_by_uri(
     ov_api_url: str,
     headers: dict[str, str],
     uri: str,
 ) -> str:
-    try:
-        resp = requests.get(
-            f"{ov_api_url}/api/v1/content/read",
-            headers=headers,
-            params={"uri": uri},
-            timeout=60,
-        )
-        if not resp.ok:
-            return ""
-        payload = resp.json() if resp.content else {}
-        result = payload.get("result", payload) if isinstance(payload, dict) else payload
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict):
-            for key in ("content", "text", "body", "markdown"):
-                value = result.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-            parts = result.get("parts")
-            if isinstance(parts, list):
-                texts = []
-                for part in parts:
-                    if isinstance(part, dict):
-                        value = part.get("text") or part.get("content")
-                        if isinstance(value, str) and value.strip():
-                            texts.append(value.strip())
-                if texts:
-                    return "\n".join(texts)
-        return ""
-    except Exception:
-        return ""
+    return ov_backend.read_content_by_uri(
+        ov_api_url,
+        headers,
+        uri,
+        requests_module=requests,
+    )
 
 
 def _build_person_entity_memory(uri: str, content: str) -> dict[str, object]:
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
-    title = ""
-    bullet_lines: list[str] = []
-    for line in lines:
-        if line.startswith("# ") and not title:
-            title = line[2:].strip()
-            continue
-        if line.startswith("- "):
-            bullet_lines.append(line[2:].strip())
-    summary = " ".join(bullet_lines[:3]).strip()
     return {
         "uri": uri,
-        "title": title,
-        "summary": summary,
+        "title": "",
+        "summary": "",
         "content": content,
         "context_type": "memory",
         "memory_hint": "person_entity",
@@ -635,148 +283,16 @@ def augment_ov_recall_with_named_person_entities(
     state_dir: str = "",
     fallback_agent_id: str = "main",
 ) -> list[dict]:
-    if not _question_targets_person_profile(question):
-        return recalled_memories
-    names = _extract_person_name_candidates(question)
-    if not names:
-        return recalled_memories
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return recalled_memories
-    existing_uris = {str(item.get("uri") or "") for item in recalled_memories if isinstance(item, dict)}
-    augmented = list(recalled_memories)
-    for name in names:
-        candidate_uris = [
-            f"viking://user/{user_id}/memories/entities/person/{name}.md",
-            f"viking://user/{user_id}/memories/entities/person/{name.lower()}.md",
-        ]
-        for uri in candidate_uris:
-            if uri in existing_uris:
-                break
-            content = _ov_read_content_by_uri(ov_api_url, headers, uri)
-            if not content:
-                continue
-            augmented.append(_build_person_entity_memory(uri, content))
-            existing_uris.add(uri)
-            break
-    return augmented
-
-
-def rerank_ov_recalled_memories(
-    question: str,
-    recalled_memories: list[dict],
-) -> list[dict]:
-    if len(recalled_memories) <= 1:
-        return recalled_memories
-    stopwords = {
-        "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "at", "by",
-        "is", "are", "was", "were", "did", "does", "do", "what", "when", "where",
-        "who", "why", "how", "which", "with", "from", "their", "them", "they",
-        "her", "his", "she", "he", "it", "this", "that", "these", "those", "be",
-        "have", "has", "had", "been", "would", "could", "should", "about", "into",
-        "than", "then", "after", "before", "during", "ago", "kind", "type",
-    }
-    query_tokens = [tok for tok in _tokenize_recall_text(question) if tok not in stopwords and len(tok) > 1]
-    if not query_tokens:
-        return recalled_memories
-
-    prefer_person_profile = _question_targets_person_profile(question)
-    question_names = [name.lower() for name in _extract_person_name_candidates(question)]
-
-    def _memory_score(memory: dict, index: int) -> tuple[int, int, int, int, int, int]:
-        title = _normalize_recall_text(memory.get("title") or memory.get("name"), max_chars=240)
-        summary = _extract_recall_summary(memory, max_chars=1000)
-        detail = _extract_recall_detail(memory, summary=summary, max_chars=1200)
-        haystack = f"{title}\n{summary}\n{detail}".lower()
-        uri = str(memory.get("uri") or "")
-        overlap = 0
-        exact_mentions = 0
-        for token in query_tokens:
-            if token in haystack:
-                overlap += 1
-                exact_mentions += haystack.count(token)
-        has_title_hit = int(any(token in title.lower() for token in query_tokens))
-        named_person_entity_hit = 0
-        if "/entities/person/" in uri:
-            lowered_title = title.lower()
-            if any(name == lowered_title or re.search(rf"\\b{re.escape(name)}\\b", lowered_title) for name in question_names):
-                named_person_entity_hit = 1
-        strong_person_entity_hit = 0
-        if prefer_person_profile and named_person_entity_hit:
-            strong_person_entity_hit = 1
-        return (strong_person_entity_hit, named_person_entity_hit, overlap, exact_mentions, has_title_hit, -index)
-
-    ranked = sorted(
-        enumerate(recalled_memories),
-        key=lambda item: _memory_score(item[1], item[0]),
-        reverse=True,
+    return _augment_ov_recall_with_named_person_entities(
+        ov_api_url=ov_api_url,
+        question=question,
+        user_id=user_id,
+        recalled_memories=recalled_memories,
+        request_headers_fn=_ov_request_headers,
+        read_content_fn=_ov_read_content_by_uri,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
     )
-    return [memory for _, memory in ranked]
-
-
-def format_ov_recall_evidence_block(
-    recalled_memories: list[dict],
-    *,
-    max_items: int = 5,
-    max_chars_per_item: int = 400,
-) -> str:
-    if not recalled_memories:
-        return ""
-    lines = [
-        "Retrieved memory evidence:",
-        "Use the following recalled memories as concrete evidence before answering.",
-    ]
-    for idx, memory in enumerate(recalled_memories[:max_items], start=1):
-        title = _normalize_recall_text(
-            memory.get("title") or memory.get("name"),
-            max_chars=160,
-        )
-        summary = _extract_recall_summary(memory, max_chars=max_chars_per_item)
-        detail = _extract_recall_detail(memory, summary=summary, max_chars=max_chars_per_item)
-        score = memory.get("score")
-        header = f"[Memory {idx}]"
-        if score not in (None, ""):
-            header += f" score={score}"
-        lines.append(header)
-        if title:
-            lines.append(f"Title: {title}")
-        if summary:
-            lines.append(f"Summary: {summary}")
-        if detail:
-            lines.append(f"Details: {detail}")
-    return "\n".join(lines).strip()
-
-
-def build_qa_input_message(
-    *,
-    question: str,
-    question_time: str | None,
-    recalled_memories: list[dict] | None = None,
-) -> str:
-    qa_prompt_prefix = os.environ.get("LOCOMO_QA_PROMPT_PREFIX", "").strip() or DEFAULT_LOCOMO_QA_PROMPT_PREFIX
-    evidence_block = format_ov_recall_evidence_block(
-        recalled_memories or [],
-        max_items=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_LIMIT", "8") or 8), 1),
-        max_chars_per_item=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_CHARS", "400") or 400), 80),
-    )
-    if question_time:
-        if evidence_block:
-            return (
-                f"{qa_prompt_prefix}Current date: {question_time}.\n\n"
-                f"{evidence_block}\n\nQuestion: {question}"
-            )
-        return f"{qa_prompt_prefix}Current date: {question_time}. Question: {question}"
-    if evidence_block:
-        return f"{qa_prompt_prefix}{evidence_block}\n\nQuestion: {question}"
-    return f"{qa_prompt_prefix}Question: {question}"
-
-
-def build_ingest_input_message(message: str) -> str:
-    ingest_prompt_prefix = (
-        os.environ.get("LOCOMO_INGEST_PROMPT_PREFIX", "").strip()
-        or DEFAULT_LOCOMO_INGEST_PROMPT_PREFIX
-    )
-    return f"{ingest_prompt_prefix}{message}"
 
 
 def _merge_usage_totals(left: dict | None, right: dict | None) -> dict:
@@ -794,36 +310,7 @@ def _merge_usage_totals(left: dict | None, right: dict | None) -> dict:
 
 
 def _merge_ov_token_usage(left: dict | None, right: dict | None) -> dict | None:
-    if not left and not right:
-        return None
-    provider = (
-        (left or {}).get("provider")
-        or (right or {}).get("provider")
-        or "openviking"
-    )
-    merged = {
-        "provider": provider,
-        "llm_prompt": 0,
-        "llm_completion": 0,
-        "llm_total": 0,
-        "embedding": 0,
-        "memories": 0,
-        "memory_write": 0,
-        "memory_edit": 0,
-        "task_id": "",
-    }
-    for payload in (left or {}, right or {}):
-        merged["llm_prompt"] += int(payload.get("llm_prompt", 0) or 0)
-        merged["llm_completion"] += int(payload.get("llm_completion", 0) or 0)
-        merged["llm_total"] += int(payload.get("llm_total", 0) or 0)
-        merged["embedding"] += int(payload.get("embedding", 0) or 0)
-        merged["memories"] += int(payload.get("memories", 0) or 0)
-        merged["memory_write"] += int(payload.get("memory_write", 0) or 0)
-        merged["memory_edit"] += int(payload.get("memory_edit", 0) or 0)
-        task_id = str(payload.get("task_id", "") or "").strip()
-        if task_id:
-            merged["task_id"] = task_id
-    return merged
+    return ov_backend.merge_ov_token_usage(left, right)
 
 
 def get_gateway_request_timeout_seconds() -> float:
@@ -856,48 +343,23 @@ def get_gateway_retry_backoff_seconds() -> float:
 
 
 def get_openviking_commit_timeout_seconds() -> float:
-    raw = os.environ.get("LOCOMO_OPENVIKING_COMMIT_TIMEOUT_SECONDS", "60").strip()
-    try:
-        value = float(raw or "0")
-    except ValueError:
-        value = 60.0
-    return max(value, 5.0)
+    return ov_backend.get_openviking_commit_timeout_seconds()
 
 
 def get_openviking_task_request_timeout_seconds() -> float:
-    raw = os.environ.get("LOCOMO_OPENVIKING_TASK_REQUEST_TIMEOUT_SECONDS", "30").strip()
-    try:
-        value = float(raw or "0")
-    except ValueError:
-        value = 30.0
-    return max(value, 5.0)
+    return ov_backend.get_openviking_task_request_timeout_seconds()
 
 
 def get_openviking_ingest_task_wait_seconds() -> int:
-    raw = os.environ.get("LOCOMO_OPENVIKING_INGEST_TASK_WAIT_SECONDS", "900").strip()
-    try:
-        value = int(raw or "0")
-    except ValueError:
-        value = 900
-    return max(value, 30)
+    return ov_backend.get_openviking_ingest_task_wait_seconds()
 
 
 def get_openviking_max_pending_ingest_sessions() -> int:
-    raw = os.environ.get("LOCOMO_OPENVIKING_MAX_PENDING_INGEST_SESSIONS", "0").strip()
-    try:
-        value = int(raw or "0")
-    except ValueError:
-        value = 0
-    return max(value, 0)
+    return ov_backend.get_openviking_max_pending_ingest_sessions()
 
 
 def get_openviking_chunk_slow_threshold_seconds() -> float:
-    raw = os.environ.get("LOCOMO_OPENVIKING_CHUNK_SLOW_THRESHOLD_SECONDS", "120").strip()
-    try:
-        value = float(raw or "0")
-    except ValueError:
-        value = 120.0
-    return max(value, 1.0)
+    return ov_backend.get_openviking_chunk_slow_threshold_seconds()
 
 
 def append_session_ingest_diagnostic(output_dir: str, payload: dict[str, object]) -> None:
@@ -941,43 +403,20 @@ def _finalize_openviking_ingest_session_item(
     ov_agent_id = str(item.get("ov_agent_id") or cfg.agent_id or "main")
     if not session_id:
         return
-    task_result = None
-    task_wait_diag = {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"}
-    if task_id:
-        task_result, task_wait_diag = query_ov_task_token_usage(
-            cfg.openviking.api_url,
-            task_id,
-            state_dir=cfg.gateway.state_dir,
-            fallback_agent_id=ov_agent_id,
-            max_wait=ingest_task_wait_seconds,
-            resource_id=session_id,
-            return_diag=True,
-        )
-    if _is_empty_ov_token_usage(task_result):
-        task_result, latest_task_diag = wait_for_ov_latest_task(
-            cfg.openviking.api_url,
-            resource_id=session_id,
-            state_dir=cfg.gateway.state_dir,
-            fallback_agent_id=ov_agent_id,
-            max_wait=ingest_task_wait_seconds,
-            return_diag=True,
-        )
-        task_wait_diag = latest_task_diag
-
-    consistency = query_ov_index_consistency(
-        cfg.openviking.api_url,
-        f"viking://user/{cfg.user}/memories",
-        state_dir=cfg.gateway.state_dir,
-        fallback_agent_id=cfg.agent_id,
+    backend = _build_openviking_memory_backend(cfg)
+    completion = backend.wait_ingest_completion(
+        session_id=session_id,
+        task_id=task_id,
+        fallback_agent_id=ov_agent_id,
+        max_wait=ingest_task_wait_seconds,
     )
+    task_result = completion.token_usage
+    task_wait_diag = completion.wait_diag
+    consistency = completion.consistency
 
     accepted_elapsed = float(item.get("accepted_elapsed_seconds", 0.0) or 0.0)
     total_elapsed = accepted_elapsed + float(task_wait_diag.get("elapsed_seconds", 0.0) or 0.0)
-    event = "completed"
-    if task_wait_diag.get("timed_out"):
-        event = "timeout"
-    elif task_result is None:
-        event = "completed_empty"
+    event = completion.event
 
     if task_result:
         print(
@@ -1041,19 +480,11 @@ def _finalize_openviking_ingest_session_item(
 
 
 def should_skip_openviking_qa_commit(session_key: str | None) -> bool:
-    if not session_key:
-        return False
-    override = os.environ.get("LOCOMO_OPENVIKING_QA_COMMIT", "").strip().lower()
-    if override in {"1", "true", "yes", "on"}:
-        return False
-    return session_key.startswith("qa-")
+    return ov_backend.should_skip_openviking_qa_commit(session_key)
 
 
 def should_wait_for_openviking_ingest_commit() -> bool:
-    override = os.environ.get("LOCOMO_OPENVIKING_INGEST_COMMIT_WAIT", "").strip().lower()
-    if override in {"0", "false", "no", "off"}:
-        return False
-    return True
+    return ov_backend.should_wait_for_openviking_ingest_commit()
 
 
 def send_message(
@@ -1154,92 +585,23 @@ def send_message_with_retry(
 # ---------------------------------------------------------------------------
 
 def _parse_ov_task_result(data: dict) -> dict | None:
-    result = data.get("result", {})
-    if isinstance(result, dict) and "result" in result:
-        result = result["result"]
-    if not isinstance(result, dict):
-        result = {}
-    token = result.get("token_usage", {})
-    llm = token.get("llm", {})
-    embed = token.get("embedding", {})
-    memories = result.get("memories_extracted", {})
-    mem_count = memories.get("memory_write", 0) + memories.get("memory_edit", 0)
-    return {
-        "llm_prompt": llm.get("prompt_tokens", 0),
-        "llm_completion": llm.get("completion_tokens", 0),
-        "llm_total": llm.get("total_tokens", 0),
-        "embedding": embed.get("total_tokens", 0),
-        "memories": mem_count,
-        "task_id": data.get("result", {}).get("task_id", ""),
-    }
+    return ov_backend.parse_ov_task_result(data)
 
 
 def _is_empty_ov_token_usage(payload: dict | None) -> bool:
-    if not payload:
-        return True
-    return (
-        int(payload.get("llm_total", 0) or 0) == 0
-        and int(payload.get("embedding", 0) or 0) == 0
-        and int(payload.get("memories", 0) or 0) == 0
-    )
+    return ov_backend.is_empty_ov_token_usage(payload)
 
 
 def _load_openviking_plugin_config(state_dir: str) -> dict:
-    if not state_dir:
-        return {}
-    config_path = os.path.join(state_dir, "openclaw.json")
-    if not os.path.exists(config_path):
-        return {}
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return (
-            data.get("plugins", {})
-            .get("entries", {})
-            .get("openviking", {})
-            .get("config", {})
-        ) or {}
-    except (json.JSONDecodeError, IOError, AttributeError):
-        return {}
+    return ov_backend.load_openviking_plugin_config(state_dir)
 
 
 def _resolve_openviking_agent_header(plugin_cfg: dict, fallback_agent_id: str) -> str:
-    configured_prefix = str(plugin_cfg.get("agent_prefix") or "").strip()
-    if configured_prefix:
-        return f"{configured_prefix}_main"
-    explicit_agent = str(plugin_cfg.get("agentId") or "").strip()
-    if explicit_agent:
-        return f"{explicit_agent}_main"
-    if fallback_agent_id:
-        return fallback_agent_id
-    env_agent = str(os.environ.get("OPENVIKING_AGENT_ID", "")).strip()
-    if env_agent:
-        return env_agent
-    return "main"
+    return ov_backend.resolve_openviking_agent_header(plugin_cfg, fallback_agent_id)
 
 
 def _ov_request_headers(state_dir: str = "", fallback_agent_id: str = "main") -> dict | None:
-    plugin_cfg = _load_openviking_plugin_config(state_dir)
-    api_key = str(
-        plugin_cfg.get("apiKey")
-        or os.environ.get("OPENVIKING_API_KEY")
-        or os.environ.get("OPENVIKING_ROOT_API_KEY")
-        or ""
-    ).strip()
-    if not api_key:
-        return None
-
-    headers = {"X-API-Key": api_key}
-    account_id = str(plugin_cfg.get("accountId") or os.environ.get("OPENVIKING_ACCOUNT_ID") or "").strip()
-    user_id = str(plugin_cfg.get("userId") or os.environ.get("OPENVIKING_USER_ID") or "").strip()
-    agent_id = _resolve_openviking_agent_header(plugin_cfg, fallback_agent_id)
-    if account_id:
-        headers["X-OpenViking-Account"] = account_id
-    if user_id:
-        headers["X-OpenViking-User"] = user_id
-    if agent_id:
-        headers["X-OpenViking-Agent"] = agent_id
-    return headers
+    return ov_backend.ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
 
 
 def _extract_session_id(session_file: str) -> str:
@@ -1247,13 +609,7 @@ def _extract_session_id(session_file: str) -> str:
 
 
 def build_openviking_ingest_agent_id(base_agent_id: str, session_key: str | None) -> str:
-    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(base_agent_id or "main")).strip("-") or "main"
-    if not session_key:
-        return base
-    suffix = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(session_key)).strip("-")
-    if not suffix:
-        return base
-    return f"{base}--{suffix}"
+    return ov_backend.build_openviking_ingest_agent_id(base_agent_id, session_key)
 
 
 def commit_openviking_session(
@@ -1265,35 +621,16 @@ def commit_openviking_session(
     state_dir: str = "",
     fallback_agent_id: str = "main",
 ) -> dict:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        raise RuntimeError("Missing OpenViking API key for direct session commit")
-    payload = {"wait": wait}
-    if keep_recent_count is not None:
-        payload["keep_recent_count"] = keep_recent_count
-    resp = requests.post(
-        f"{ov_api_url}/api/v1/sessions/{session_id}/commit",
-        json=payload,
-        headers=headers,
-        timeout=get_openviking_commit_timeout_seconds(),
+    return ov_backend.commit_openviking_session(
+        ov_api_url=ov_api_url,
+        session_id=session_id,
+        keep_recent_count=keep_recent_count,
+        wait=wait,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
     )
-    if resp.status_code == 404:
-        return {
-            "status": "not_found",
-            "task_id": "",
-            "archived": False,
-            "memories_extracted": {},
-            "error": f"HTTP 404 for session {session_id}",
-        }
-    resp.raise_for_status()
-    body = resp.json()
-    result = body.get("result", {}) if isinstance(body, dict) else {}
-    return {
-        "status": result.get("status", ""),
-        "task_id": result.get("task_id", ""),
-        "archived": result.get("archived", False),
-        "memories_extracted": result.get("memories_extracted", {}),
-    }
 
 
 def query_ov_task_token_usage(
@@ -1306,69 +643,19 @@ def query_ov_task_token_usage(
     resource_id: str | None = None,
     return_diag: bool = False,
 ) -> dict | tuple[dict | None, dict]:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        result = None
-        diag = {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "missing_headers"}
-        return (result, diag) if return_diag else result
-    deadline = time.time() + max_wait
-    interval = 2
-    poll_count = 0
-    started = time.monotonic()
-    fallback_used = False
-    final_status = ""
-    try:
-        while True:
-            poll_count += 1
-            resp = requests.get(
-                f"{ov_api_url}/api/v1/tasks/{task_id}",
-                headers=headers,
-                timeout=get_openviking_task_request_timeout_seconds(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            status = data.get("result", {}).get("status", "") if isinstance(data.get("result"), dict) else ""
-            final_status = status or final_status
-            if status in ("completed", "failed", ""):
-                parsed = _parse_ov_task_result(data)
-                if _is_empty_ov_token_usage(parsed) and resource_id:
-                    fallback = query_ov_latest_task(
-                        ov_api_url,
-                        resource_id=resource_id,
-                        state_dir=state_dir,
-                        fallback_agent_id=fallback_agent_id,
-                    )
-                    if fallback and not _is_empty_ov_token_usage(fallback):
-                        fallback_used = True
-                        result = fallback
-                        diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": fallback_used, "final_status": status or "completed"}
-                        return (result, diag) if return_diag else result
-                result = parsed
-                diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": fallback_used, "final_status": status or "completed"}
-                return (result, diag) if return_diag else result
-            if time.time() >= deadline:
-                if resource_id:
-                    fallback = query_ov_latest_task(
-                        ov_api_url,
-                        resource_id=resource_id,
-                        state_dir=state_dir,
-                        fallback_agent_id=fallback_agent_id,
-                    )
-                    if fallback and not _is_empty_ov_token_usage(fallback):
-                        fallback_used = True
-                        result = fallback
-                        diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": True, "fallback_used": fallback_used, "final_status": final_status or "timeout"}
-                        return (result, diag) if return_diag else result
-                result = None
-                diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": True, "fallback_used": fallback_used, "final_status": final_status or "timeout"}
-                return (result, diag) if return_diag else result
-            time.sleep(interval)
-            interval = min(interval * 2, 10)
-    except Exception as e:
-        print(f"    [ov-task] Error querying task {task_id}: {e}", file=sys.stderr)
-        result = None
-        diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": fallback_used, "final_status": "error", "error": str(e)}
-        return (result, diag) if return_diag else result
+    return ov_backend.query_ov_task_token_usage(
+        ov_api_url,
+        task_id,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        max_wait=max_wait,
+        resource_id=resource_id,
+        return_diag=return_diag,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
+        time_module=time,
+        latest_task_fn=query_ov_latest_task,
+    )
 
 
 def query_ov_latest_task(
@@ -1378,49 +665,14 @@ def query_ov_latest_task(
     state_dir: str = "",
     fallback_agent_id: str = "main",
 ) -> dict | None:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return None
-    try:
-        params = {"task_type": "session_commit", "status": "completed", "limit": 1}
-        if resource_id:
-            params["resource_id"] = resource_id
-        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        tasks = data.get("result", [])
-        if tasks:
-            task = tasks[0]
-            result = _parse_ov_task_result({"result": task})
-            if result:
-                result["task_id"] = task.get("task_id", "")
-            return result
-    except requests.exceptions.HTTPError as e:
-        if resource_id and e.response is not None and e.response.status_code == 400:
-            try:
-                resp = requests.get(
-                    f"{ov_api_url}/api/v1/tasks",
-                    params={"task_type": "session_commit", "status": "completed", "limit": 1},
-                    headers=headers,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                tasks = data.get("result", [])
-                if tasks:
-                    task = tasks[0]
-                    result = _parse_ov_task_result({"result": task})
-                    if result:
-                        result["task_id"] = task.get("task_id", "")
-                    return result
-            except Exception as inner:
-                print(f"    [ov-task] Error querying latest task without resource_id: {inner}", file=sys.stderr)
-                return None
-        print(f"    [ov-task] Error querying latest task: {e}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"    [ov-task] Error querying latest task: {e}", file=sys.stderr)
-    return None
+    return ov_backend.query_ov_latest_task(
+        ov_api_url,
+        resource_id=resource_id,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
+    )
 
 
 def wait_for_ov_latest_task(
@@ -1432,26 +684,16 @@ def wait_for_ov_latest_task(
     max_wait: int = 60,
     return_diag: bool = False,
 ) -> dict | tuple[dict | None, dict]:
-    deadline = time.time() + max_wait
-    interval = 2
-    poll_count = 0
-    started = time.monotonic()
-    while True:
-        poll_count += 1
-        result = query_ov_latest_task(
-            ov_api_url,
-            resource_id=resource_id,
-            state_dir=state_dir,
-            fallback_agent_id=fallback_agent_id,
-        )
-        if result:
-            diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": False, "fallback_used": True, "final_status": "latest_task"}
-            return (result, diag) if return_diag else result
-        if time.time() >= deadline:
-            diag = {"poll_count": poll_count, "elapsed_seconds": round(time.monotonic() - started, 3), "timed_out": True, "fallback_used": False, "final_status": "timeout"}
-            return (None, diag) if return_diag else None
-        time.sleep(interval)
-        interval = min(interval * 2, 10)
+    return ov_backend.wait_for_ov_latest_task(
+        ov_api_url,
+        resource_id=resource_id,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        max_wait=max_wait,
+        return_diag=return_diag,
+        time_module=time,
+        latest_task_fn=query_ov_latest_task,
+    )
 
 
 def query_ov_session_usage(
@@ -1463,39 +705,17 @@ def query_ov_session_usage(
     max_wait: int = 30,
     interval: float = 1.0,
 ) -> dict | None:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return None
-    deadline = time.time() + max_wait
-    while True:
-        try:
-            resp = requests.get(f"{ov_api_url}/api/v1/sessions/{session_id}", headers=headers, timeout=30)
-            resp.raise_for_status()
-            body = resp.json()
-            result = body.get("result", {}) if isinstance(body, dict) else {}
-            if int(result.get("commit_count", 0) or 0) > 0:
-                llm = result.get("llm_token_usage", {}) or {}
-                embed = result.get("embedding_token_usage", {}) or {}
-                memories = result.get("memories_extracted", {}) or {}
-                return {
-                    "llm_prompt": int(llm.get("prompt_tokens", 0) or 0),
-                    "llm_completion": int(llm.get("completion_tokens", 0) or 0),
-                    "llm_total": int(llm.get("total_tokens", 0) or 0),
-                    "embedding": int(embed.get("total_tokens", 0) or 0),
-                    "memories": int(memories.get("total", 0) or 0),
-                    "memory_write": int(memories.get("memory_write", 0) or 0),
-                    "memory_edit": int(memories.get("memory_edit", 0) or 0),
-                    "commit_count": int(result.get("commit_count", 0) or 0),
-                    "last_commit_at": result.get("last_commit_at", ""),
-                    "session_id": session_id,
-                    "source": "session_meta",
-                }
-        except Exception as e:
-            print(f"    [ov-session] Error querying session {session_id}: {e}", file=sys.stderr)
-            return None
-        if time.time() >= deadline:
-            return None
-        time.sleep(interval)
+    return ov_backend.query_ov_session_usage(
+        ov_api_url,
+        session_id,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        max_wait=max_wait,
+        interval=interval,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
+        time_module=time,
+    )
 
 
 def query_ov_index_consistency(
@@ -1505,22 +725,14 @@ def query_ov_index_consistency(
     state_dir: str = "",
     fallback_agent_id: str = "main",
 ) -> dict | None:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return None
-    try:
-        resp = requests.post(
-            f"{ov_api_url}/api/v1/system/consistency",
-            json={"uri": uri},
-            headers=headers,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        return body.get("result", {}) if isinstance(body, dict) else {}
-    except Exception as e:
-        print(f"    [ov-consistency] Error checking {uri}: {e}", file=sys.stderr)
-        return None
+    return ov_backend.query_ov_index_consistency(
+        ov_api_url,
+        uri,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1567,9 +779,7 @@ def _ogmem_token_delta(before: dict, after: dict) -> dict:
 
 
 def normalize_ov_task_query_mode(memory_mode: str) -> str:
-    if memory_mode == "openviking":
-        return "direct_ov_stable"
-    return "legacy"
+    return ov_backend.normalize_ov_task_query_mode(memory_mode)
 
 
 def should_attempt_gateway_compact(memory_mode: str) -> bool:
@@ -1803,52 +1013,14 @@ def derive_ov_closure_status(
     response_text: str = "",
     qa_commit_skipped: bool = False,
 ) -> dict:
-    token_emitted = False
-    memory_written = False
-    index_available = False
-    recall_hit = int(recall_total or 0) > 0
-    answered = bool(str(response_text or "").strip())
-
-    if ov_token_usage:
-        token_emitted = int(ov_token_usage.get("llm_total", 0) or 0) > 0 or int(
-            ov_token_usage.get("embedding", 0) or 0
-        ) > 0
-        memory_written = int(ov_token_usage.get("memories", 0) or 0) > 0 or int(
-            ov_token_usage.get("memory_write", 0) or 0
-        ) > 0 or int(ov_token_usage.get("memory_edit", 0) or 0) > 0
-
-    if consistency:
-        index_available = bool(consistency.get("ok", False))
-
-    if qa_commit_skipped and int(direct_recall_count or 0) > 0:
-        memory_written = True
-        index_available = True
-        recall_hit = True
-        state = "qa_direct_recall_only"
-    elif qa_commit_skipped:
-        state = "qa_direct_recall_miss"
-    elif not token_emitted and not memory_written:
-        state = "no_memory_signal"
-    elif token_emitted and not memory_written:
-        state = "token_emitted_only"
-    elif token_emitted and memory_written and recall_hit and answered and not index_available:
-        state = "memory_recalled_with_consistency_gap"
-    elif token_emitted and memory_written and recall_hit and answered:
-        state = "memory_closed_loop_ready"
-    elif token_emitted and memory_written and not index_available:
-        state = "memory_written_but_index_unavailable"
-    elif token_emitted and memory_written and index_available:
-        state = "memory_closed_loop_ready"
-    else:
-        state = "partial_memory_signal"
-
-    return {
-        "memory_written": str(memory_written).lower(),
-        "token_emitted": str(token_emitted).lower(),
-        "index_available": str(index_available).lower(),
-        "recall_hit": str(recall_hit).lower(),
-        "closure_state": state,
-    }
+    return ov_backend.derive_ov_closure_status(
+        ov_token_usage,
+        consistency,
+        recall_total=recall_total,
+        direct_recall_count=direct_recall_count,
+        response_text=response_text,
+        qa_commit_skipped=qa_commit_skipped,
+    )
 
 
 def query_ov_search_find_total(
@@ -1860,23 +1032,16 @@ def query_ov_search_find_total(
     fallback_agent_id: str = "main",
     limit: int = 5,
 ) -> int:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return 0
-    try:
-        resp = requests.post(
-            f"{ov_api_url}/api/v1/search/find",
-            headers=headers,
-            json={"query": query, "target_uri": target_uri, "limit": limit},
-            timeout=60,
-        )
-        if not resp.ok:
-            return 0
-        payload = resp.json()
-        result = payload.get("result", {}) if isinstance(payload, dict) else {}
-        return int(result.get("total", 0) or 0)
-    except Exception:
-        return 0
+    return ov_backend.query_ov_search_find_total(
+        ov_api_url,
+        query,
+        target_uri,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        limit=limit,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
+    )
 
 
 def query_ov_search_find_memories(
@@ -1888,52 +1053,21 @@ def query_ov_search_find_memories(
     fallback_agent_id: str = "main",
     limit: int = 3,
 ) -> list[dict]:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return []
-
-    try:
-        resp = requests.post(
-            f"{ov_api_url}/api/v1/search/find",
-            headers=headers,
-            json={
-                "query": query,
-                "target_uri": target_uri,
-                "limit": max(limit, 1),
-                "score_threshold": 0,
-            },
-            timeout=60,
-        )
-        if not resp.ok:
-            return []
-        payload = resp.json()
-        result = payload.get("result", {}) if isinstance(payload, dict) else {}
-        memories = result.get("memories", [])
-        if not isinstance(memories, list):
-            return []
-        enriched = []
-        for item in memories:
-            if not isinstance(item, dict):
-                continue
-            memory = dict(item)
-            uri = str(memory.get("uri") or "").strip()
-            abstract = str(memory.get("abstract") or "").strip()
-            if uri.endswith("/.overview.md"):
-                continue
-            if "[Directory abstract is not ready]" in abstract:
-                continue
-            has_text = any(
-                isinstance(memory.get(key), str) and memory.get(key).strip()
-                for key in ("normalized_summary", "summary", "excerpt", "text", "content", "body", "markdown")
-            )
-            if uri and not has_text:
-                content = _ov_read_content_by_uri(ov_api_url, headers, uri)
-                if content:
-                    memory["content"] = content
-            enriched.append(memory)
-        return enriched
-    except Exception:
-        return []
+    return ov_backend.query_ov_search_find_memories(
+        ov_api_url,
+        query,
+        target_uri,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        limit=limit,
+        request_headers_fn=_ov_request_headers,
+        read_content_fn=lambda ov_api_url, headers, uri, **_kwargs: _ov_read_content_by_uri(
+            ov_api_url,
+            headers,
+            uri,
+        ),
+        requests_module=requests,
+    )
 
 
 def reindex_ov_memory_root(
@@ -1944,48 +1078,16 @@ def reindex_ov_memory_root(
     fallback_agent_id: str = "main",
     timeout: float = 120.0,
 ) -> dict[str, Any]:
-    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
-    if not headers:
-        return {"ok": False, "last_error": "missing_headers"}
-    payload = {
-        "uri": f"viking://user/{user_id}/memories",
-        "mode": "vectors_only",
-        "wait": True,
-    }
-    deadline = time.monotonic() + max(timeout, 1.0)
-    last_error = ""
-    while time.monotonic() < deadline:
-        try:
-            resp = requests.post(
-                f"{ov_api_url.rstrip('/')}/api/v1/content/reindex",
-                headers=headers,
-                json=payload,
-                timeout=max(30.0, timeout),
-            )
-            data = resp.json() if resp.content else {}
-            if resp.ok:
-                return {
-                    "ok": True,
-                    "target_uri": payload["uri"],
-                    "result": data.get("result", data) if isinstance(data, dict) else data,
-                }
-            last_error = (
-                data.get("error", {}).get("message")
-                if isinstance(data, dict)
-                else ""
-            ) or resp.text or f"HTTP {resp.status_code}"
-            if resp.status_code == 409 and "tree lock" in last_error.lower():
-                time.sleep(2.0)
-                continue
-            return {
-                "ok": False,
-                "target_uri": payload["uri"],
-                "last_error": last_error,
-            }
-        except Exception as exc:
-            last_error = str(exc)
-            time.sleep(2.0)
-    return {"ok": False, "target_uri": payload["uri"], "last_error": last_error}
+    return ov_backend.reindex_ov_memory_root(
+        ov_api_url=ov_api_url,
+        user_id=user_id,
+        state_dir=state_dir,
+        fallback_agent_id=fallback_agent_id,
+        timeout=timeout,
+        request_headers_fn=_ov_request_headers,
+        requests_module=requests,
+        time_module=time,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2106,6 +1208,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                     session_slow_threshold = get_openviking_chunk_slow_threshold_seconds()
 
                     if cfg.memory_mode == "openviking":
+                        memory_backend = _build_openviking_memory_backend(cfg, user_id=user_key)
                         commit_key = current_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
                         found = wait_for_session_id_from_key(commit_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
                         if not found:
@@ -2120,14 +1223,12 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                             raise RuntimeError(f"OpenViking session not found for {commit_key}")
                         session_file, _ = found
                         ov_session_id = _extract_session_id(session_file)
-                        commit_result = commit_openviking_session(
-                            ov_api_url=cfg.openviking.api_url,
-                            session_id=ov_session_id,
-                            keep_recent_count=cfg.openviking.keep_recent_count,
+                        accepted_session = memory_backend.accept_ingest_session(
+                            ov_session_id,
                             wait=False,
-                            state_dir=cfg.gateway.state_dir,
                             fallback_agent_id=ov_ingest_agent_id,
                         )
+                        commit_result = accepted_session.commit_result
                         print(
                             f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
                             f"wait=false session={ov_session_id}",
@@ -2139,7 +1240,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                             "task_id": commit_result.get("task_id") or "",
                             "wait": False,
                         }
-                        task_id = commit_result.get("task_id") or ""
+                        task_id = accepted_session.task_id
                     print(
                         f"    [ingest-diag] send attempts={send_diag['attempts']}/{send_diag['retries_configured'] + 1} "
                         f"accepted_elapsed={session_total_elapsed:.1f}s "
@@ -2293,19 +1394,19 @@ def _process_single_question(
         qa_user = str(sample_id)
         session_key = f"qa-{sample_id}-q{qi}"
     qa_commit_skipped = cfg.memory_mode == "openviking" and should_skip_openviking_qa_commit(session_key)
+    memory_backend = _build_openviking_memory_backend(cfg, user_id=user_key) if cfg.memory_mode == "openviking" else None
 
     print(f"  [{sample_idx}] Q{qi}: {question[:60]}{'...' if len(question) > 60 else ''}", file=sys.stderr)
 
     direct_recalled_memories = []
-    if cfg.memory_mode == "openviking":
-        direct_recalled_memories = query_ov_search_find_memories(
-            cfg.openviking.api_url,
+    if memory_backend is not None:
+        direct_recall = memory_backend.recall_for_question(
             question,
-            f"viking://user/{user_key}/memories",
-            state_dir=cfg.gateway.state_dir,
             fallback_agent_id=cfg.agent_id,
             limit=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_LIMIT", "8") or 8), 1),
+            include_total=False,
         )
+        direct_recalled_memories = direct_recall.memories
         direct_recalled_memories = augment_ov_recall_with_named_person_entities(
             ov_api_url=cfg.openviking.api_url,
             question=question,
@@ -2351,65 +1452,40 @@ def _process_single_question(
                     jsonl_path = os.path.join(qa_sessions_dir, sf if sf.endswith(".jsonl") else f"{sf}.jsonl")
 
         if jsonl_path and os.path.exists(jsonl_path):
-            if cfg.memory_mode == "openviking" and not qa_commit_skipped:
+            if memory_backend is not None and not qa_commit_skipped:
                 ov_session_id = _extract_session_id(Path(jsonl_path).name)
-                commit_result = commit_openviking_session(
-                    ov_api_url=cfg.openviking.api_url,
-                    session_id=ov_session_id,
-                    keep_recent_count=cfg.openviking.keep_recent_count,
+                accepted_session = memory_backend.accept_ingest_session(
+                    ov_session_id,
                     wait=False,
-                    state_dir=cfg.gateway.state_dir,
                     fallback_agent_id=cfg.agent_id,
                 )
+                commit_result = accepted_session.commit_result
                 print(
                     f"  [{sample_idx}]   [ov-commit] status={commit_result.get('status') or 'unknown'} "
                     f"session={ov_session_id}",
                     file=sys.stderr,
                 )
-                task_id = commit_result.get("task_id") or ""
-                if task_id:
-                    ov_token_usage = query_ov_task_token_usage(
-                        cfg.openviking.api_url,
-                        task_id,
-                        state_dir=cfg.gateway.state_dir,
-                        fallback_agent_id=cfg.agent_id,
-                        max_wait=30,
-                        resource_id=ov_session_id,
-                    )
-                    if ov_token_usage:
-                        print(
-                            f"  [{sample_idx}]   [ov-task] llm={ov_token_usage['llm_total']:,} "
-                            f"embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}",
-                            file=sys.stderr,
-                        )
-                if _is_empty_ov_token_usage(ov_token_usage):
-                    ov_token_usage = query_ov_session_usage(
-                        cfg.openviking.api_url,
-                        ov_session_id,
-                        state_dir=cfg.gateway.state_dir,
-                        fallback_agent_id=cfg.agent_id,
-                        max_wait=30,
-                        interval=1.0,
-                    )
-                    if ov_token_usage:
-                        print(
-                            f"  [{sample_idx}]   [ov-session] llm={ov_token_usage['llm_total']:,} "
-                            f"embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}",
-                            file=sys.stderr,
-                        )
-                consistency = query_ov_index_consistency(
-                    cfg.openviking.api_url,
-                    f"viking://user/{user_key}/memories",
-                    state_dir=cfg.gateway.state_dir,
+                usage_result = memory_backend.read_task_usage(
+                    session_id=ov_session_id,
+                    task_id=accepted_session.task_id,
                     fallback_agent_id=cfg.agent_id,
+                    max_wait=30,
                 )
-                ov_recall_total = query_ov_search_find_total(
-                    cfg.openviking.api_url,
+                ov_token_usage = usage_result.get("usage")
+                if ov_token_usage:
+                    label = "ov-session" if usage_result.get("source") == "session_meta" else "ov-task"
+                    print(
+                        f"  [{sample_idx}]   [{label}] llm={ov_token_usage['llm_total']:,} "
+                        f"embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}",
+                        file=sys.stderr,
+                    )
+                consistency = memory_backend.check_consistency(fallback_agent_id=cfg.agent_id)
+                recall_result = memory_backend.recall_for_question(
                     question,
-                    f"viking://user/{user_key}/memories",
-                    state_dir=cfg.gateway.state_dir,
                     fallback_agent_id=cfg.agent_id,
+                    include_memories=False,
                 )
+                ov_recall_total = recall_result.total
                 if ov_recall_total:
                     print(
                         f"  [{sample_idx}]   [ov-recall] total={ov_recall_total}",
