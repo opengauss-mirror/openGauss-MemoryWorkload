@@ -17,8 +17,8 @@ def test_load_locomo_test_artifacts_reads_meta_rows_and_logs(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "pipeline.log").write_text("demo-log", encoding="utf-8")
-    (tmp_path / "chunk_diagnostics.jsonl").write_text(
-        json.dumps({"session_key": "session_1", "chunk_index": 1, "status": "passed"}, ensure_ascii=False) + "\n",
+    (tmp_path / "session_ingest_diagnostics.jsonl").write_text(
+        json.dumps({"session_key": "session_1", "status": "passed"}, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     (tmp_path / "report.html").write_text("<html></html>", encoding="utf-8")
@@ -30,5 +30,5 @@ def test_load_locomo_test_artifacts_reads_meta_rows_and_logs(tmp_path):
     assert bundle.ingest_record["s1"]["timestamp"] == 1
     assert bundle.qa_rows[0]["question"] == "Q1"
     assert bundle.pipeline_log == "demo-log"
-    assert bundle.chunk_diagnostics[0]["session_key"] == "session_1"
+    assert bundle.session_ingest_diagnostics[0]["session_key"] == "session_1"
     assert bundle.artifact_paths()["report_html"].endswith("report.html")

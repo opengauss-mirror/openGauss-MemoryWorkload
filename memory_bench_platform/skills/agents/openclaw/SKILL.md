@@ -48,6 +48,12 @@
   - 平台自动 recall 仍落到错误 agent scope
   - `official_small` 回答大量表现为 `retrieval_miss`
 
+## Session / Chunk 边界
+
+- benchmark 层只应把完整 `session` 交给 OpenClaw / OpenViking ingest。
+- 若长 session 需要内部 chunking，这属于 agent 或 memory backend 的实现策略，不属于 benchmark skill 责任。
+- 当前仓库中过渡实现采用 memory skill manifest 驱动 OpenViking ingest chunk 参数，目标是逐步把 chunking 从 `locomo_test` benchmark 逻辑中抽离。
+
 ## OpenViking 评测闭环
 
 - 对接 `LoCoMo` / `LongMemEval` 这类多轮记忆 benchmark 时，不要把 `direct_ov_stable` 理解成“跳过 commit”。

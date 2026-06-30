@@ -35,6 +35,7 @@ execution:
   mode: multi_turn
   requires_stateful_agent: true
   task_isolation: per_task
+  ingest_unit: session
   entrypoints:
     official_small:
       external_runner: ../../../../tools/test_entrypoints/run_official_locomo_small.sh

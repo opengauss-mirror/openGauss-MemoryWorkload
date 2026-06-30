@@ -1,5 +1,5 @@
-kind: agent
-id: openclaw
+kind: memory
+id: openviking
 version: 0.1.0
 version_policy:
   default_selection: latest_official_release_tag
@@ -17,28 +17,19 @@ version_policy:
     - dev_build
     - non_tag_commit
   targets:
-    - name: openclaw
-      scope: system_under_test
-      version_source: upstream_release_tag
-      upstream: https://github.com/openclaw/openclaw
-      record_runtime_version: true
     - name: openviking
       scope: memory_backend
       version_source: upstream_release_tag
       upstream: https://github.com/volcengine/OpenViking
       record_runtime_version: true
   record_runtime_version: true
-  notes: Default to latest official release tags for both OpenClaw and OpenViking, and record the resolved runtime versions in every real run.
-entry:
-  runner: scripts/run_task.py
-  healthcheck: scripts/healthcheck.py
+entry: {}
 runtime:
-  mode: service
-  default_memory_skill: openviking
-io:
-  protocol_mode: stateful_session
-lifecycle:
-  startup_required: true
-collection:
-  stdout: true
-  stderr: true
+  benchmark_unit: session
+ingest:
+  benchmark_unit: session
+recall:
+  mode: direct_recall_plus_search
+completion:
+  accept_signal: accepted
+  complete_signal: completed

@@ -29,25 +29,30 @@ OPENVIKING_PORT="${OPENVIKING_PORT:-}"
 OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"
 OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"
 OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-/root/.openviking/venv-0.3.24/bin/python}"
+OPENVIKING_VLM_TIMEOUT_SECONDS="${OPENVIKING_VLM_TIMEOUT_SECONDS:-300}"
 OV_LOG="${OV_LOG:-/tmp/${RUN_ID}_openviking.log}"
 GW_LOG="${GW_LOG:-/tmp/${RUN_ID}_openclaw_gateway.log}"
+PLUGIN_USER_KEY_FILE="/tmp/${RUN_ID}_plugin_user_key.txt"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-pick_random_port() {
-python3 - <<'PY'
-import random
+pick_remote_free_port() {
+ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} python3 - <<'PY'
+import socket
 
-print(random.randint(30000, 45000))
-PY
+sock = socket.socket()
+sock.bind(('127.0.0.1', 0))
+print(sock.getsockname()[1])
+sock.close()
+PY"
 }
 
 if [ -z "${OPENVIKING_PORT}" ]; then
-  OPENVIKING_PORT="$(pick_random_port)"
+  OPENVIKING_PORT="$(pick_remote_free_port)"
 fi
 if [ -z "${OPENCLAW_GATEWAY_PORT}" ]; then
-  OPENCLAW_GATEWAY_PORT="$(pick_random_port)"
+  OPENCLAW_GATEWAY_PORT="$(pick_remote_free_port)"
 fi
 
 TMP_TAR="$(mktemp)"
@@ -63,8 +68,12 @@ LOCK_DIR="${REMOTE_LOCK_DIR}"
 mkdir -p "\$LOCK_DIR"
 LOCK_FILE="\$LOCK_DIR/locomo_test_remote.lock"
 if [ -f "\$LOCK_FILE" ]; then
-  echo "LOCKED:\$LOCK_FILE" >&2
-  exit 2
+  existing_pid="$(cat "\$LOCK_FILE" 2>/dev/null || true)"
+  if [ -n "\$existing_pid" ] && ps -p "\$existing_pid" >/dev/null 2>&1; then
+    echo "LOCKED:\$LOCK_FILE" >&2
+    exit 2
+  fi
+  rm -f "\$LOCK_FILE"
 fi
 cleanup() {
   rm -f "\$LOCK_FILE"
@@ -321,7 +330,7 @@ path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encodi
 PY
 }
 
-python3 - "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" "${RUN_ID}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" <<'PY'
+python3 - "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG}" "${RUN_ID}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" "${OPENVIKING_VLM_TIMEOUT_SECONDS}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -336,6 +345,7 @@ run_id = sys.argv[2]
 ov_conf_path = Path(sys.argv[3])
 ov_data_dir = Path(sys.argv[4])
 ov_port = int(sys.argv[5])
+vlm_timeout_seconds = float(sys.argv[6])
 
 runtime_cfg = tomllib.loads(config_path.read_text(encoding="utf-8"))
 runtime_user = str(runtime_cfg.get("general", {}).get("user", "eval-1"))
@@ -360,6 +370,7 @@ ov_conf["vlm"] = {
     "api_base": str(chat_cfg.get("base_url", "https://codex.jemmy.icu/v1")),
     "temperature": 0.1,
     "max_retries": 3,
+    "timeout": vlm_timeout_seconds,
 }
 ov_conf["embedding"] = {
     "dense": {
@@ -410,7 +421,99 @@ PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.
 
 # shellcheck disable=SC1090
 source "${OPENCLAW_ENV}" 2>/dev/null || true
-nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" OPENVIKING_BASE_URL="${OPENVIKING_BASE_URL:-http://127.0.0.1:${OPENVIKING_PORT}}" OPENVIKING_API_KEY="${OPENVIKING_API_KEY:-}" openclaw gateway >"${GW_LOG}" 2>&1 &
+PLUGIN_USER_KEY="$(
+python3 - "${OPENVIKING_PORT}" "${RUN_ID}" <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from urllib import error, request
+
+port = int(sys.argv[1])
+run_id = sys.argv[2]
+root_key = os.environ.get("OPENVIKING_ROOT_API_KEY") or os.environ.get("OPENVIKING_API_KEY", "")
+account_id = os.environ.get("OPENVIKING_ACCOUNT_ID", "")
+user_id = os.environ.get("OPENVIKING_USER_ID", "")
+
+if not (port and root_key and account_id and user_id):
+    raise SystemExit(0)
+
+base = f"http://127.0.0.1:{port}"
+headers = {"Content-Type": "application/json", "X-API-Key": root_key}
+
+def post(path: str, payload: dict) -> dict:
+    req = request.Request(
+        base + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        try:
+            return json.loads(body or "{}")
+        except Exception:
+            return {"status": "error", "error": {"message": body or str(exc)}}
+    except Exception as exc:
+        return {"status": "error", "error": {"message": str(exc)}}
+
+last = {}
+for _ in range(15):
+    post(
+        "/api/v1/admin/accounts",
+        {
+            "account_id": account_id,
+            "admin_user_id": f"{user_id}-admin",
+            "isolate_user_scope_by_agent": True,
+            "isolate_agent_scope_by_user": True,
+        },
+    )
+    last = post(f"/api/v1/admin/accounts/{account_id}/users", {"user_id": user_id, "role": "user"})
+    user_key = ((last.get("result") or {}).get("user_key")) or ""
+    if user_key:
+        Path(f"/tmp/{run_id}_user_create_resp.json").write_text(
+            json.dumps(last, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(user_key)
+        raise SystemExit(0)
+    time.sleep(2)
+
+Path(f"/tmp/{run_id}_user_create_resp.json").write_text(
+    json.dumps(last, ensure_ascii=False),
+    encoding="utf-8",
+)
+PY
+)"
+printf '%s' "\$PLUGIN_USER_KEY" > "${PLUGIN_USER_KEY_FILE}"
+python3 - "${OPENCLAW_CONFIG_PATH}" "\$PLUGIN_USER_KEY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+user_key = sys.argv[2]
+data = json.loads(config_path.read_text(encoding="utf-8"))
+cfg = data.setdefault("plugins", {}).setdefault("entries", {}).setdefault("openviking", {}).setdefault("config", {})
+cfg["apiKey"] = str(user_key or cfg.get("apiKey") or "")
+cfg.pop("agent_prefix", None)
+cfg["isolateUserScopeByAgent"] = True
+cfg["isolateAgentScopeByUser"] = True
+cfg["emitStandardDiagnostics"] = True
+cfg["logFindRequests"] = True
+config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(json.dumps({
+    "plugin_api_key": "set_user_key" if user_key else "preserved",
+    "has_user_key": bool(user_key),
+    "accountId": cfg.get("accountId"),
+    "userId": cfg.get("userId"),
+}, ensure_ascii=False))
+PY
+nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT="true" OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER="true" openclaw gateway >"${GW_LOG}" 2>&1 &
 OPENCLAW_GATEWAY_PID=\$!
 write_pid_registry openclaw_gateway "\${OPENCLAW_GATEWAY_PID}"
 for _ in \$(seq 1 30); do

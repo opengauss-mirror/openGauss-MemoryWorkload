@@ -73,14 +73,12 @@ def test_diagnose_locomo_test_output_extracts_nodes_and_timings(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    (tmp_path / "chunk_diagnostics.jsonl").write_text(
+    (tmp_path / "session_ingest_diagnostics.jsonl").write_text(
         "\n".join(
             [
                 json.dumps(
                     {
                         "session_key": "session_3",
-                        "chunk_index": 1,
-                        "chunk_total": 4,
                         "status": "passed",
                         "send": {"elapsed_seconds": 30.0, "attempts": 1},
                         "ov_task_wait": {"elapsed_seconds": 95.0, "timed_out": False},
@@ -90,8 +88,6 @@ def test_diagnose_locomo_test_output_extracts_nodes_and_timings(tmp_path: Path):
                 json.dumps(
                     {
                         "session_key": "session_4",
-                        "chunk_index": 2,
-                        "chunk_total": 3,
                         "status": "failed",
                         "send": {"elapsed_seconds": 181.0, "attempts": 3, "timeout_hit": True},
                     },
@@ -114,8 +110,8 @@ def test_diagnose_locomo_test_output_extracts_nodes_and_timings(tmp_path: Path):
     assert result["nodes"]["answer_generation"]["overall_accuracy"] == 0.6667
     assert result["timing"]["steps"]["ingest_seconds"] == 120.0
     assert result["timing"]["ingest_session_span_seconds"] == 90
-    assert result["chunk_diagnostics_summary"]["chunk_total"] == 2
-    assert result["chunk_diagnostics_summary"]["slow_chunk_count"] == 1
-    assert result["chunk_diagnostics_summary"]["timeout_chunk_count"] == 1
+    assert result["session_ingest_diagnostics_summary"]["session_ingest_total"] == 2
+    assert result["session_ingest_diagnostics_summary"]["slow_session_ingest_count"] == 1
+    assert result["session_ingest_diagnostics_summary"]["timeout_session_ingest_count"] == 1
     assert any("index unavailable" in item for item in result["findings"])
-    assert any("ingest chunk" in item for item in result["findings"])
+    assert any("session ingest" in item for item in result["findings"])

@@ -62,6 +62,13 @@
   - 导出 `qa_results.csv` / `qa_diagnostics.json` / `meta.json`
   - 输出 OpenViking closure / recall 专项诊断字段
 
+## Session 层级约束
+
+- LoCoMo benchmark 层的 ingest 单位是 `session`。
+- benchmark skill 只负责提供完整 session 顺序，不负责 chunk 切分。
+- 若 OpenViking / Agent 需要对长 session 做内部 chunking，应由 memory skill 或 agent skill 自己决定与实现。
+- 当前仓库的过渡实现中，chunk 配置来源已迁到 `skills/memories/openviking/manifest.yaml`，而不再应由 LoCoMo benchmark 侧硬编码声明。
+
 ## OpenViking 闭环要求
 
 - 对接 OpenViking 作为记忆后端时，LoCoMo benchmark 不应只把对话 turn 写入 session。

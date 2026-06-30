@@ -230,10 +230,12 @@ def bootstrap_locomo_openclaw_runtime(
             "apiKey": str(ov_conf.get("server", {}).get("root_api_key", "")),
             "accountId": account_id,
             "userId": runtime_user,
-            "agent_prefix": account_id,
+            "isolateUserScopeByAgent": True,
+            "isolateAgentScopeByUser": True,
             "autoRecall": False,
             "autoCapture": True,
             "bypassSessionPatterns": ["qa-*"],
+            "emitStandardDiagnostics": True,
             "logFindRequests": True,
         },
     }
@@ -277,9 +279,6 @@ def bootstrap_locomo_openclaw_runtime(
                 manifest_data = json.loads(plugin_manifest.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 manifest_data = {}
-            config_schema = manifest_data.setdefault("configSchema", {})
-            properties = config_schema.setdefault("properties", {})
-            properties.setdefault("agent_prefix", {"type": "string"})
             plugin_manifest.write_text(
                 json.dumps(manifest_data, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -299,6 +298,8 @@ def bootstrap_locomo_openclaw_runtime(
     env_text = _ensure_export(env_text, "OPENVIKING_ACCOUNT_ID", account_id)
     env_text = _ensure_export(env_text, "OPENVIKING_USER_ID", runtime_user)
     env_text = _ensure_export(env_text, "OPENVIKING_AGENT_ID", runtime_agent)
+    env_text = _ensure_export(env_text, "OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT", "true")
+    env_text = _ensure_export(env_text, "OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER", "true")
     env_path.write_text(env_text, encoding="utf-8")
 
     judge_cfg = existing_env.get("judge", {}) if isinstance(existing_env, dict) else {}

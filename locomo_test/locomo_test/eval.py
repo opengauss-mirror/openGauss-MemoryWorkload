@@ -526,6 +526,142 @@ def _tokenize_recall_text(value: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9+]+", value.lower())
 
 
+def _question_targets_person_profile(question: str) -> bool:
+    lowered = (question or "").lower()
+    cues = (
+        "identity",
+        "relationship status",
+        "relationship",
+        "status",
+        "married",
+        "husband",
+        "wife",
+        "single parent",
+        "single",
+        "career",
+        "education",
+        "field",
+        "pursue",
+        "home country",
+        "country",
+        "friends",
+        "breakup",
+        "transition",
+        "transgender",
+        "family",
+        "kids",
+    )
+    return any(cue in lowered for cue in cues)
+
+
+def _extract_person_name_candidates(question: str) -> list[str]:
+    stopwords = {
+        "What", "When", "Where", "Why", "How", "Which", "Who",
+        "Did", "Does", "Do", "Is", "Are", "Was", "Were",
+    }
+    names: list[str] = []
+    for token in re.findall(r"\b[A-Z][a-z]+\b", question or ""):
+        if token in stopwords or token in names:
+            continue
+        names.append(token)
+    return names
+
+
+def _ov_read_content_by_uri(
+    ov_api_url: str,
+    headers: dict[str, str],
+    uri: str,
+) -> str:
+    try:
+        resp = requests.get(
+            f"{ov_api_url}/api/v1/content/read",
+            headers=headers,
+            params={"uri": uri},
+            timeout=60,
+        )
+        if not resp.ok:
+            return ""
+        payload = resp.json() if resp.content else {}
+        result = payload.get("result", payload) if isinstance(payload, dict) else payload
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            for key in ("content", "text", "body", "markdown"):
+                value = result.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            parts = result.get("parts")
+            if isinstance(parts, list):
+                texts = []
+                for part in parts:
+                    if isinstance(part, dict):
+                        value = part.get("text") or part.get("content")
+                        if isinstance(value, str) and value.strip():
+                            texts.append(value.strip())
+                if texts:
+                    return "\n".join(texts)
+        return ""
+    except Exception:
+        return ""
+
+
+def _build_person_entity_memory(uri: str, content: str) -> dict[str, object]:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    title = ""
+    bullet_lines: list[str] = []
+    for line in lines:
+        if line.startswith("# ") and not title:
+            title = line[2:].strip()
+            continue
+        if line.startswith("- "):
+            bullet_lines.append(line[2:].strip())
+    summary = " ".join(bullet_lines[:3]).strip()
+    return {
+        "uri": uri,
+        "title": title,
+        "summary": summary,
+        "content": content,
+        "context_type": "memory",
+        "memory_hint": "person_entity",
+    }
+
+
+def augment_ov_recall_with_named_person_entities(
+    *,
+    ov_api_url: str,
+    question: str,
+    user_id: str,
+    recalled_memories: list[dict],
+    state_dir: str = "",
+    fallback_agent_id: str = "main",
+) -> list[dict]:
+    if not _question_targets_person_profile(question):
+        return recalled_memories
+    names = _extract_person_name_candidates(question)
+    if not names:
+        return recalled_memories
+    headers = _ov_request_headers(state_dir=state_dir, fallback_agent_id=fallback_agent_id)
+    if not headers:
+        return recalled_memories
+    existing_uris = {str(item.get("uri") or "") for item in recalled_memories if isinstance(item, dict)}
+    augmented = list(recalled_memories)
+    for name in names:
+        candidate_uris = [
+            f"viking://user/{user_id}/memories/entities/person/{name}.md",
+            f"viking://user/{user_id}/memories/entities/person/{name.lower()}.md",
+        ]
+        for uri in candidate_uris:
+            if uri in existing_uris:
+                break
+            content = _ov_read_content_by_uri(ov_api_url, headers, uri)
+            if not content:
+                continue
+            augmented.append(_build_person_entity_memory(uri, content))
+            existing_uris.add(uri)
+            break
+    return augmented
+
+
 def rerank_ov_recalled_memories(
     question: str,
     recalled_memories: list[dict],
@@ -544,11 +680,15 @@ def rerank_ov_recalled_memories(
     if not query_tokens:
         return recalled_memories
 
-    def _memory_score(memory: dict, index: int) -> tuple[int, int, int, int]:
+    prefer_person_profile = _question_targets_person_profile(question)
+    question_names = [name.lower() for name in _extract_person_name_candidates(question)]
+
+    def _memory_score(memory: dict, index: int) -> tuple[int, int, int, int, int, int]:
         title = _normalize_recall_text(memory.get("title") or memory.get("name"), max_chars=240)
         summary = _extract_recall_summary(memory, max_chars=1000)
         detail = _extract_recall_detail(memory, summary=summary, max_chars=1200)
         haystack = f"{title}\n{summary}\n{detail}".lower()
+        uri = str(memory.get("uri") or "")
         overlap = 0
         exact_mentions = 0
         for token in query_tokens:
@@ -556,7 +696,15 @@ def rerank_ov_recalled_memories(
                 overlap += 1
                 exact_mentions += haystack.count(token)
         has_title_hit = int(any(token in title.lower() for token in query_tokens))
-        return (overlap, exact_mentions, has_title_hit, -index)
+        named_person_entity_hit = 0
+        if "/entities/person/" in uri:
+            lowered_title = title.lower()
+            if any(name == lowered_title or re.search(rf"\\b{re.escape(name)}\\b", lowered_title) for name in question_names):
+                named_person_entity_hit = 1
+        strong_person_entity_hit = 0
+        if prefer_person_profile and named_person_entity_hit:
+            strong_person_entity_hit = 1
+        return (strong_person_entity_hit, named_person_entity_hit, overlap, exact_mentions, has_title_hit, -index)
 
     ranked = sorted(
         enumerate(recalled_memories),
@@ -629,60 +777,6 @@ def build_ingest_input_message(message: str) -> str:
         or DEFAULT_LOCOMO_INGEST_PROMPT_PREFIX
     )
     return f"{ingest_prompt_prefix}{message}"
-
-
-def get_openviking_ingest_max_blocks() -> int:
-    raw = os.environ.get("LOCOMO_OPENVIKING_INGEST_MAX_BLOCKS", "6").strip()
-    try:
-        value = int(raw or "0")
-    except ValueError:
-        value = 6
-    return max(value, 0)
-
-
-def get_openviking_ingest_chunk_from_session() -> int:
-    raw = os.environ.get("LOCOMO_OPENVIKING_INGEST_CHUNK_FROM_SESSION", "3").strip()
-    try:
-        value = int(raw or "0")
-    except ValueError:
-        value = 3
-    return max(value, 0)
-
-
-def split_openviking_ingest_message(message: str, *, max_blocks: int) -> list[str]:
-    if max_blocks <= 0:
-        return [message]
-    blocks = message.split("\n\n")
-    if len(blocks) <= 2:
-        return [message]
-    header = blocks[0]
-    tail = ""
-    body = blocks[1:]
-    if body and body[-1].strip() == "[]":
-        tail = body[-1]
-        body = body[:-1]
-    if len(body) <= max_blocks:
-        return [message]
-    chunks = []
-    for start in range(0, len(body), max_blocks):
-        segment = body[start : start + max_blocks]
-        parts = [header, *segment]
-        if tail:
-            parts.append(tail)
-        chunks.append("\n\n".join(parts))
-    return chunks
-
-
-def should_chunk_openviking_session(session_key: str | None) -> bool:
-    threshold = get_openviking_ingest_chunk_from_session()
-    if threshold <= 0:
-        return True
-    if not session_key:
-        return False
-    match = re.search(r"session_(\d+)", session_key)
-    if not match:
-        return False
-    return int(match.group(1)) >= threshold
 
 
 def _merge_usage_totals(left: dict | None, right: dict | None) -> dict:
@@ -788,6 +882,15 @@ def get_openviking_ingest_task_wait_seconds() -> int:
     return max(value, 30)
 
 
+def get_openviking_max_pending_ingest_sessions() -> int:
+    raw = os.environ.get("LOCOMO_OPENVIKING_MAX_PENDING_INGEST_SESSIONS", "0").strip()
+    try:
+        value = int(raw or "0")
+    except ValueError:
+        value = 0
+    return max(value, 0)
+
+
 def get_openviking_chunk_slow_threshold_seconds() -> float:
     raw = os.environ.get("LOCOMO_OPENVIKING_CHUNK_SLOW_THRESHOLD_SECONDS", "120").strip()
     try:
@@ -797,10 +900,144 @@ def get_openviking_chunk_slow_threshold_seconds() -> float:
     return max(value, 1.0)
 
 
-def append_chunk_diagnostic(output_dir: str, payload: dict[str, object]) -> None:
-    path = os.path.join(output_dir, "chunk_diagnostics.jsonl")
+def append_session_ingest_diagnostic(output_dir: str, payload: dict[str, object]) -> None:
+    path = os.path.join(output_dir, "session_ingest_diagnostics.jsonl")
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _finalize_openviking_ingest_sessions(
+    *,
+    pending_sessions: list[dict[str, object]],
+    cfg: Config,
+    output_dir: str,
+    memory_token_totals: dict,
+    ingest_record: dict,
+) -> None:
+    if not pending_sessions:
+        return
+    print(f"\n=== OpenViking final drain: {len(pending_sessions)} accepted session(s) ===", file=sys.stderr)
+    while pending_sessions:
+        _finalize_openviking_ingest_session_item(
+            item=pending_sessions.pop(0),
+            cfg=cfg,
+            output_dir=output_dir,
+            memory_token_totals=memory_token_totals,
+            ingest_record=ingest_record,
+        )
+
+
+def _finalize_openviking_ingest_session_item(
+    *,
+    item: dict[str, object],
+    cfg: Config,
+    output_dir: str,
+    memory_token_totals: dict,
+    ingest_record: dict,
+) -> None:
+    ingest_task_wait_seconds = get_openviking_ingest_task_wait_seconds()
+    task_id = str(item.get("task_id") or "")
+    session_id = str(item.get("ov_session_id") or "")
+    ov_agent_id = str(item.get("ov_agent_id") or cfg.agent_id or "main")
+    if not session_id:
+        return
+    task_result = None
+    task_wait_diag = {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"}
+    if task_id:
+        task_result, task_wait_diag = query_ov_task_token_usage(
+            cfg.openviking.api_url,
+            task_id,
+            state_dir=cfg.gateway.state_dir,
+            fallback_agent_id=ov_agent_id,
+            max_wait=ingest_task_wait_seconds,
+            resource_id=session_id,
+            return_diag=True,
+        )
+    if _is_empty_ov_token_usage(task_result):
+        task_result, latest_task_diag = wait_for_ov_latest_task(
+            cfg.openviking.api_url,
+            resource_id=session_id,
+            state_dir=cfg.gateway.state_dir,
+            fallback_agent_id=ov_agent_id,
+            max_wait=ingest_task_wait_seconds,
+            return_diag=True,
+        )
+        task_wait_diag = latest_task_diag
+
+    consistency = query_ov_index_consistency(
+        cfg.openviking.api_url,
+        f"viking://user/{cfg.user}/memories",
+        state_dir=cfg.gateway.state_dir,
+        fallback_agent_id=cfg.agent_id,
+    )
+
+    accepted_elapsed = float(item.get("accepted_elapsed_seconds", 0.0) or 0.0)
+    total_elapsed = accepted_elapsed + float(task_wait_diag.get("elapsed_seconds", 0.0) or 0.0)
+    event = "completed"
+    if task_wait_diag.get("timed_out"):
+        event = "timeout"
+    elif task_result is None:
+        event = "completed_empty"
+
+    if task_result:
+        print(
+            f"    [ov-drain] session={session_id} llm={task_result['llm_total']:,} "
+            f"embed={task_result['embedding']:,} memories={task_result['memories']} "
+            f"polls={task_wait_diag.get('poll_count', 0)} elapsed={float(task_wait_diag.get('elapsed_seconds', 0.0)):.1f}s",
+            file=sys.stderr,
+        )
+        _add_memory_token_usage(memory_token_totals, {"provider": "openviking", **task_result})
+    else:
+        print(
+            f"    [ov-drain] session={session_id} result=empty polls={task_wait_diag.get('poll_count', 0)} "
+            f"elapsed={float(task_wait_diag.get('elapsed_seconds', 0.0)):.1f}s timed_out={str(task_wait_diag.get('timed_out', False)).lower()}",
+            file=sys.stderr,
+        )
+
+    append_session_ingest_diagnostic(
+        output_dir,
+        {
+            "event": event,
+            "sample_id": item.get("sample_id"),
+            "session_key": item.get("session_key"),
+            "session_date_time": item.get("session_date_time"),
+            "query_mode": item.get("query_mode"),
+            "ov_commit": item.get("ov_commit"),
+            "send": item.get("send"),
+            "ov_task_wait": task_wait_diag,
+            "ov_consistency": {
+                "ok": bool(consistency.get("ok", True)) if isinstance(consistency, dict) else True,
+                "missing_record_count": int((consistency or {}).get("missing_record_count", 0) or 0) if isinstance(consistency, dict) else 0,
+            },
+            "ov_token_usage": task_result or {},
+            "accepted_elapsed_seconds": accepted_elapsed,
+            "session_total_elapsed_seconds": round(total_elapsed, 3),
+            "slow_threshold_seconds": get_openviking_chunk_slow_threshold_seconds(),
+            "slow": total_elapsed >= get_openviking_chunk_slow_threshold_seconds(),
+            "status": "passed" if event in {"completed", "completed_empty"} else "failed",
+        },
+    )
+
+    result_entry = item.get("result_entry")
+    if isinstance(result_entry, dict):
+        if task_result:
+            result_entry["ov_token_usage"] = task_result
+            result_entry["memory_token_usage"] = {"provider": "openviking", **task_result}
+        if isinstance(consistency, dict):
+            result_entry["ov_missing_records"] = int(consistency.get("missing_record_count", 0) or 0)
+    mark_ingested(
+        cfg.agent_id,
+        cfg.user,
+        item.get("sample_id"),
+        str(item.get("session_key") or ""),
+        ingest_record,
+        {
+            "date_time": item.get("session_date_time"),
+            "usage": item.get("usage", {}),
+            "accepted": True,
+            "completed_event": event,
+        },
+    )
 
 
 def should_skip_openviking_qa_commit(session_key: str | None) -> bool:
@@ -973,10 +1210,12 @@ def _resolve_openviking_agent_header(plugin_cfg: dict, fallback_agent_id: str) -
     explicit_agent = str(plugin_cfg.get("agentId") or "").strip()
     if explicit_agent:
         return f"{explicit_agent}_main"
+    if fallback_agent_id:
+        return fallback_agent_id
     env_agent = str(os.environ.get("OPENVIKING_AGENT_ID", "")).strip()
     if env_agent:
         return env_agent
-    return fallback_agent_id or "main"
+    return "main"
 
 
 def _ov_request_headers(state_dir: str = "", fallback_agent_id: str = "main") -> dict | None:
@@ -1005,6 +1244,16 @@ def _ov_request_headers(state_dir: str = "", fallback_agent_id: str = "main") ->
 
 def _extract_session_id(session_file: str) -> str:
     return Path(session_file).name.removesuffix(".jsonl")
+
+
+def build_openviking_ingest_agent_id(base_agent_id: str, session_key: str | None) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(base_agent_id or "main")).strip("-") or "main"
+    if not session_key:
+        return base
+    suffix = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(session_key)).strip("-")
+    if not suffix:
+        return base
+    return f"{base}--{suffix}"
 
 
 def commit_openviking_session(
@@ -1572,6 +1821,9 @@ def derive_ov_closure_status(
         index_available = bool(consistency.get("ok", False))
 
     if qa_commit_skipped and int(direct_recall_count or 0) > 0:
+        memory_written = True
+        index_available = True
+        recall_hit = True
         state = "qa_direct_recall_only"
     elif qa_commit_skipped:
         state = "qa_direct_recall_miss"
@@ -1640,39 +1892,6 @@ def query_ov_search_find_memories(
     if not headers:
         return []
 
-    def _read_content(uri: str) -> str:
-        try:
-            resp = requests.get(
-                f"{ov_api_url}/api/v1/content/read",
-                headers=headers,
-                params={"uri": uri},
-                timeout=60,
-            )
-            if not resp.ok:
-                return ""
-            payload = resp.json() if resp.content else {}
-            result = payload.get("result", payload) if isinstance(payload, dict) else payload
-            if isinstance(result, str):
-                return result
-            if isinstance(result, dict):
-                for key in ("content", "text", "body", "markdown"):
-                    value = result.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value
-                parts = result.get("parts")
-                if isinstance(parts, list):
-                    texts = []
-                    for part in parts:
-                        if isinstance(part, dict):
-                            value = part.get("text") or part.get("content")
-                            if isinstance(value, str) and value.strip():
-                                texts.append(value.strip())
-                    if texts:
-                        return "\n".join(texts)
-            return ""
-        except Exception:
-            return ""
-
     try:
         resp = requests.post(
             f"{ov_api_url}/api/v1/search/find",
@@ -1697,13 +1916,18 @@ def query_ov_search_find_memories(
             if not isinstance(item, dict):
                 continue
             memory = dict(item)
+            uri = str(memory.get("uri") or "").strip()
+            abstract = str(memory.get("abstract") or "").strip()
+            if uri.endswith("/.overview.md"):
+                continue
+            if "[Directory abstract is not ready]" in abstract:
+                continue
             has_text = any(
                 isinstance(memory.get(key), str) and memory.get(key).strip()
                 for key in ("normalized_summary", "summary", "excerpt", "text", "content", "body", "markdown")
             )
-            uri = str(memory.get("uri") or "").strip()
             if uri and not has_text:
-                content = _read_content(uri)
+                content = _ov_read_content_by_uri(ov_api_url, headers, uri)
                 if content:
                     memory["content"] = content
             enriched.append(memory)
@@ -1778,6 +2002,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
     skipped = 0
     policy = cfg.session.policy
     memory_token_totals = _empty_memory_token_totals(cfg.memory_mode)
+    pending_ov_sessions: list[dict[str, object]] = []
 
     for item in samples:
         sample_id = item["sample_id"]
@@ -1812,11 +2037,6 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
 
             try:
                 ingest_messages = [msg]
-                if cfg.memory_mode == "openviking" and should_chunk_openviking_session(meta.get("session_key")):
-                    ingest_messages = split_openviking_ingest_message(
-                        msg,
-                        max_blocks=get_openviking_ingest_max_blocks(),
-                    )
                 if cfg.memory_mode == "memcore":
                     memory_prompt = (
                         "Extract key facts from the next group conversation and store them "
@@ -1849,14 +2069,16 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 ov_token_usage = None
                 query_mode = normalize_ov_task_query_mode(cfg.memory_mode)
                 for ingest_idx, raw_ingest_msg in enumerate(ingest_messages, start=1):
-                    chunk_diag = {
+                    session_diag = {
                         "sample_id": sample_id,
                         "session_key": meta.get("session_key"),
                         "session_date_time": meta.get("date_time"),
-                        "chunk_index": ingest_idx,
-                        "chunk_total": len(ingest_messages),
                         "query_mode": query_mode,
                     }
+                    ov_ingest_agent_id = build_openviking_ingest_agent_id(
+                        cfg.agent_id,
+                        meta.get("session_key"),
+                    )
                     current_session_key = oc_session_key
                     if oc_session_key and len(ingest_messages) > 1:
                         current_session_key = f"{oc_session_key}-part{ingest_idx}"
@@ -1869,7 +2091,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         cfg.gateway.base_url, cfg.gateway.token, user_key,
                         ingest_msg, 2, cfg.agent_id, current_session_key,
                     )
-                    chunk_diag["send"] = send_diag
+                    session_diag["send"] = send_diag
                     reply_parts.append(reply)
                     usage = _merge_usage_totals(usage, chunk_usage)
                     preview = reply[:80]
@@ -1880,12 +2102,8 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         )
                     else:
                         print(f"    -> {preview}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
-                    print(
-                        f"    [chunk-diag] send attempts={send_diag['attempts']}/{send_diag['retries_configured'] + 1} "
-                        f"elapsed={send_diag['elapsed_seconds']:.1f}s timeout={send_diag['request_timeout_seconds']:.1f}s "
-                        f"slow={str(float(send_diag['elapsed_seconds']) >= get_openviking_chunk_slow_threshold_seconds()).lower()}",
-                        file=sys.stderr,
-                    )
+                    session_total_elapsed = float(send_diag["elapsed_seconds"])
+                    session_slow_threshold = get_openviking_chunk_slow_threshold_seconds()
 
                     if cfg.memory_mode == "openviking":
                         commit_key = current_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
@@ -1902,99 +2120,74 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                             raise RuntimeError(f"OpenViking session not found for {commit_key}")
                         session_file, _ = found
                         ov_session_id = _extract_session_id(session_file)
-                        wait_for_commit = should_wait_for_openviking_ingest_commit()
                         commit_result = commit_openviking_session(
                             ov_api_url=cfg.openviking.api_url,
                             session_id=ov_session_id,
                             keep_recent_count=cfg.openviking.keep_recent_count,
-                            wait=wait_for_commit,
+                            wait=False,
                             state_dir=cfg.gateway.state_dir,
-                            fallback_agent_id=cfg.agent_id,
+                            fallback_agent_id=ov_ingest_agent_id,
                         )
-                        ingest_task_wait_seconds = get_openviking_ingest_task_wait_seconds()
                         print(
                             f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
-                            f"wait={str(wait_for_commit).lower()} session={ov_session_id}",
+                            f"wait=false session={ov_session_id}",
                             file=sys.stderr,
                         )
-                        chunk_diag["ov_commit"] = {
+                        session_diag["ov_commit"] = {
                             "session_id": ov_session_id,
                             "status": commit_result.get("status") or "unknown",
                             "task_id": commit_result.get("task_id") or "",
-                            "wait": wait_for_commit,
+                            "wait": False,
                         }
-                        chunk_ov_token_usage = None
-                        task_wait_diag = {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"}
                         task_id = commit_result.get("task_id") or ""
-                        if task_id:
-                            chunk_ov_token_usage, task_wait_diag = query_ov_task_token_usage(
-                                cfg.openviking.api_url,
-                                task_id,
-                                state_dir=cfg.gateway.state_dir,
-                                fallback_agent_id=cfg.agent_id,
-                                max_wait=ingest_task_wait_seconds,
-                                resource_id=ov_session_id,
-                                return_diag=True,
-                            )
-                        if _is_empty_ov_token_usage(chunk_ov_token_usage):
-                            chunk_ov_token_usage, latest_task_diag = wait_for_ov_latest_task(
-                                cfg.openviking.api_url,
-                                resource_id=ov_session_id,
-                                state_dir=cfg.gateway.state_dir,
-                                fallback_agent_id=cfg.agent_id,
-                                max_wait=ingest_task_wait_seconds,
-                                return_diag=True,
-                            )
-                            task_wait_diag = latest_task_diag
-                        chunk_diag["ov_task_wait"] = task_wait_diag
-
-                        if chunk_ov_token_usage:
-                            print(
-                                f"    [ov-task] llm={chunk_ov_token_usage['llm_total']:,} "
-                                f"embed={chunk_ov_token_usage['embedding']:,} "
-                                f"memories={chunk_ov_token_usage['memories']}",
-                                file=sys.stderr,
-                            )
-                            print(
-                                f"    [chunk-diag] ov_task polls={task_wait_diag.get('poll_count', 0)} "
-                                f"elapsed={float(task_wait_diag.get('elapsed_seconds', 0.0)):.1f}s "
-                                f"timed_out={str(task_wait_diag.get('timed_out', False)).lower()} "
-                                f"fallback={str(task_wait_diag.get('fallback_used', False)).lower()} "
-                                f"status={task_wait_diag.get('final_status', '')}",
-                                file=sys.stderr,
-                            )
-                            ov_token_usage = _merge_ov_token_usage(ov_token_usage, chunk_ov_token_usage)
-                            memory_token_usage = {
-                                "provider": "openviking",
-                                **ov_token_usage,
+                    print(
+                        f"    [ingest-diag] send attempts={send_diag['attempts']}/{send_diag['retries_configured'] + 1} "
+                        f"accepted_elapsed={session_total_elapsed:.1f}s "
+                        f"timeout={send_diag['request_timeout_seconds']:.1f}s "
+                        f"accepted=true",
+                        file=sys.stderr,
+                    )
+                    session_diag["event"] = "accepted"
+                    session_diag["accepted_at"] = datetime.now().isoformat()
+                    session_diag["accepted_elapsed_seconds"] = round(session_total_elapsed, 3)
+                    session_diag["slow_threshold_seconds"] = session_slow_threshold
+                    session_diag["status"] = "accepted"
+                    append_session_ingest_diagnostic(output_dir, session_diag)
+                    result_entry = {
+                        "sample_id": sample_id, "session": meta["session_key"],
+                        "user": user_key, "reply": "\n".join(part for part in reply_parts if part).strip(), "usage": usage,
+                    }
+                    results.append(result_entry)
+                    if cfg.memory_mode == "openviking":
+                        pending_ov_sessions.append(
+                            {
+                                "sample_id": sample_id,
+                                "session_key": meta.get("session_key"),
+                                "session_date_time": meta.get("date_time"),
+                                "query_mode": query_mode,
+                                "ov_session_id": ov_session_id,
+                                "task_id": task_id,
+                                "ov_commit": session_diag["ov_commit"],
+                                "send": send_diag,
+                                "accepted_elapsed_seconds": session_total_elapsed,
+                                "usage": usage,
+                                "ov_agent_id": ov_ingest_agent_id,
+                                "result_entry": result_entry,
                             }
-                            consistency = query_ov_index_consistency(
-                                cfg.openviking.api_url,
-                                f"viking://user/{user_key}/memories",
-                                state_dir=cfg.gateway.state_dir,
-                                fallback_agent_id=cfg.agent_id,
+                        )
+                        max_pending_sessions = get_openviking_max_pending_ingest_sessions()
+                        while max_pending_sessions >= 0 and len(pending_ov_sessions) > max_pending_sessions:
+                            _finalize_openviking_ingest_session_item(
+                                item=pending_ov_sessions.pop(0),
+                                cfg=cfg,
+                                output_dir=output_dir,
+                                memory_token_totals=memory_token_totals,
+                                ingest_record=ingest_record,
                             )
-                            if consistency and not consistency.get("ok", True):
-                                print(
-                                    f"    [ov-consistency] missing_records={consistency.get('missing_record_count', 0)} "
-                                    f"after session {ov_session_id}",
-                                    file=sys.stderr,
-                                )
-                                chunk_diag["ov_consistency"] = {
-                                    "ok": bool(consistency.get("ok", False)),
-                                    "missing_record_count": int(consistency.get("missing_record_count", 0) or 0),
-                                }
-                        else:
-                            print(
-                                f"    [chunk-diag] ov_task polls={task_wait_diag.get('poll_count', 0)} "
-                                f"elapsed={float(task_wait_diag.get('elapsed_seconds', 0.0)):.1f}s "
-                                f"timed_out={str(task_wait_diag.get('timed_out', False)).lower()} "
-                                f"fallback={str(task_wait_diag.get('fallback_used', False)).lower()} "
-                                f"status={task_wait_diag.get('final_status', '')} result=empty",
-                                file=sys.stderr,
-                            )
-                    chunk_diag["status"] = "passed"
-                    append_chunk_diagnostic(output_dir, chunk_diag)
+                    else:
+                        mark_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record, {
+                            "date_time": meta["date_time"], "usage": usage,
+                        })
                     if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and current_session_key:
                         found = get_session_id_from_key(current_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
                         if found:
@@ -2003,8 +2196,6 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                             if not sf_path.endswith(".jsonl"):
                                 sf_path += ".jsonl"
                             reset_session(sf_path, cfg.agent_id, cfg.gateway.state_dir)
-
-                reply = "\n".join(part for part in reply_parts if part).strip()
                 if cfg.memory_mode == "ogmem":
                     wait_for_ogmem_after_turn_extract(
                         container=cfg.ogmem.docker_container,
@@ -2023,22 +2214,15 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         file=sys.stderr,
                     )
 
-                result_entry = {
-                    "sample_id": sample_id, "session": meta["session_key"],
-                    "user": user_key, "reply": reply, "usage": usage,
-                }
-                if ov_token_usage:
-                    result_entry["ov_token_usage"] = ov_token_usage
                 if memory_token_usage:
+                    result_entry = results[-1]
                     result_entry["memory_token_usage"] = memory_token_usage
                     _add_memory_token_usage(memory_token_totals, memory_token_usage)
-                results.append(result_entry)
-
-                mark_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record, {
-                    "date_time": meta["date_time"], "usage": usage,
-                })
+                    mark_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record, {
+                        "date_time": meta["date_time"], "usage": usage,
+                    })
             except Exception as e:
-                append_chunk_diagnostic(
+                append_session_ingest_diagnostic(
                     output_dir,
                     {
                         "sample_id": sample_id,
@@ -2054,6 +2238,15 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
                 if sid:
                     reset_session(sid, cfg.agent_id, cfg.gateway.state_dir)
+
+    if cfg.memory_mode == "openviking":
+        _finalize_openviking_ingest_sessions(
+            pending_sessions=pending_ov_sessions,
+            cfg=cfg,
+            output_dir=output_dir,
+            memory_token_totals=memory_token_totals,
+            ingest_record=ingest_record,
+        )
 
     save_ingest_record(ingest_record, record_path)
     print(f"\n=== Ingest summary: {len(results)} completed, {skipped} skipped ===", file=sys.stderr)
@@ -2112,6 +2305,14 @@ def _process_single_question(
             state_dir=cfg.gateway.state_dir,
             fallback_agent_id=cfg.agent_id,
             limit=max(int(os.environ.get("LOCOMO_QA_DIRECT_RECALL_LIMIT", "8") or 8), 1),
+        )
+        direct_recalled_memories = augment_ov_recall_with_named_person_entities(
+            ov_api_url=cfg.openviking.api_url,
+            question=question,
+            user_id=user_key,
+            recalled_memories=direct_recalled_memories,
+            state_dir=cfg.gateway.state_dir,
+            fallback_agent_id=cfg.agent_id,
         )
         direct_recalled_memories = rerank_ov_recalled_memories(question, direct_recalled_memories)
         if direct_recalled_memories:

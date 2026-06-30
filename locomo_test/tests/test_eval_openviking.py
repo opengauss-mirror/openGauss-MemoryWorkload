@@ -4,26 +4,56 @@ from locomo_test.config import Config, SessionConfig, SessionPolicy
 from locomo_test.eval import (
     _send_message_with_retry_diagnostics,
     _process_single_question,
+    augment_ov_recall_with_named_person_entities,
+    build_openviking_ingest_agent_id,
     build_ingest_input_message,
     build_qa_input_message,
     format_ov_recall_evidence_block,
-    get_openviking_ingest_chunk_from_session,
-    get_openviking_ingest_max_blocks,
     normalize_ov_task_query_mode,
     query_ov_search_find_memories,
     query_ov_task_token_usage,
     rerank_ov_recalled_memories,
     run_ingest,
     run_qa,
-    should_chunk_openviking_session,
-    split_openviking_ingest_message,
     should_skip_openviking_qa_commit,
     should_attempt_gateway_compact,
 )
 
-
 def test_normalize_ov_task_query_mode_prefers_direct_ov_stable_for_openviking():
     assert normalize_ov_task_query_mode("openviking") == "direct_ov_stable"
+
+
+def test_build_openviking_ingest_agent_id_is_session_scoped():
+    assert build_openviking_ingest_agent_id("locomo-eval", "session_1") == "locomo-eval--session_1"
+    assert build_openviking_ingest_agent_id("locomo eval", "session 2") == "locomo-eval--session-2"
+
+
+def test_ov_request_headers_prefers_explicit_fallback_agent_over_env(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "openclaw.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "plugins": {
+                    "entries": {
+                        "openviking": {
+                            "config": {
+                                "apiKey": "ov-key",
+                                "accountId": "acct-1",
+                                "userId": "user-1",
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENVIKING_AGENT_ID", "locomo-eval")
+
+    from locomo_test.eval import _ov_request_headers
+
+    headers = _ov_request_headers(str(tmp_path), fallback_agent_id="locomo-eval--session_1")
+    assert headers["X-OpenViking-Agent"] == "locomo-eval--session_1"
 
 
 def test_should_attempt_gateway_compact_disabled_for_openviking_by_default(monkeypatch):
@@ -58,43 +88,6 @@ def test_build_ingest_input_message_uses_memory_summary_prompt(monkeypatch):
     assert "Sweden, necklace, 5 years, 10 years ago, June 2023" in text
     assert len(text.split("\n\n", 1)[0]) < 900
     assert text.endswith("Caroline: hello")
-
-
-def test_get_openviking_ingest_max_blocks_defaults_to_six(monkeypatch):
-    monkeypatch.delenv("LOCOMO_OPENVIKING_INGEST_MAX_BLOCKS", raising=False)
-    assert get_openviking_ingest_max_blocks() == 6
-
-
-def test_get_openviking_ingest_chunk_from_session_defaults_to_three(monkeypatch):
-    monkeypatch.delenv("LOCOMO_OPENVIKING_INGEST_CHUNK_FROM_SESSION", raising=False)
-    assert get_openviking_ingest_chunk_from_session() == 3
-
-
-def test_split_openviking_ingest_message_chunks_body_blocks():
-    message = "\n\n".join(
-        [
-            "[group chat conversation: 1:56 pm on 8 May, 2023]",
-            "A: one",
-            "B: two",
-            "A: three",
-            "B: four",
-            "A: five",
-            "[]",
-        ]
-    )
-    chunks = split_openviking_ingest_message(message, max_blocks=2)
-    assert len(chunks) == 3
-    assert chunks[0].startswith("[group chat conversation:")
-    assert chunks[0].endswith("[]")
-    assert "A: one" in chunks[0]
-    assert "A: three" not in chunks[0]
-
-
-def test_should_chunk_openviking_session_only_for_later_sessions_by_default(monkeypatch):
-    monkeypatch.delenv("LOCOMO_OPENVIKING_INGEST_CHUNK_FROM_SESSION", raising=False)
-    assert should_chunk_openviking_session("session_1") is False
-    assert should_chunk_openviking_session("session_2") is False
-    assert should_chunk_openviking_session("session_3") is True
 
 
 def test_should_skip_openviking_qa_commit_defaults_to_true_for_qa_sessions(monkeypatch):
@@ -186,6 +179,136 @@ def test_rerank_ov_recalled_memories_prefers_exact_keyword_overlap():
         ],
     )
     assert ranked[0]["uri"].endswith("workshop.md")
+
+
+def test_rerank_ov_recalled_memories_prefers_named_person_entity_for_profile_question():
+    ranked = rerank_ov_recalled_memories(
+        "What is Caroline's identity?",
+        [
+            {
+                "uri": "viking://user/demo/memories/events/support_group.md",
+                "summary": "Caroline visited an LGBTQ support group and felt accepted.",
+            },
+            {
+                "uri": "viking://user/demo/memories/entities/person/Caroline.md",
+                "title": "Caroline",
+                "summary": "Caroline has been transitioning for 3 years and spoke about her transgender journey.",
+            },
+        ],
+    )
+    assert ranked[0]["uri"].endswith("entities/person/Caroline.md")
+
+
+def test_rerank_ov_recalled_memories_prefers_named_person_entity_for_named_person_question():
+    ranked = rerank_ov_recalled_memories(
+        "What did Caroline research?",
+        [
+            {
+                "uri": "viking://user/demo/memories/events/career.md",
+                "summary": "Caroline said she would continue her education and explore counseling or mental health work.",
+            },
+            {
+                "uri": "viking://user/demo/memories/entities/person/Caroline.md",
+                "title": "Caroline",
+                "summary": "Caroline was researching adoption agencies because she wanted to give kids a loving home.",
+            },
+        ],
+    )
+    assert ranked[0]["uri"].endswith("entities/person/Caroline.md")
+
+
+def test_augment_ov_recall_with_named_person_entities_adds_matching_entity_memory(monkeypatch):
+    monkeypatch.setattr("locomo_test.eval._ov_request_headers", lambda **kwargs: {"Authorization": "Bearer x"})
+    def _read(_ov_api_url, _headers, uri):
+        if uri.endswith("/caroline.md"):
+            return "# Caroline\n- Has been transitioning for 3 years.\n- Said her friends are her rocks.\n"
+        return ""
+
+    monkeypatch.setattr("locomo_test.eval._ov_read_content_by_uri", _read)
+
+    augmented = augment_ov_recall_with_named_person_entities(
+        ov_api_url="http://ov.local",
+        question="What is Caroline's identity?",
+        user_id="demo",
+        recalled_memories=[
+            {"uri": "viking://user/demo/memories/events/support_group.md", "summary": "Caroline visited a support group."}
+        ],
+        state_dir="/tmp/demo",
+        fallback_agent_id="locomo-eval",
+    )
+
+    assert len(augmented) == 2
+    assert augmented[-1]["uri"].endswith("entities/person/caroline.md")
+    assert augmented[-1]["title"] == "Caroline"
+
+
+def test_augment_ov_recall_with_named_person_entities_skips_non_profile_question(monkeypatch):
+    monkeypatch.setattr("locomo_test.eval._ov_request_headers", lambda **kwargs: {"Authorization": "Bearer x"})
+    seen = {"count": 0}
+
+    def _read(*args, **kwargs):
+        seen["count"] += 1
+        return ""
+
+    monkeypatch.setattr("locomo_test.eval._ov_read_content_by_uri", _read)
+
+    augmented = augment_ov_recall_with_named_person_entities(
+        ov_api_url="http://ov.local",
+        question="When did Melanie run a charity race?",
+        user_id="demo",
+        recalled_memories=[
+            {"uri": "viking://user/demo/memories/events/charity_race.md", "summary": "Melanie ran a charity race on 2023-05-20."}
+        ],
+        state_dir="/tmp/demo",
+        fallback_agent_id="locomo-eval",
+    )
+
+    assert len(augmented) == 1
+    assert seen["count"] == 0
+
+
+def test_query_ov_search_find_memories_skips_directory_overview_and_unready_abstract(monkeypatch):
+    class _Resp:
+        def __init__(self, payload):
+            self.ok = True
+            self._payload = payload
+            self.content = b"x"
+
+        def json(self):
+            return self._payload
+
+    monkeypatch.setattr("locomo_test.eval._ov_request_headers", lambda **kwargs: {"Authorization": "Bearer x"})
+    monkeypatch.setattr(
+        "locomo_test.eval.requests.post",
+        lambda *args, **kwargs: _Resp(
+            {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": "viking://user/demo/memories/entities/person/.overview.md",
+                            "abstract": "# viking://user/demo/memories/entities/person [Directory abstract is not ready]",
+                        },
+                        {
+                            "uri": "viking://user/demo/memories/events/workshop.md",
+                            "summary": "Caroline attended an LGBTQ+ counseling workshop.",
+                        },
+                    ]
+                }
+            }
+        ),
+    )
+
+    memories = query_ov_search_find_memories(
+        "http://ov.local",
+        "What workshop did Caroline attend?",
+        "viking://user/demo/memories",
+        state_dir="/tmp/demo",
+        fallback_agent_id="locomo-eval",
+        limit=8,
+    )
+
+    assert len(memories) == 1
+    assert memories[0]["uri"].endswith("workshop.md")
 
 
 def test_format_ov_recall_evidence_block_prefers_normalized_summary():
@@ -308,14 +431,14 @@ def test_run_ingest_commits_openviking_session_after_message(monkeypatch, tmp_pa
     committed = []
 
     def _commit(*, ov_api_url, session_id, keep_recent_count=None, wait=False, **kwargs):
-        committed.append((ov_api_url, session_id, keep_recent_count, wait))
+        committed.append((ov_api_url, session_id, keep_recent_count, wait, kwargs.get("fallback_agent_id")))
         return {"status": "accepted", "task_id": ""}
 
     monkeypatch.setattr("locomo_test.eval.commit_openviking_session", _commit)
 
     run_ingest(cfg, str(output_dir))
 
-    assert committed == [("http://ov.local", "ov-session-1", None, True)]
+    assert committed == [("http://ov.local", "ov-session-1", None, False, "locomo-eval--session_1")]
 
 
 def test_run_ingest_retries_session_lookup_before_failing(monkeypatch, tmp_path):
@@ -398,7 +521,7 @@ def test_run_ingest_retries_session_lookup_before_failing(monkeypatch, tmp_path)
     run_ingest(cfg, str(output_dir))
 
     assert lookup_calls["count"] >= 3
-    assert committed == [("http://ov.local", "ov-session-2", None, True)]
+    assert committed == [("http://ov.local", "ov-session-2", None, False)]
 
 
 def test_run_ingest_falls_back_to_latest_session_file_when_index_missing(monkeypatch, tmp_path):
@@ -473,7 +596,7 @@ def test_run_ingest_falls_back_to_latest_session_file_when_index_missing(monkeyp
 
     run_ingest(cfg, str(output_dir))
 
-    assert committed == [("http://ov.local", "latest-session", None, True)]
+    assert committed == [("http://ov.local", "latest-session", None, False)]
 
 
 def test_run_ingest_falls_back_to_session_id_from_openclaw_log(monkeypatch, tmp_path):
@@ -549,7 +672,7 @@ def test_run_ingest_falls_back_to_session_id_from_openclaw_log(monkeypatch, tmp_
 
     run_ingest(cfg, str(output_dir))
 
-    assert committed == [("http://ov.local", "from-log-session", None, True)]
+    assert committed == [("http://ov.local", "from-log-session", None, False)]
 
 
 def test_process_single_question_skips_openviking_commit_for_qa_session_by_default(monkeypatch, tmp_path):
@@ -620,6 +743,8 @@ def test_process_single_question_skips_openviking_commit_for_qa_session_by_defau
     assert record["usage"]["total_tokens"] == 7
     assert record["ov_direct_recall_count"] == 1
     assert record["ov_closure_state"] == "qa_direct_recall_only"
+    assert record["ov_memory_written"] == "true"
+    assert record["ov_index_available"] == "true"
 
 
 def test_process_single_question_tolerates_openviking_commit_404(monkeypatch, tmp_path):
@@ -1296,7 +1421,7 @@ def test_run_ingest_passes_explicit_keep_recent_count_override(monkeypatch, tmp_
 
     run_ingest(cfg, str(output_dir))
 
-    assert committed == [("http://ov.local", "ov-session-1", 0, True)]
+    assert committed == [("http://ov.local", "ov-session-1", 0, False)]
 
 
 def test_run_ingest_uses_longer_openviking_task_wait_override(monkeypatch, tmp_path):
@@ -1376,3 +1501,97 @@ def test_run_ingest_uses_longer_openviking_task_wait_override(monkeypatch, tmp_p
 
     assert seen["max_wait"] == 900
     assert seen["fallback_max_wait"] == 900
+
+
+def test_run_ingest_drains_oldest_openviking_session_when_pending_limit_exceeded(monkeypatch, tmp_path):
+    data_path = tmp_path / "locomo.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-1",
+                    "conversation": {
+                        "speaker_a": "A",
+                        "speaker_b": "B",
+                        "session_1_date_time": "1:00 pm on 1 May, 2023",
+                        "session_1": [{"speaker": "A", "text": "hello-1"}],
+                        "session_2_date_time": "1:00 pm on 2 May, 2023",
+                        "session_2": [{"speaker": "A", "text": "hello-2"}],
+                        "session_3_date_time": "1:00 pm on 3 May, 2023",
+                        "session_3": [{"speaker": "A", "text": "hello-3"}],
+                    },
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    cfg = Config()
+    cfg.data_file = str(data_path)
+    cfg.memory_mode = "openviking"
+    cfg.user = "eval-1"
+    cfg.agent_id = "locomo-eval"
+    cfg.parallel = 1
+    cfg.session = SessionConfig(policy=SessionPolicy.ISOLATED, tail="[]")
+    cfg.gateway.state_dir = str(tmp_path)
+    cfg.openviking.api_url = "http://ov.local"
+
+    monkeypatch.setenv("LOCOMO_OPENVIKING_MAX_PENDING_INGEST_SESSIONS", "1")
+    monkeypatch.setattr(
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
+    )
+
+    session_files = {
+        "ingest-conv-1-session_1": ("ov-session-1.jsonl", str(tmp_path)),
+        "ingest-conv-1-session_2": ("ov-session-2.jsonl", str(tmp_path)),
+        "ingest-conv-1-session_3": ("ov-session-3.jsonl", str(tmp_path)),
+    }
+    monkeypatch.setattr(
+        "locomo_test.eval.get_session_id_from_key",
+        lambda session_key, *args, **kwargs: session_files[session_key],
+    )
+    monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: "ignored")
+    monkeypatch.setattr("locomo_test.eval.query_ov_index_consistency", lambda *args, **kwargs: None)
+
+    operations = []
+    task_ids = iter(["task-1", "task-2", "task-3"])
+
+    def _commit(*, session_id, **kwargs):
+        operations.append(f"commit:{session_id}")
+        return {"status": "accepted", "task_id": next(task_ids)}
+
+    def _query_task(*args, **kwargs):
+        task_id = args[1]
+        operations.append(f"query:{task_id}")
+        return (
+            {"llm_total": 10, "embedding": 5, "memories": 1},
+            {"poll_count": 1, "elapsed_seconds": 0.1, "timed_out": False, "fallback_used": False, "final_status": "completed"},
+        ) if kwargs.get("return_diag") else {"llm_total": 10, "embedding": 5, "memories": 1}
+
+    monkeypatch.setattr("locomo_test.eval.commit_openviking_session", _commit)
+    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", _query_task)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
+
+    run_ingest(cfg, str(output_dir))
+
+    assert operations[:5] == [
+        "commit:ov-session-1",
+        "commit:ov-session-2",
+        "query:task-1",
+        "commit:ov-session-3",
+        "query:task-2",
+    ]

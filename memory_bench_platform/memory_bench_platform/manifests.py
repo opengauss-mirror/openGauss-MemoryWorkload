@@ -129,6 +129,28 @@ class AgentManifest(BaseModel):
         return data
 
 
+class MemoryManifest(BaseModel):
+    kind: Literal["memory"] = "memory"
+    id: str
+    version: str
+    version_policy: VersionPolicy
+    entry: EntryPoints = Field(default_factory=EntryPoints)
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    ingest: dict[str, Any] = Field(default_factory=dict)
+    recall: dict[str, Any] = Field(default_factory=dict)
+    completion: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_version_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "version_policy" not in data:
+            raise ValueError(
+                "memory manifest must declare version_policy explicitly; "
+                "default software selection should stay machine-readable"
+            )
+        return data
+
+
 class SmokeManifest(BaseModel):
     kind: Literal["smoke"] = "smoke"
     id: str

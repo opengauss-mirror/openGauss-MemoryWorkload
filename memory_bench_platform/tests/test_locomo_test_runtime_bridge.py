@@ -58,14 +58,19 @@ def test_bootstrap_locomo_openclaw_runtime_writes_openviking_identity_config(tmp
     plugin_cfg = data["plugins"]["entries"]["openviking"]["config"]
     assert plugin_cfg["accountId"] == "acct-mini-run"
     assert plugin_cfg["userId"] == "eval-1"
-    assert plugin_cfg["agent_prefix"] == "acct-mini-run"
+    assert "agent_prefix" not in plugin_cfg
+    assert plugin_cfg["isolateUserScopeByAgent"] is True
+    assert plugin_cfg["isolateAgentScopeByUser"] is True
     assert plugin_cfg["autoRecall"] is False
     assert plugin_cfg["autoCapture"] is True
     assert plugin_cfg["bypassSessionPatterns"] == ["qa-*"]
+    assert plugin_cfg["emitStandardDiagnostics"] is True
+    assert plugin_cfg["logFindRequests"] is True
     assert data["agents"]["defaults"]["timeoutSeconds"] == 600
     assert "agentId" not in plugin_cfg
-    manifest = json.loads((state_dir / "extensions" / "openviking" / "openclaw.plugin.json").read_text(encoding="utf-8"))
-    assert manifest["configSchema"]["properties"]["agent_prefix"] == {"type": "string"}
+    env_text = env_path.read_text(encoding="utf-8")
+    assert 'OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT="true"' in env_text
+    assert 'OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER="true"' in env_text
 
 
 def test_bootstrap_locomo_openclaw_runtime_honors_openclaw_timeout_override(tmp_path):

@@ -22,9 +22,13 @@ def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
     assert 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-/root/.openviking/venv-0.3.24/bin/python}"' in text
     assert 'REMOTE_MONITOR_DIR="${REMOTE_OUTPUT_DIR}/monitor"' in text
     assert 'REMOTE_PID_FILE="${REMOTE_MONITOR_DIR}/target_pids.json"' in text
-    assert 'pick_random_port() {' in text
-    assert 'OPENVIKING_PORT="$(pick_random_port)"' in text
-    assert 'OPENCLAW_GATEWAY_PORT="$(pick_random_port)"' in text
+    assert 'pick_remote_free_port() {' in text
+    assert "sock.bind(('127.0.0.1', 0))" in text
+    assert 'OPENVIKING_PORT="$(pick_remote_free_port)"' in text
+    assert 'OPENCLAW_GATEWAY_PORT="$(pick_remote_free_port)"' in text
+    assert 'existing_pid="$(cat "\\$LOCK_FILE" 2>/dev/null || true)"' in text
+    assert 'if [ -n "\\$existing_pid" ] && ps -p "\\$existing_pid" >/dev/null 2>&1; then' in text
+    assert 'rm -f "\\$LOCK_FILE"' in text
     assert 'MONITOR_PID=\\$!' in text
     assert 'cpu_status.csv' in text
     assert 'mem_status.csv' in text
@@ -44,6 +48,14 @@ def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
     assert '--runtime-config-dst "${REMOTE_ROOT}/configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml" \\' in text
     assert 'nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &' in text
     assert 'curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health"' in text
-    assert 'nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" OPENVIKING_BASE_URL="${OPENVIKING_BASE_URL:-http://127.0.0.1:${OPENVIKING_PORT}}" OPENVIKING_API_KEY="${OPENVIKING_API_KEY:-}" openclaw gateway >"${GW_LOG}" 2>&1 &' in text
+    assert 'PLUGIN_USER_KEY="$(' in text
+    assert '"/api/v1/admin/accounts"' in text
+    assert '"/api/v1/admin/accounts/{account_id}/users"' in text or '"/api/v1/admin/accounts/' in text
+    assert 'root_key = os.environ.get("OPENVIKING_ROOT_API_KEY") or os.environ.get("OPENVIKING_API_KEY", "")' in text
+    assert 'cfg["apiKey"] = str(user_key or cfg.get("apiKey") or "")' in text
+    assert 'cfg.pop("agent_prefix", None)' in text
+    assert 'OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT="true"' in text
+    assert 'OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER="true"' in text
+    assert 'nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT="true" OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER="true" openclaw gateway >"${GW_LOG}" 2>&1 &' in text
     assert 'curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health"' in text
     assert "--skip health_check" not in text
