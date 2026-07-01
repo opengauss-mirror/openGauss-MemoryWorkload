@@ -32,6 +32,56 @@ def test_resolve_benchmark_entrypoint_reads_locomo_test_remote_wrapper():
     assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_locomo_test_remote.sh")
 
 
+def test_resolve_benchmark_entrypoint_reads_openclaw_import_wrapper():
+    entrypoint = resolve_benchmark_entrypoint("locomo", "openclaw_import")
+    assert entrypoint.entrypoint_kind == "external_runner"
+    assert entrypoint.command[0] == "bash"
+    assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_locomo_openclaw_import.sh")
+
+
+def test_openclaw_import_entrypoint_copies_existing_locomo_result(tmp_path: Path):
+    source_dir = tmp_path / "openclaw-export"
+    output_dir = tmp_path / "platform-output"
+    source_dir.mkdir()
+    (source_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.5,
+                "total_correct": 1,
+                "total_graded": 2,
+                "total_questions": 2,
+                "accuracy_by_category": {},
+                "memory_token_totals": {},
+                "token_totals": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source_dir / "qa_results.csv").write_text(
+        "sample_id,qi,question,expected,response,category,result,input_tokens,output_tokens,total_tokens\n"
+        "sample0,1,q1,a1,r1,1,CORRECT,1,1,2\n"
+        "sample0,2,q2,a2,r2,1,WRONG,1,1,2\n",
+        encoding="utf-8",
+    )
+    entrypoint = resolve_benchmark_entrypoint("locomo", "openclaw_import")
+
+    result = execute_external_runner(
+        entrypoint,
+        env={
+            **os.environ,
+            "RUN_ID": "openclaw-import-test",
+            "OUTPUT_DIR": str(output_dir),
+            "DATA_PATH": str(source_dir),
+        },
+        cwd=Path(__file__).resolve().parents[2],
+    )
+
+    assert result["status"] == "passed"
+    assert (output_dir / "qa_results.csv").exists()
+    assert (output_dir / "meta.json").exists()
+    assert json.loads((output_dir / "openclaw_import_manifest.json").read_text(encoding="utf-8"))["source"] == "openclaw_locomo_import"
+
+
 def test_execute_external_runner_captures_process_result(tmp_path: Path):
     script = tmp_path / "runner.py"
     script.write_text(
@@ -107,6 +157,85 @@ def test_external_runner_missing_output_becomes_failed_summary(monkeypatch, tmp_
     assert summary["status"] == "failed"
     assert "external_error" in summary["resource_summary"]
     assert entry["status"] == "failed"
+
+
+def test_cli_run_openclaw_import_entrypoint_builds_platform_report(monkeypatch, tmp_path: Path):
+    from memory_bench_platform import cli as cli_module
+
+    source_dir = tmp_path / "openclaw-export"
+    source_dir.mkdir()
+    (source_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "overall_accuracy": 0.5,
+                "total_correct": 1,
+                "total_graded": 2,
+                "total_questions": 2,
+                "accuracy_by_category": {},
+                "memory_token_totals": {},
+                "token_totals": {"total_tokens": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source_dir / "qa_results.csv").write_text(
+        "sample_id,qi,question,expected,response,category,result,input_tokens,output_tokens,total_tokens\n"
+        "sample0,1,q1,a1,r1,1,CORRECT,1,1,2\n"
+        "sample0,2,q2,a2,r2,1,WRONG,1,1,2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "_plan_from_args",
+        lambda args: type(
+            "Plan",
+            (),
+            {
+                "run_id": "run-openclaw-import",
+                "benchmark_id": args.benchmark,
+                "agent_id": args.agent,
+                "benchmark_version": None,
+                "agent_version": None,
+                "memory_backend": None,
+                "hardware_profile": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_version_selection",
+        lambda manifest, overrides=None: {
+            "selection_mode": "latest_official_release_tag",
+            "overridden": False,
+            "targets": [],
+        },
+    )
+    cli_module.main(
+        [
+            "run",
+            "--benchmark",
+            "locomo",
+            "--agent",
+            "openclaw",
+            "--entrypoint",
+            "openclaw_import",
+            "--data-path",
+            str(source_dir),
+        ]
+    )
+
+    run_dir = tmp_path / "runs" / "run-openclaw-import"
+    summary = json.loads((run_dir / "reports" / "summary.json").read_text(encoding="utf-8"))
+    entry = json.loads((run_dir / "records" / "external_entrypoint.json").read_text(encoding="utf-8"))
+    contract = json.loads((run_dir / "records" / "run_contract.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "passed"
+    assert summary["case_total"] == 2
+    assert summary["case_passed"] == 1
+    assert entry["entrypoint_id"] == "openclaw_import"
+    assert contract["selection"]["memory_id"] == "openviking"
+    assert (run_dir / "external_artifacts" / "openclaw_import" / "openclaw_import_manifest.json").exists()
+    assert (run_dir / "reports" / "run_report.html").exists()
 
 
 def test_run_smoke_gate_failure_blocks_external_runner(monkeypatch, tmp_path: Path):

@@ -43,5 +43,7 @@ execution:
       external_runner: ../../../../tools/test_entrypoints/run_official_locomo_sample.sh
     locomo_test_remote:
       external_runner: ../../../../tools/test_entrypoints/run_locomo_test_remote.sh
+    openclaw_import:
+      external_runner: ../../../../tools/test_entrypoints/run_locomo_openclaw_import.sh
 judging:
   mode: external

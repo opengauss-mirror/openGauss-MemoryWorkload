@@ -16,6 +16,10 @@
 
 - `official_small` 这类 external runner 依赖真实 `OpenClaw/OpenViking` 环境。
 - `locomo_test_remote` 代表“通过 `memory_bench_platform` 调起 `locomo_test`”的 LoCoMo 专项路径。
+- `openclaw_import` 代表“导入已由 OpenClaw LoCoMo 流程产出的结果目录”的路径。
+  - 它不负责启动 OpenViking ingest。
+  - 它只要求源目录中已有 `qa_results.csv` 或 `phaseA*.csv`。
+  - 平台仍负责统一归档、结果提取、资源监控、HTML/JSON 报告。
 - 默认要求被测软件使用“当前最新正式 release tag”。
 - 除非 run 配置显式指定允许的 override，否则 benchmark skill 不应自行退回旧版本。
 - `manifest.yaml` 必须声明 `version_policy.default_selection=latest_official_release_tag`，让平台能结构化读取该约束。
@@ -61,6 +65,18 @@
   - 启动 isolated OpenClaw/OpenViking runtime
   - 导出 `qa_results.csv` / `qa_diagnostics.json` / `meta.json`
   - 输出 OpenViking closure / recall 专项诊断字段
+
+## openclaw_import 的职责边界
+
+- `openclaw_import` 是导入型入口，不是执行型入口。
+- 输入：
+  - `OPENCLAW_LOCOMO_IMPORT_SOURCE`
+  - 或 `LOCOMO_OPENCLAW_IMPORT_SOURCE`
+  - 或平台 `--data-path` 传入的目录
+- 输出：
+  - 将源目录内容复制到平台分配的 `OUTPUT_DIR`
+  - 写入 `openclaw_import_manifest.json`
+- 该入口用于快速验证平台 skill 机制能否接入“已经由 OpenClaw 产出的 LoCoMo 结果”，不应被解释为 OpenViking ingest 能力测试。
 
 ## Session 层级约束
 
