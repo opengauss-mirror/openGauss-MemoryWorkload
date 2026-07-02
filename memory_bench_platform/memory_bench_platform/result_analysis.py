@@ -733,6 +733,54 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
             + "</tbody></table></section>"
         )
 
+    def render_timing_overview_chart(timing_payload: dict[str, Any]) -> str:
+        duration_distributions = timing_payload.get("duration_distributions", {}) if isinstance(timing_payload, dict) else {}
+        if not duration_distributions:
+            return "<section class='card' style='margin-top: 16px;'><h2>Timing Overview</h2><div class='muted'>无耗时图表数据</div></section>"
+        items: list[tuple[str, float, float, float]] = []
+        for label, payload in duration_distributions.items():
+            if not isinstance(payload, dict):
+                continue
+            items.append(
+                (
+                    str(label),
+                    float(payload.get("mean_ms", 0.0) or 0.0),
+                    float(payload.get("p90_ms", 0.0) or 0.0),
+                    float(payload.get("max_ms", 0.0) or 0.0),
+                )
+            )
+        items = sorted(items, key=lambda item: item[3], reverse=True)[:14]
+        if not items:
+            return "<section class='card' style='margin-top: 16px;'><h2>Timing Overview</h2><div class='muted'>无耗时图表数据</div></section>"
+        width = 960
+        row_h = 28
+        left = 250
+        right = 70
+        top = 26
+        height = top + len(items) * row_h + 18
+        max_value = max([item[3] for item in items] + [1.0])
+        chart_w = width - left - right
+        rows = []
+        for idx, (label, mean_ms, p90_ms, max_ms) in enumerate(items):
+            y = top + idx * row_h
+            max_w = (max_ms / max_value) * chart_w
+            p90_w = (p90_ms / max_value) * chart_w
+            mean_w = (mean_ms / max_value) * chart_w
+            rows.append(
+                f"<text class='bar-label' x='8' y='{y + 16}'>{esc(label[:42])}</text>"
+                f"<rect x='{left}' y='{y + 6}' width='{max_w:.2f}' height='15' rx='7' fill='#dbeafe' />"
+                f"<rect x='{left}' y='{y + 6}' width='{p90_w:.2f}' height='15' rx='7' fill='#93c5fd' />"
+                f"<rect x='{left}' y='{y + 6}' width='{mean_w:.2f}' height='15' rx='7' fill='#2563eb' />"
+                f"<text class='bar-value' x='{left + max_w + 6:.2f}' y='{y + 16}'>{_format_duration_ms(max_ms)}</text>"
+            )
+        return (
+            "<section class='card' style='margin-top: 16px;'><h2>Timing Overview</h2>"
+            "<div class='muted'>mean=深蓝，p90=蓝色，max=浅蓝；按 max 排序展示最慢阶段。</div>"
+            f"<svg viewBox='0 0 {width} {height}' class='resource-chart'>"
+            + "".join(rows)
+            + "</svg></section>"
+        )
+
     def render_resource_chart(title: str, points: list[dict[str, Any]], value_key: str, color: str, unit: str) -> str:
         if not points:
             return f"<section class='card' style='margin-top: 16px;'><h2>{title}</h2><div class='muted'>无采样数据</div></section>"
@@ -774,10 +822,12 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     timing_html = ""
     stage_timing_cards_html = ""
     stage_timeline_html = ""
+    timing_overview_chart_html = ""
     if analysis.get("timing_report"):
         timing_payload = analysis["timing_report"].get("report", {}) if isinstance(analysis["timing_report"], dict) else {}
         stage_timing_cards_html = render_stage_timing_cards(timing_payload)
         stage_timeline_html = render_stage_timeline(timing_payload)
+        timing_overview_chart_html = render_timing_overview_chart(timing_payload)
         timing_html = (
             "<section class='card'><h2>Timing Report</h2><table><tbody>"
             + render_mapping(analysis["timing_report"])
@@ -848,6 +898,8 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     .mini-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }}
     .mini-card {{ background: #f8fafc; border: 1px solid var(--line); border-radius: 12px; padding: 14px; }}
     .resource-chart {{ width: 100%; height: auto; margin-top: 12px; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; }}
+    .bar-label {{ font-size: 11px; fill: #334155; }}
+    .bar-value {{ font-size: 10px; fill: #64748b; }}
     .phase-marker {{ stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 4 4; }}
     .phase-label {{ fill: #64748b; font-size: 10px; }}
     .timeline-row {{ display: grid; grid-template-columns: 140px 1fr 110px; gap: 12px; align-items: center; margin-top: 12px; }}
@@ -873,6 +925,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     </section>
     {qa_mode_html}
     {stage_timing_cards_html}
+    {timing_overview_chart_html}
     <section class="sections">
       <section class="card"><h2>Failure Summary</h2><table><tbody>{render_mapping(analysis.get("failure_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Resource Summary</h2><table><tbody>{render_mapping(analysis.get("resource_summary", {}))}</tbody></table></section>

@@ -302,7 +302,7 @@ def load_config(test_toml_path: str) -> Config:
         errors.append("gateway.token is required (set in env.toml or OPENCLAW_GATEWAY_TOKEN env var)")
     if not cfg.gateway.port:
         errors.append("gateway.port is required (set in env.toml)")
-    valid_memory_modes = {"openviking", "ogmem", "memcore", "none"}
+    valid_memory_modes = {"openclaw", "openviking", "ogmem", "memcore", "none"}
     if cfg.memory_mode not in valid_memory_modes:
         errors.append(f"general.memory_mode must be one of {sorted(valid_memory_modes)}")
     if cfg.memory_mode == "openviking" and not cfg.openviking.port:

@@ -39,7 +39,15 @@ def test_resolve_benchmark_entrypoint_reads_openclaw_import_wrapper():
     assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_locomo_openclaw_import.sh")
 
 
-def test_openclaw_import_entrypoint_copies_existing_locomo_result(tmp_path: Path):
+def test_openclaw_import_entrypoint_defaults_to_full_openclaw_execution():
+    script = Path(__file__).resolve().parents[2] / "tools" / "test_entrypoints" / "run_locomo_openclaw_import.sh"
+    text = script.read_text(encoding="utf-8")
+    assert 'MODE="${LOCOMO_OPENCLAW_IMPORT_MODE:-execute}"' in text
+    assert 'LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openclaw-small-stable.toml}"' in text
+    assert 'exec "${SCRIPT_DIR}/run_locomo_test_remote.sh"' in text
+
+
+def test_openclaw_import_entrypoint_copy_mode_copies_existing_locomo_result(tmp_path: Path):
     source_dir = tmp_path / "openclaw-export"
     output_dir = tmp_path / "platform-output"
     source_dir.mkdir()
@@ -72,6 +80,7 @@ def test_openclaw_import_entrypoint_copies_existing_locomo_result(tmp_path: Path
             "RUN_ID": "openclaw-import-test",
             "OUTPUT_DIR": str(output_dir),
             "DATA_PATH": str(source_dir),
+            "LOCOMO_OPENCLAW_IMPORT_MODE": "copy",
         },
         cwd=Path(__file__).resolve().parents[2],
     )
@@ -159,7 +168,7 @@ def test_external_runner_missing_output_becomes_failed_summary(monkeypatch, tmp_
     assert entry["status"] == "failed"
 
 
-def test_cli_run_openclaw_import_entrypoint_builds_platform_report(monkeypatch, tmp_path: Path):
+def test_cli_run_openclaw_import_entrypoint_copy_mode_builds_platform_report(monkeypatch, tmp_path: Path):
     from memory_bench_platform import cli as cli_module
 
     source_dir = tmp_path / "openclaw-export"
@@ -185,6 +194,7 @@ def test_cli_run_openclaw_import_entrypoint_builds_platform_report(monkeypatch, 
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LOCOMO_OPENCLAW_IMPORT_MODE", "copy")
     monkeypatch.setattr(
         cli_module,
         "_plan_from_args",

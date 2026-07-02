@@ -1,0 +1,33 @@
+# LoCoMo small / OpenClaw full execution.
+#
+# This profile drives OpenClaw as the system under test and does not call
+# OpenViking ingest/commit/recall directly from the benchmark side. OpenViking
+# may still be configured as an OpenClaw memory plugin by the remote runtime.
+
+[general]
+name = "openclaw-small-stable"
+env_file = "env.toml"
+dataset = "small"
+memory_mode = "openclaw"
+parallel = 1
+user = "locomo-openclaw-stable"
+agent_id = "locomo-eval"
+
+[session]
+policy = "isolated"
+
+[steps]
+health_check = true
+ingest = true
+qa = true
+judge = true
+stats = true
+
+[openclaw]
+timeout_seconds = 900
+
+[openviking_plugin]
+# OpenClaw full-execution mode relies on the plugin auto-capture path. Keep the
+# threshold low for small benchmark sessions so each session can produce memory.
+commit_token_threshold = 50
+commit_token_threshold_ratio = 0

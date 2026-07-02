@@ -808,6 +808,10 @@ def _add_memory_token_usage(total: dict, delta: dict | None) -> None:
         total[key] = int(total.get(key, 0) or 0) + int(delta.get(key, 0) or 0)
 
 
+def _uses_openviking_completion_backend(memory_mode: str) -> bool:
+    return memory_mode in {"openviking", "openclaw"}
+
+
 def count_ogmem_after_turn_extract_logs(
     container: str = "ogmem",
     log_tail: int = 500,
@@ -941,6 +945,8 @@ CSV_FIELDS = [
     "sample_id", "sample_idx", "qi", "question", "expected",
     "response", "category", "evidence", "input_tokens",
     "output_tokens", "cacheRead", "cacheWrite", "total_tokens",
+    "qa_elapsed_seconds", "qa_direct_recall_elapsed_seconds", "qa_llm_elapsed_seconds",
+    "qa_started_at", "qa_completed_at",
     "ov_llm_prompt_tokens", "ov_llm_completion_tokens", "ov_llm_total_tokens",
     "ov_embedding_tokens", "ov_memories_extracted", "ov_memory_write", "ov_memory_edit",
     "ov_missing_records", "ov_recall_total", "ov_direct_recall_count", "ov_recall_hit",
@@ -973,6 +979,11 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
     flat["cacheRead"] = usage.get("cacheRead", 0)
     flat["cacheWrite"] = usage.get("cacheWrite", 0)
     flat["total_tokens"] = usage.get("total_tokens", 0)
+    flat["qa_elapsed_seconds"] = flat.get("qa_elapsed_seconds", 0)
+    flat["qa_direct_recall_elapsed_seconds"] = flat.get("qa_direct_recall_elapsed_seconds", 0)
+    flat["qa_llm_elapsed_seconds"] = flat.get("qa_llm_elapsed_seconds", 0)
+    flat["qa_started_at"] = flat.get("qa_started_at", "")
+    flat["qa_completed_at"] = flat.get("qa_completed_at", "")
     ov_usage = flat.pop("ov_token_usage", {}) or {}
     flat["ov_llm_prompt_tokens"] = ov_usage.get("llm_prompt", 0)
     flat["ov_llm_completion_tokens"] = ov_usage.get("llm_completion", 0)
@@ -1103,7 +1114,9 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
     results = []
     skipped = 0
     policy = cfg.session.policy
-    memory_token_totals = _empty_memory_token_totals(cfg.memory_mode)
+    memory_token_totals = _empty_memory_token_totals(
+        "openviking" if _uses_openviking_completion_backend(cfg.memory_mode) else cfg.memory_mode
+    )
     pending_ov_sessions: list[dict[str, object]] = []
 
     for item in samples:
@@ -1207,7 +1220,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                     session_total_elapsed = float(send_diag["elapsed_seconds"])
                     session_slow_threshold = get_openviking_chunk_slow_threshold_seconds()
 
-                    if cfg.memory_mode == "openviking":
+                    if _uses_openviking_completion_backend(cfg.memory_mode):
                         memory_backend = _build_openviking_memory_backend(cfg, user_id=user_key)
                         commit_key = current_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
                         found = wait_for_session_id_from_key(commit_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
@@ -1223,14 +1236,19 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                             raise RuntimeError(f"OpenViking session not found for {commit_key}")
                         session_file, _ = found
                         ov_session_id = _extract_session_id(session_file)
+                        commit_agent_id = (
+                            ov_ingest_agent_id
+                            if cfg.memory_mode == "openviking"
+                            else cfg.agent_id
+                        )
                         accepted_session = memory_backend.accept_ingest_session(
                             ov_session_id,
                             wait=False,
-                            fallback_agent_id=ov_ingest_agent_id,
+                            fallback_agent_id=commit_agent_id,
                         )
                         commit_result = accepted_session.commit_result
                         print(
-                            f"    [ov-commit] {query_mode} status={commit_result.get('status') or 'unknown'} "
+                            f"    [ov-commit] {query_mode} mode={cfg.memory_mode} status={commit_result.get('status') or 'unknown'} "
                             f"wait=false session={ov_session_id}",
                             file=sys.stderr,
                         )
@@ -1259,7 +1277,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                         "user": user_key, "reply": "\n".join(part for part in reply_parts if part).strip(), "usage": usage,
                     }
                     results.append(result_entry)
-                    if cfg.memory_mode == "openviking":
+                    if _uses_openviking_completion_backend(cfg.memory_mode):
                         pending_ov_sessions.append(
                             {
                                 "sample_id": sample_id,
@@ -1272,12 +1290,12 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                                 "send": send_diag,
                                 "accepted_elapsed_seconds": session_total_elapsed,
                                 "usage": usage,
-                                "ov_agent_id": ov_ingest_agent_id,
+                                "ov_agent_id": commit_agent_id,
                                 "result_entry": result_entry,
                             }
                         )
                         max_pending_sessions = get_openviking_max_pending_ingest_sessions()
-                        while max_pending_sessions >= 0 and len(pending_ov_sessions) > max_pending_sessions:
+                        while max_pending_sessions > 0 and len(pending_ov_sessions) > max_pending_sessions:
                             _finalize_openviking_ingest_session_item(
                                 item=pending_ov_sessions.pop(0),
                                 cfg=cfg,
@@ -1340,7 +1358,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 if sid:
                     reset_session(sid, cfg.agent_id, cfg.gateway.state_dir)
 
-    if cfg.memory_mode == "openviking":
+    if _uses_openviking_completion_backend(cfg.memory_mode):
         _finalize_openviking_ingest_sessions(
             pending_sessions=pending_ov_sessions,
             cfg=cfg,
@@ -1379,6 +1397,10 @@ def _process_single_question(
     sample_id: str, sample_idx: int, qi: int, qa: dict,
     cfg: Config, csv_path: str, question_time: str | None,
 ) -> dict:
+    qa_started_at = datetime.now().isoformat()
+    qa_started_monotonic = time.monotonic()
+    qa_direct_recall_elapsed_seconds = 0.0
+    qa_llm_elapsed_seconds = 0.0
     question = qa["question"]
     expected = str(qa["answer"])
     category = qa.get("category", "")
@@ -1393,13 +1415,20 @@ def _process_single_question(
     else:
         qa_user = str(sample_id)
         session_key = f"qa-{sample_id}-q{qi}"
-    qa_commit_skipped = cfg.memory_mode == "openviking" and should_skip_openviking_qa_commit(session_key)
-    memory_backend = _build_openviking_memory_backend(cfg, user_id=user_key) if cfg.memory_mode == "openviking" else None
+    qa_commit_skipped = _uses_openviking_completion_backend(
+        cfg.memory_mode
+    ) and should_skip_openviking_qa_commit(session_key)
+    memory_backend = (
+        _build_openviking_memory_backend(cfg, user_id=user_key)
+        if _uses_openviking_completion_backend(cfg.memory_mode)
+        else None
+    )
 
     print(f"  [{sample_idx}] Q{qi}: {question[:60]}{'...' if len(question) > 60 else ''}", file=sys.stderr)
 
     direct_recalled_memories = []
     if memory_backend is not None:
+        direct_recall_started = time.monotonic()
         direct_recall = memory_backend.recall_for_question(
             question,
             fallback_agent_id=cfg.agent_id,
@@ -1416,6 +1445,7 @@ def _process_single_question(
             fallback_agent_id=cfg.agent_id,
         )
         direct_recalled_memories = rerank_ov_recalled_memories(question, direct_recalled_memories)
+        qa_direct_recall_elapsed_seconds = time.monotonic() - direct_recall_started
         if direct_recalled_memories:
             print(
                 f"  [{sample_idx}]   [ov-direct-recall] memories={len(direct_recalled_memories)}",
@@ -1432,10 +1462,12 @@ def _process_single_question(
     consistency = None
     ov_recall_total = 0
     try:
+        qa_llm_started = time.monotonic()
         response, api_usage = send_message_with_retry(
             cfg.gateway.base_url, cfg.gateway.token, qa_user,
             input_msg, 2, cfg.agent_id, session_key,
         )
+        qa_llm_elapsed_seconds = time.monotonic() - qa_llm_started
         print(f"  [{sample_idx}]   A: {response[:60]}{'...' if len(response) > 60 else ''}", file=sys.stderr)
 
         # Token usage: read from JSONL first (has cacheRead), then archive
@@ -1524,15 +1556,20 @@ def _process_single_question(
         "question": question, "expected": expected, "response": response,
         "category": category, "evidence": evidence,
         "usage": usage, "jsonl_filename": jsonl_filename,
+        "qa_elapsed_seconds": round(time.monotonic() - qa_started_monotonic, 3),
+        "qa_direct_recall_elapsed_seconds": round(qa_direct_recall_elapsed_seconds, 3),
+        "qa_llm_elapsed_seconds": round(qa_llm_elapsed_seconds, 3),
+        "qa_started_at": qa_started_at,
+        "qa_completed_at": datetime.now().isoformat(),
     }
     if ov_token_usage:
         record["ov_token_usage"] = ov_token_usage
     if consistency:
         record["ov_missing_records"] = int(consistency.get("missing_record_count", 0) or 0)
-    if cfg.memory_mode == "openviking":
+    if _uses_openviking_completion_backend(cfg.memory_mode):
         record["ov_recall_total"] = ov_recall_total
         record["ov_direct_recall_count"] = len(direct_recalled_memories)
-    if cfg.memory_mode == "openviking":
+    if _uses_openviking_completion_backend(cfg.memory_mode):
         ov_state = derive_ov_closure_status(
             ov_token_usage,
             consistency,

@@ -66,11 +66,170 @@ def test_bootstrap_locomo_openclaw_runtime_writes_openviking_identity_config(tmp
     assert plugin_cfg["bypassSessionPatterns"] == ["qa-*"]
     assert plugin_cfg["emitStandardDiagnostics"] is True
     assert plugin_cfg["logFindRequests"] is True
+    assert "commitTokenThreshold" not in plugin_cfg
+    assert "commitTokenThresholdRatio" not in plugin_cfg
     assert data["agents"]["defaults"]["timeoutSeconds"] == 600
     assert "agentId" not in plugin_cfg
     env_text = env_path.read_text(encoding="utf-8")
     assert 'OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT="true"' in env_text
     assert 'OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER="true"' in env_text
+
+
+def test_bootstrap_locomo_openclaw_runtime_lowers_plugin_commit_threshold_for_openclaw_mode(tmp_path):
+    base_state_dir = tmp_path / "base_state"
+    (base_state_dir / "agents" / "main" / "agent").mkdir(parents=True)
+    (base_state_dir / "extensions" / "openviking").mkdir(parents=True)
+    (base_state_dir / "openviking.env").write_text("", encoding="utf-8")
+    (base_state_dir / "agents" / "main" / "agent" / "auth-profiles.json").write_text("{}", encoding="utf-8")
+    (base_state_dir / "agents" / "main" / "agent" / "auth-state.json").write_text("{}", encoding="utf-8")
+    (base_state_dir / "agents" / "main" / "agent" / "models.json").write_text("{}", encoding="utf-8")
+    (base_state_dir / "extensions" / "openviking" / "openclaw.plugin.json").write_text("{}", encoding="utf-8")
+    (base_state_dir / "openclaw.json").write_text(
+        json.dumps({"gateway": {"auth": {"token": "gw-token"}}, "plugins": {"allow": []}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    base_ov_conf = tmp_path / "ov.conf"
+    base_ov_conf.write_text(
+        json.dumps(
+            {
+                "server": {"port": 1933, "root_api_key": "root-key"},
+                "vlm": {"api_key": "judge-key", "api_base": "http://judge", "model": "judge-model"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    runtime_cfg_src = tmp_path / "mini.toml"
+    runtime_cfg_src.write_text(
+        "\n".join(
+            [
+                "[general]",
+                'name = "mini-test"',
+                'memory_mode = "openclaw"',
+                'user = "eval-1"',
+                'agent_id = "locomo-eval"',
+                "",
+                "[openviking_plugin]",
+                "commit_token_threshold = 64",
+                "commit_token_threshold_ratio = 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "state"
+    config_path = state_dir / "openclaw.json"
+
+    bootstrap_locomo_openclaw_runtime(
+        base_state_dir=base_state_dir,
+        base_ov_conf=base_ov_conf,
+        state_dir=state_dir,
+        home_dir=tmp_path / "home",
+        config_path=config_path,
+        env_path=state_dir / "openviking.env",
+        gateway_port=28789,
+        run_id="mini-run",
+        runtime_config_src=runtime_cfg_src,
+        runtime_config_dst=tmp_path / "mini-runtime.toml",
+        output_dir="/tmp/out",
+    )
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    plugin_cfg = data["plugins"]["entries"]["openviking"]["config"]
+    assert plugin_cfg["autoRecall"] is True
+    assert "bypassSessionPatterns" not in plugin_cfg
+    assert plugin_cfg["commitTokenThreshold"] == 64
+    assert plugin_cfg["commitTokenThresholdRatio"] == 0.0
+
+
+def test_bootstrap_locomo_openclaw_runtime_filters_plugin_config_by_manifest_schema(tmp_path):
+    base_state_dir = tmp_path / "base_state"
+    (base_state_dir / "agents" / "main" / "agent").mkdir(parents=True)
+    (base_state_dir / "extensions" / "openviking").mkdir(parents=True)
+    (base_state_dir / "openviking.env").write_text("", encoding="utf-8")
+    (base_state_dir / "agents" / "main" / "agent" / "auth-profiles.json").write_text("{}", encoding="utf-8")
+    (base_state_dir / "agents" / "main" / "agent" / "auth-state.json").write_text("{}", encoding="utf-8")
+    (base_state_dir / "agents" / "main" / "agent" / "models.json").write_text("{}", encoding="utf-8")
+    allowed_properties = {
+        key: {}
+        for key in [
+            "mode",
+            "baseUrl",
+            "apiKey",
+            "accountId",
+            "userId",
+            "isolateUserScopeByAgent",
+            "isolateAgentScopeByUser",
+            "autoRecall",
+            "autoCapture",
+            "bypassSessionPatterns",
+            "emitStandardDiagnostics",
+            "logFindRequests",
+            "commitTokenThreshold",
+        ]
+    }
+    (base_state_dir / "extensions" / "openviking" / "openclaw.plugin.json").write_text(
+        json.dumps({"configSchema": {"properties": allowed_properties}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (base_state_dir / "openclaw.json").write_text(
+        json.dumps({"gateway": {"auth": {"token": "gw-token"}}, "plugins": {"allow": []}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    base_ov_conf = tmp_path / "ov.conf"
+    base_ov_conf.write_text(
+        json.dumps(
+            {
+                "server": {"port": 1933, "root_api_key": "root-key"},
+                "vlm": {"api_key": "judge-key", "api_base": "http://judge", "model": "judge-model"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    runtime_cfg_src = tmp_path / "mini.toml"
+    runtime_cfg_src.write_text(
+        "\n".join(
+            [
+                "[general]",
+                'name = "mini-test"',
+                'memory_mode = "openclaw"',
+                'user = "eval-1"',
+                'agent_id = "locomo-eval"',
+                "",
+                "[openviking_plugin]",
+                "commit_token_threshold = 64",
+                "commit_token_threshold_ratio = 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "state"
+    config_path = state_dir / "openclaw.json"
+
+    bootstrap_locomo_openclaw_runtime(
+        base_state_dir=base_state_dir,
+        base_ov_conf=base_ov_conf,
+        state_dir=state_dir,
+        home_dir=tmp_path / "home",
+        config_path=config_path,
+        env_path=state_dir / "openviking.env",
+        gateway_port=28789,
+        run_id="mini-run",
+        runtime_config_src=runtime_cfg_src,
+        runtime_config_dst=tmp_path / "mini-runtime.toml",
+        output_dir="/tmp/out",
+    )
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    plugin_cfg = data["plugins"]["entries"]["openviking"]["config"]
+    assert plugin_cfg["autoRecall"] is True
+    assert "bypassSessionPatterns" not in plugin_cfg
+    assert plugin_cfg["commitTokenThreshold"] == 64
+    assert "commitTokenThresholdRatio" not in plugin_cfg
 
 
 def test_bootstrap_locomo_openclaw_runtime_honors_openclaw_timeout_override(tmp_path):

@@ -1595,3 +1595,181 @@ def test_run_ingest_drains_oldest_openviking_session_when_pending_limit_exceeded
         "commit:ov-session-3",
         "query:task-2",
     ]
+
+
+def test_run_ingest_default_pending_limit_drains_only_after_all_sessions(monkeypatch, tmp_path):
+    data_path = tmp_path / "locomo.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-1",
+                    "conversation": {
+                        "speaker_a": "A",
+                        "speaker_b": "B",
+                        "session_1_date_time": "1:00 pm on 1 May, 2023",
+                        "session_1": [{"speaker": "A", "text": "hello-1"}],
+                        "session_2_date_time": "1:00 pm on 2 May, 2023",
+                        "session_2": [{"speaker": "A", "text": "hello-2"}],
+                    },
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    cfg = Config()
+    cfg.data_file = str(data_path)
+    cfg.memory_mode = "openviking"
+    cfg.user = "eval-1"
+    cfg.agent_id = "locomo-eval"
+    cfg.parallel = 1
+    cfg.session = SessionConfig(policy=SessionPolicy.ISOLATED, tail="[]")
+    cfg.gateway.state_dir = str(tmp_path)
+    cfg.openviking.api_url = "http://ov.local"
+
+    monkeypatch.delenv("LOCOMO_OPENVIKING_MAX_PENDING_INGEST_SESSIONS", raising=False)
+    monkeypatch.setattr(
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
+    )
+    session_files = {
+        "ingest-conv-1-session_1": ("ov-session-1.jsonl", str(tmp_path)),
+        "ingest-conv-1-session_2": ("ov-session-2.jsonl", str(tmp_path)),
+    }
+    monkeypatch.setattr(
+        "locomo_test.eval.get_session_id_from_key",
+        lambda session_key, *args, **kwargs: session_files[session_key],
+    )
+    monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: "ignored")
+    monkeypatch.setattr("locomo_test.eval.query_ov_index_consistency", lambda *args, **kwargs: None)
+
+    operations = []
+    task_ids = iter(["task-1", "task-2"])
+
+    def _commit(*, session_id, **kwargs):
+        operations.append(f"commit:{session_id}")
+        return {"status": "accepted", "task_id": next(task_ids)}
+
+    def _query_task(*args, **kwargs):
+        task_id = args[1]
+        operations.append(f"query:{task_id}")
+        return (
+            {"llm_total": 10, "embedding": 5, "memories": 1},
+            {"poll_count": 1, "elapsed_seconds": 0.1, "timed_out": False, "fallback_used": False, "final_status": "completed"},
+        ) if kwargs.get("return_diag") else {"llm_total": 10, "embedding": 5, "memories": 1}
+
+    monkeypatch.setattr("locomo_test.eval.commit_openviking_session", _commit)
+    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", _query_task)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
+
+    run_ingest(cfg, str(output_dir))
+
+    assert operations[:4] == [
+        "commit:ov-session-1",
+        "commit:ov-session-2",
+        "query:task-1",
+        "query:task-2",
+    ]
+
+
+def test_run_ingest_openclaw_mode_drains_openclaw_captured_sessions(monkeypatch, tmp_path):
+    data_path = tmp_path / "locomo.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-1",
+                    "conversation": {
+                        "speaker_a": "A",
+                        "speaker_b": "B",
+                        "session_1_date_time": "1:00 pm on 1 May, 2023",
+                        "session_1": [{"speaker": "A", "text": "hello-1"}],
+                        "session_2_date_time": "1:00 pm on 2 May, 2023",
+                        "session_2": [{"speaker": "A", "text": "hello-2"}],
+                    },
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    cfg = Config()
+    cfg.data_file = str(data_path)
+    cfg.memory_mode = "openclaw"
+    cfg.user = "eval-1"
+    cfg.agent_id = "locomo-eval"
+    cfg.parallel = 1
+    cfg.session = SessionConfig(policy=SessionPolicy.ISOLATED, tail="[]")
+    cfg.gateway.state_dir = str(tmp_path)
+    cfg.openviking.api_url = "http://ov.local"
+
+    monkeypatch.delenv("LOCOMO_OPENVIKING_MAX_PENDING_INGEST_SESSIONS", raising=False)
+    monkeypatch.setattr(
+        "locomo_test.eval._send_message_with_retry_diagnostics",
+        lambda *args, **kwargs: (
+            "OK",
+            {"input_tokens": 1, "output_tokens": 1, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 2},
+            {"attempts": 1, "retries_configured": 2, "elapsed_seconds": 1.0, "request_timeout_seconds": 180.0, "wait_schedule_seconds": [], "timeout_hit": False, "final_error": ""},
+        ),
+    )
+    session_files = {
+        "ingest-conv-1-session_1": ("ov-session-1.jsonl", str(tmp_path)),
+        "ingest-conv-1-session_2": ("ov-session-2.jsonl", str(tmp_path)),
+    }
+    monkeypatch.setattr(
+        "locomo_test.eval.get_session_id_from_key",
+        lambda session_key, *args, **kwargs: session_files[session_key],
+    )
+    monkeypatch.setattr("locomo_test.eval.reset_session", lambda *args, **kwargs: "ignored")
+    monkeypatch.setattr("locomo_test.eval.query_ov_index_consistency", lambda *args, **kwargs: None)
+
+    operations = []
+    task_ids = iter(["task-1", "task-2"])
+
+    def _commit(*, session_id, fallback_agent_id, **kwargs):
+        operations.append(f"commit:{session_id}:{fallback_agent_id}")
+        return {"status": "accepted", "task_id": next(task_ids)}
+
+    def _query_task(*args, **kwargs):
+        task_id = args[1]
+        operations.append(f"query:{task_id}:{kwargs.get('fallback_agent_id')}")
+        return (
+            {"llm_total": 10, "embedding": 5, "memories": 1},
+            {"poll_count": 1, "elapsed_seconds": 0.1, "timed_out": False, "fallback_used": False, "final_status": "completed"},
+        ) if kwargs.get("return_diag") else {"llm_total": 10, "embedding": 5, "memories": 1}
+
+    monkeypatch.setattr("locomo_test.eval.commit_openviking_session", _commit)
+    monkeypatch.setattr("locomo_test.eval.query_ov_task_token_usage", _query_task)
+    monkeypatch.setattr(
+        "locomo_test.eval.wait_for_ov_latest_task",
+        lambda *args, **kwargs: (
+            None,
+            {"poll_count": 0, "elapsed_seconds": 0.0, "timed_out": False, "fallback_used": False, "final_status": "no_task"},
+        ) if kwargs.get("return_diag") else None,
+    )
+
+    run_ingest(cfg, str(output_dir))
+
+    assert operations[:4] == [
+        "commit:ov-session-1:locomo-eval",
+        "commit:ov-session-2:locomo-eval",
+        "query:task-1:locomo-eval",
+        "query:task-2:locomo-eval",
+    ]

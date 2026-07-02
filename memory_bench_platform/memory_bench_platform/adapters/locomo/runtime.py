@@ -132,6 +132,33 @@ def _rewrite_auth_profile_api_key(path: Path, *, provider: str, api_key: str) ->
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _optional_int(value: object, default: int) -> int:
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _optional_float(value: object, default: float) -> float:
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _filter_plugin_config_by_manifest(config: dict, manifest_path: Path) -> dict:
+    if not manifest_path.exists():
+        return config
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return config
+    schema = manifest.get("configSchema") if isinstance(manifest, dict) else None
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or not properties:
+        return config
+    allowed = set(properties)
+    return {key: value for key, value in config.items() if key in allowed}
+
+
 def _load_locomo_eval_agents_md() -> str:
     override_path = (
         Path(__file__).resolve().parents[2]
@@ -168,6 +195,8 @@ def bootstrap_locomo_openclaw_runtime(
     )
     general_cfg = runtime_cfg.get("general", {}) if isinstance(runtime_cfg, dict) else {}
     openclaw_cfg = runtime_cfg.get("openclaw", {}) if isinstance(runtime_cfg, dict) else {}
+    openviking_plugin_cfg = runtime_cfg.get("openviking_plugin", {}) if isinstance(runtime_cfg, dict) else {}
+    memory_mode = str(general_cfg.get("memory_mode", "")).strip().lower()
     runtime_user = str(general_cfg.get("user", "eval-1"))
     runtime_agent = str(general_cfg.get("agent_id", "locomo-eval"))
     account_id = f"acct-{run_id}"
@@ -222,22 +251,38 @@ def bootstrap_locomo_openclaw_runtime(
         allow.append("openviking")
     plugins["allow"] = allow
     entries = plugins.setdefault("entries", {})
+    plugin_config = {
+        "mode": "remote",
+        "baseUrl": f'http://127.0.0.1:{ov_conf["server"]["port"]}',
+        "apiKey": str(ov_conf.get("server", {}).get("root_api_key", "")),
+        "accountId": account_id,
+        "userId": runtime_user,
+        "isolateUserScopeByAgent": True,
+        "isolateAgentScopeByUser": True,
+        "autoRecall": False,
+        "autoCapture": True,
+        "emitStandardDiagnostics": True,
+        "logFindRequests": True,
+    }
+    if memory_mode == "openclaw":
+        plugin_config["autoRecall"] = True
+        plugin_config["commitTokenThreshold"] = _optional_int(
+            openviking_plugin_cfg.get("commit_token_threshold"),
+            50,
+        )
+        plugin_config["commitTokenThresholdRatio"] = _optional_float(
+            openviking_plugin_cfg.get("commit_token_threshold_ratio"),
+            0.0,
+        )
+    else:
+        plugin_config["bypassSessionPatterns"] = ["qa-*"]
+    plugin_config = _filter_plugin_config_by_manifest(
+        plugin_config,
+        base_state_dir / "extensions" / "openviking" / "openclaw.plugin.json",
+    )
     entries["openviking"] = {
         "enabled": True,
-        "config": {
-            "mode": "remote",
-            "baseUrl": f'http://127.0.0.1:{ov_conf["server"]["port"]}',
-            "apiKey": str(ov_conf.get("server", {}).get("root_api_key", "")),
-            "accountId": account_id,
-            "userId": runtime_user,
-            "isolateUserScopeByAgent": True,
-            "isolateAgentScopeByUser": True,
-            "autoRecall": False,
-            "autoCapture": True,
-            "bypassSessionPatterns": ["qa-*"],
-            "emitStandardDiagnostics": True,
-            "logFindRequests": True,
-        },
+        "config": plugin_config,
     }
     plugins.setdefault("slots", {})["contextEngine"] = "openviking"
     config_path.parent.mkdir(parents=True, exist_ok=True)
