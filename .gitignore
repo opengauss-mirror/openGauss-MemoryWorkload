@@ -10,3 +10,4 @@ memory_bench_platform/runs/
 ClusterBench/
 trace-replayer/
 data/
+.worktrees/
