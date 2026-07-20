@@ -55,9 +55,42 @@ Benchmark 决定被测系统的回答如何评分
 
 统一的是插件形式、执行协议、Metric Envelope、验证证据和诊断输出；不统一不同 Benchmark 的领域语义、评分规则和质量阈值。
 
+### 4.1 平台侧的两个组成部分
+
+本文所说的“平台负责”实际分为两层：
+
+1. **Integration SDK**：Python 公共库，定义请求/响应模型、协议版本、能力字段、Evaluation Profile 接口、标准异常和 Runner 辅助函数。
+2. **Onboarding Kit**：基于 SDK 实现的 CLI 和测试工具，包括 Scaffolder、Static Validator、Conformance Harness、Compatibility Resolver、Smoke Runner 和 Diagnostic Reporter。
+
+Agent 可以调用 Onboarding Kit，也可以在 Adapter 中导入 Integration SDK 提供的公开接口，但不能修改这两层来适配某个具体 Skill。
+
+### 4.2 SDK、Agent 与验证器责任矩阵
+
+| 接入内容 | Integration SDK / Onboarding Kit 负责 | Agent 负责 | 最终判断方 |
+|---|---|---|---|
+| Integration Skill 目录 | 提供版本化模板并创建全部固定文件 | 不自行发明目录或入口文件 | Static Validator |
+| `manifest.yaml` | 定义 schema、默认值、协议版本和合法能力字段 | 根据新系统填写 ID、entrypoint、requirements、capabilities、Profile 和环境变量名称 | Static Validator / Compatibility Resolver |
+| `SKILL.md` | 生成固定章节和协议说明 | 填写外部系统、配置、限制和运行示例 | 文档校验与维护者评审 |
+| `build_tasks.py` | 生成函数签名、类型、Runner 包装和标准错误处理 | 实现原始样本到 Case/Step 的业务映射 | Type Contract / Golden Test |
+| `score_predictions.py` | 提供 Metric Envelope 和预置 Profile scorer | 映射 prediction/reference；为 `custom@1` 实现自定义评分 | Profile Contract / Golden Test |
+| `validate.py` | 提供校验入口、结果模型和公共校验工具 | 实现 Benchmark 特有的数据、资源和样本关系检查 | Conformance Harness |
+| `run_task.py` | 提供 Agent 请求/响应模型、Runner 包装和错误 Envelope | 实现平台任务到外部 Agent CLI/API 的映射 | Agent Type Contract / Golden Test |
+| `run_operation.py` | 提供 Memory action、请求/响应模型和 Runner 包装 | 实现外部 Memory 的 ingest/status/recall 调用与字段映射 | Memory Type Contract / Capability Contract |
+| `healthcheck.py` | 提供无副作用的健康检查协议 | 实现目标 CLI/API 的实际连通性检查 | Smoke Runner |
+| Evaluation Profile | 定义标准 Profile、Metric 语义、方向、值域和聚合方式 | 为 Benchmark 选择 Profile 并填写必要映射或 rubric | Profile Contract |
+| requirements/capabilities | 定义字段词汇、schema 和匹配算法 | 根据外部系统源码声明需要或提供的能力 | Capability Contract / Compatibility Resolver |
+| Golden Fixture | 创建固定目录、schema 和示例占位 | 构造小型输入并起草预期 Case/Metric | Golden Test；预期语义由官方实现或维护者确认 |
+| 错误与诊断 | 定义错误码、脱敏规则和结构化报告 | 根据诊断修改当前 Skill | Diagnostic Reporter |
+| Smoke 组合 | 提供参考 Skill、选择规则和执行器 | 发起命令；必要时从兼容候选中选择目标组合 | Compatibility Resolver / Smoke Runner |
+| `integration_receipt.json` | 自动汇总并生成，不接受 Skill 自报测试结果 | 不直接编辑 | Onboarding Kit / CI |
+
+“Agent 负责”表示 Agent 填写平台模板中的外部系统适配逻辑，不表示 Agent 可以自由改变公共协议。协议模型、模板框架、Profile 公式、匹配算法、Conformance 规则、错误码和接入凭证都只能由平台提供。
+
+Golden Fixture 是特殊的协作项：Agent 可以自动生成小型样本和预期结果草稿，但不能用待测试实现的输出自我证明正确。`expected_tasks.json` 和 `expected_metrics.json` 必须能由 Benchmark 官方实现、官方样例或维护者手工推导确认。
+
 ## 5. 总体架构
 
-平台新增接入平面，现有 Workflow、Builder、Operator Dispatcher 和执行器继续作为运行平面：
+平台新增接入平面，现有 Workflow、Builder、Operator Dispatcher 和执行器继续作为运行平面。下图中的平台步骤都是 Onboarding Kit 执行，只有“Agent 填写”步骤由 Agent 生成外部系统适配代码：
 
 ```text
 新系统源码或文档
@@ -95,7 +128,7 @@ Benchmark 决定被测系统的回答如何评分
   → Agent 根据诊断修复
 ```
 
-平台生成固定函数签名、SDK import、stdin/stdout 协议、异常转换和未实现占位。Agent 只实现外部数据或 API 到平台模型的映射，不重新设计入口协议，也不重复实现子进程通信和结果 Envelope。
+平台生成固定函数签名、SDK import、stdin/stdout 协议、异常转换和未实现占位。Agent 只实现外部数据或 API 到平台模型的映射，不重新设计入口协议，也不重复实现子进程通信和结果 Envelope。生成骨架、执行校验、计算能力匹配和生成接入凭证始终是平台行为，即使这些命令由 Agent 自动发起。
 
 ## 7. Integration Skill 骨架
 
@@ -167,7 +200,7 @@ integration:
   sdk_version: ">=1.0,<2.0"
 ```
 
-Benchmark 声明运行要求：
+Benchmark 的运行要求由 Agent 根据 Benchmark 源码填写，但字段定义和合法值由 SDK 提供：
 
 ```yaml
 requirements:
@@ -178,7 +211,7 @@ requirements:
     async_ingest: true
 ```
 
-Memory 声明自身能力：
+Memory 的实际能力由 Agent 根据 Memory 系统接口填写，但能力是否真实可用必须由 Capability Contract 验证：
 
 ```yaml
 capabilities:
@@ -186,7 +219,7 @@ capabilities:
   async_ingest: true
 ```
 
-Agent 使用同一机制声明 `structured_input`、`multi_turn`、`tool_calling` 等执行能力，但不声明 Memory action。
+Agent 使用同一机制声明 `structured_input`、`multi_turn`、`tool_calling` 等执行能力，但不声明 Memory action。Compatibility Resolver 由平台执行，Agent 不能通过自行输出“匹配成功”跳过验证。
 
 执行前必须满足：
 
@@ -300,7 +333,7 @@ Golden 输入必须小型、确定性、可提交并能人工确认。预期结�
 
 ### 12.1 生成骨架
 
-Agent 根据用户指定的类型和 ID 调用平台命令：
+Agent 根据用户指定的类型和 ID 调用平台命令。命令可以由 Agent 自动发起，但目录和代码框架由平台 Scaffolder 生成：
 
 ```bash
 memory-bench integration create benchmark locomo \
@@ -311,7 +344,7 @@ memory-bench integration create benchmark locomo \
 
 ### 12.2 分析并填充
 
-Agent 同时阅读新系统源码、文档和平台生成的实现占位，填写 Manifest、Adapter、Benchmark 特有 validator 和 Golden Fixture。修改范围必须限制在新 Integration Skill 目录内。
+Agent 同时阅读新系统源码、文档和平台生成的实现占位，填写 Manifest、Adapter、Benchmark 特有 validator 和 Golden Fixture。Agent 可以生成这些外部系统特有内容，但不能修改 SDK、Onboarding Kit、公共 Profile 或 Conformance 规则。修改范围必须限制在新 Integration Skill 目录内。
 
 ### 12.3 静态校验
 
@@ -327,7 +360,7 @@ memory-bench integration validate skills/benchmarks/locomo
 memory-bench integration test skills/benchmarks/locomo
 ```
 
-测试按公共契约、类型契约、能力契约、Profile 契约和 Golden Case 的顺序执行。Agent 根据结构化诊断迭代修复。
+测试按公共契约、类型契约、能力契约、Profile 契约和 Golden Case 的顺序执行。所有 PASS/FAIL 由平台测试工具计算；Agent 只能根据结构化诊断迭代修复，不能在 Manifest 或 Skill 输出中自行声明通过。
 
 ### 12.5 隔离 Smoke Test
 
