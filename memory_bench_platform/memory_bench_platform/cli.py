@@ -23,7 +23,14 @@ from .integration import (
 from .loader import load_agent_skill, load_all_skills, load_benchmark_skill
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
-from .protocol import CaseRecord, ExecutionSpec, ReportSummary, RunRecord, StepRecord
+from .protocol import (
+    CaseRecord,
+    ExecutionSpec,
+    ReportSummary,
+    RunRecord,
+    StepRecord,
+    WorkflowRuntimeContext,
+)
 from .result_analysis import analyze_run
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .resource_monitor import ResourceMonitor
@@ -124,7 +131,11 @@ def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step
     rows: list[dict] = []
     for judge in judge_results:
         case = case_map.get(judge.case_id)
-        matched_results = [item for item in step_results if item.step_id.startswith(f"{judge.case_id}-")]
+        expected_step_id = str(case.reference.get("expected_step_id", "") or "") if case else ""
+        if expected_step_id:
+            matched_results = [item for item in step_results if item.step_id == expected_step_id]
+        else:
+            matched_results = [item for item in step_results if item.step_id.startswith(f"{judge.case_id}-")]
         response = ""
         if matched_results:
             structured = matched_results[-1].structured_output
@@ -470,9 +481,23 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     cases_payload = build_cases_from_source(args.benchmark, args.data_path)
+    declared_source_kind = str(cases_payload.get("source_kind", "") or "")
+    if declared_source_kind:
+        run_record.source_kind = declared_source_kind
+        storage.write_run_record(run_dir, run_record)
     cases = [CaseRecord(run_id=run_record.run_id, **item) for item in cases_payload.get("cases", [])]
     steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
     execution_spec = ExecutionSpec(**cases_payload.get("execution_spec", {}))
+    resolved_memory_id = str(run_contract["selection"].get("memory_id") or "").strip() or None
+    runtime_context = WorkflowRuntimeContext(
+        run_id=run_record.run_id,
+        run_dir=str(run_dir),
+        benchmark_id=str(run_contract["selection"]["benchmark_id"]),
+        agent_id=str(run_contract["selection"]["agent_id"]),
+        memory_id=resolved_memory_id,
+        run_contract=run_contract,
+        version_selection=run_record.version_selection,
+    )
 
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
@@ -481,6 +506,8 @@ def main(argv: list[str] | None = None) -> None:
         workflow_output = execute_cases(
             run_id=run_record.run_id,
             agent_id=args.agent,
+            memory_id=resolved_memory_id,
+            runtime_context=runtime_context,
             cases=cases,
             steps=steps,
             execution_spec=execution_spec,
@@ -517,6 +544,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     storage.write_json_record(
         run_dir,
+        "records/artifacts.json",
+        [item.model_dump(mode="json") for item in workflow_output["artifacts"]],
+    )
+    storage.write_json_record(
+        run_dir,
         "records/metrics.json",
         [item.model_dump(mode="json") for item in workflow_output["metrics"]]
         + [
@@ -537,7 +569,7 @@ def main(argv: list[str] | None = None) -> None:
     summary_record = ReportSummary(
         run_id=run_record.run_id,
         status=final_status,
-        case_total=len(cases),
+        case_total=len(judge_results),
         case_passed=passed_cases,
         case_failed=failed_cases,
         resource_summary={"cpu": cpu_snapshot},

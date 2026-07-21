@@ -23,9 +23,14 @@ version_policy:
       upstream: https://github.com/volcengine/OpenViking
       record_runtime_version: true
   record_runtime_version: true
-entry: {}
+entry:
+  runner: scripts/run_operation.py
 runtime:
   benchmark_unit: session
+  actions:
+    - ingest
+    - status
+    - recall
 ingest:
   benchmark_unit: session
 recall:

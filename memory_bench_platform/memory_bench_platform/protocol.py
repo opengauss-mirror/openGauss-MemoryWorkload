@@ -34,6 +34,7 @@ class CaseRecord(BaseModel):
     title: str
     goal: str
     capability: str
+    depends_on_cases: list[str] = Field(default_factory=list)
     reference: dict[str, Any] = Field(default_factory=dict)
     labels: list[str] = Field(default_factory=list)
     source_metadata: dict[str, Any] = Field(default_factory=dict)
@@ -44,7 +45,7 @@ class StepRecord(BaseModel):
     step_id: str
     case_id: str
     name: str
-    operator_kind: Literal["bash", "http", "agent", "wait"]
+    operator_kind: Literal["bash", "http", "agent", "wait", "memory", "poll"]
     depends_on: list[str] = Field(default_factory=list)
     retry_limit: int = 0
     timeout_seconds: int | None = None
@@ -78,6 +79,7 @@ class TraceEventRecord(BaseModel):
         "gate_passed",
         "gate_failed",
         "retry_scheduled",
+        "poll_probe",
         "case_judge_started",
         "case_judge_finished",
     ]
@@ -99,6 +101,34 @@ class RenderedTaskInput(BaseModel):
     messages: list[dict[str, str]] = Field(default_factory=list)
     attachments: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowRuntimeContext(BaseModel):
+    run_id: str
+    run_dir: str
+    benchmark_id: str
+    agent_id: str
+    memory_id: str | None = None
+    run_contract: dict[str, Any] = Field(default_factory=dict)
+    version_selection: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryTaskInput(BaseModel):
+    task_id: str
+    action: Literal["ingest", "status", "recall", "consistency"]
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    runtime_context: WorkflowRuntimeContext
+    idempotency_key: str
+
+
+class MemoryTaskOutput(BaseModel):
+    status: Literal["ok", "failed"]
+    state: Literal["accepted", "running", "completed", "failed"]
+    operation: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    metrics: list[dict[str, Any]] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    error: dict[str, Any] = Field(default_factory=dict)
 
 
 class JudgeInput(BaseModel):

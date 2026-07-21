@@ -75,7 +75,8 @@
 | `loader.py` / `manifests.py` | 发现并加载目录型 Skill，解析 manifest，校验 Skill 元数据。 |
 | `planner.py` | 根据 benchmark、agent、memory backend、hardware profile 生成执行计划。 |
 | `integration.py` | 串联 Skill 能力，解析 benchmark entrypoint，执行外部 runner 或 smoke。 |
-| `workflow.py` / `executor.py` | 执行平台原生 case/step workflow，收集 step result、trace、metric。 |
+| `workflow.py` / `workflow_operators.py` | 执行平台原生 case/step workflow，分发 Agent、Shell、HTTP、Memory 和 Poll Operator。 |
+| `workflow_inputs.py` | 校验 Step 顺序和引用，并在运行时解析 `$ref`、`$template` 输入。 |
 | `resource_monitor.py` | 采集 CPU、进程级内存、IO 等资源数据，并写入 `artifacts/monitor/`。 |
 | `storage.py` | 建立标准 run 目录，写入 `run.json`、`records/`、`logs/`、`reports/`。 |
 | `result_analysis.py` | 对 run 结果做二次分析，生成 `analysis.json`、`analysis.md`、`run_report.html`。 |
@@ -133,12 +134,27 @@ Memory Skill 负责：
 Benchmark Skill
   -> build cases / steps
   -> Platform workflow executor
-  -> Agent Skill run_task
+  -> Agent Skill run_task / Memory Skill runner
   -> Trace / Metric / JudgeResult
   -> Analyze / Report
 ```
 
 适合结构相对简单、可由平台直接展开 case/step 的 benchmark。
+
+原生记忆链路使用串行 `single_path`：
+
+```text
+memory.ingest -> poll(memory.status) -> memory.recall -> agent -> judge
+```
+
+后续 Step 可以引用同一 Case 中已完成的前序输出：
+
+```json
+{"operation": {"$ref": "steps.memory-ingest.output.operation"}}
+{"question": {"$template": "Evidence: {{ steps.memory-recall.output.evidence_text }}"}}
+```
+
+`$ref` 保留原始类型；`$template` 只接受标量占位值并返回字符串。引用范围限于 `run.*`、`case.*` 和当前 Case 的前序 `steps.*`。平台在执行第一个 Case 前拒绝未来引用、跨 Case 引用、非法 Poll probe 和可重试的 `memory.ingest`。
 
 ### 2. 外部 runner 导入
 
@@ -211,6 +227,26 @@ PYTHONPATH=. python3 -m memory_bench_platform.cli run \
   --run-id locomo-ov-ingest-small
 ```
 
+### 运行原生 OpenViking 记忆闭环
+
+先配置服务地址、凭据和 identity。凭据只通过进程环境传给 Memory runner，不写入 runtime context：
+
+```bash
+export OPENVIKING_API_URL=http://127.0.0.1:1933
+export OPENVIKING_API_KEY=<user-or-root-key>
+export OPENVIKING_ACCOUNT_ID=<account-id>
+export OPENVIKING_USER_ID=<user-id>
+export OPENVIKING_AGENT_ID=<agent-id>
+export OPENVIKING_BIN=ov
+
+PYTHONPATH=. python3 -m memory_bench_platform.cli run \
+  --benchmark ovtest-memory \
+  --agent generic-cli \
+  --memory-backend openviking
+```
+
+该 smoke workload 写入固定事实，轮询写入完成状态，执行 Recall，再把 `evidence_text` 注入 Agent 输入。`records/traces.json` 保存每次 `poll_probe`，`records/metrics.json` 保存 Poll 和 Memory runner 指标。
+
 OpenClaw 完整执行 LoCoMo 路径：
 
 ```bash
@@ -252,6 +288,7 @@ runs/<run-id>/
     step_results.json
     traces.json
     metrics.json
+    artifacts.json
     external_entrypoint.json
   logs/
     external_runner.stdout.log
@@ -376,6 +413,7 @@ skills/agents/<agent-id>/
 skills/memories/<memory-id>/
   SKILL.md
   manifest.yaml
+  scripts/run_operation.py
 ```
 
 2. 明确 memory backend 的能力边界：
@@ -387,7 +425,21 @@ skills/memories/<memory-id>/
 - token usage 和 task/session usage 读取
 - consistency check 或 reindex/flush 能力
 
-3. Benchmark 层只应知道 session、question、answer、evidence 等执行语义，不应依赖具体 chunk 切分或索引实现。
+3. 在 manifest 的 `entry.runner` 声明统一入口。Runner 从 stdin 读取：
+
+```json
+{
+  "task_id": "memory-recall",
+  "action": "recall",
+  "inputs": {"query": "preferred language"},
+  "runtime_context": {},
+  "idempotency_key": "run:case:step"
+}
+```
+
+Runner 向 stdout 写入 `status`、`state`、`operation`、`output`、`metrics`、`artifacts` 和 `error`。脚本必须输出单个 JSON 对象，并从环境读取凭据。错误、Artifact 和默认输出不得包含 API key 或 ingest 原文。
+
+4. Benchmark 层只应知道 session、question、answer、evidence 等执行语义，不应依赖具体 chunk 切分或索引实现。
 
 ## 配置和版本策略
 

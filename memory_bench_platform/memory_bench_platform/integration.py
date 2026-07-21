@@ -7,10 +7,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .loader import load_all_skills
 from .manifests import AgentManifest, BenchmarkManifest, MemoryManifest, SmokeManifest
 from .paths import PROJECT_ROOT, SKILLS_ROOT
-from .protocol import EntryPointRecord, RenderedTaskInput
+from .protocol import EntryPointRecord, MemoryTaskInput, MemoryTaskOutput, RenderedTaskInput
 
 
 @dataclass(frozen=True)
@@ -203,6 +205,8 @@ def build_run_contract(
         },
         "memory_runtime": {
             "enabled": memory is not None,
+            "runner": memory.entry.runner if memory is not None else None,
+            "supported_actions": memory_runtime.get("actions", []),
             "benchmark_unit": memory_runtime.get("benchmark_unit"),
             "ingest_benchmark_unit": memory_ingest.get("benchmark_unit"),
             "recall_mode": memory_recall.get("mode"),
@@ -240,6 +244,24 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
         _script_for_manifest(manifest_path, manifest.entry.runner),
         stdin_payload=rendered_input.model_dump(),
     )
+
+
+def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput:
+    manifest = get_memory_manifest(skill_id)
+    manifest_path = _manifest_path("memories", skill_id)
+    if not manifest.entry.runner:
+        raise ValueError(f"memory skill {skill_id} has no runner")
+    try:
+        payload = run_json_script(
+            _script_for_manifest(manifest_path, manifest.entry.runner),
+            stdin_payload=request.model_dump(mode="json"),
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"memory skill {skill_id} runner returned invalid JSON") from exc
+    try:
+        return MemoryTaskOutput.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"memory skill {skill_id} runner returned invalid response") from exc
 
 
 def score_benchmark_run(skill_id: str, run_dir: Path, source_path: str | None = None) -> dict:

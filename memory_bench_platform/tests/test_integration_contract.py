@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_bench_platform.integration import build_run_contract, resolve_run_skill_bundle
+from memory_bench_platform.integration import build_run_contract, get_memory_manifest, resolve_run_skill_bundle
 
 
 def test_resolve_run_skill_bundle_uses_agent_default_memory_skill():
@@ -28,6 +28,15 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert contract["memory_runtime"]["ingest_benchmark_unit"] == "session"
     assert contract["memory_runtime"]["accept_signal"] == "accepted"
     assert contract["memory_runtime"]["complete_signal"] == "completed"
+    assert contract["memory_runtime"]["runner"] == "scripts/run_operation.py"
+    assert contract["memory_runtime"]["supported_actions"] == ["ingest", "status", "recall"]
+
+
+def test_openviking_memory_manifest_declares_unified_runner():
+    manifest = get_memory_manifest("openviking")
+
+    assert manifest.entry.runner == "scripts/run_operation.py"
+    assert manifest.runtime["actions"] == ["ingest", "status", "recall"]
 
 
 def test_resolve_run_skill_bundle_rejects_incompatible_memory_unit(tmp_path: Path):

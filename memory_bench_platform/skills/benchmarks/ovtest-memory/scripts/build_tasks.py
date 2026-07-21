@@ -10,10 +10,11 @@ def build_cases() -> dict:
             {
                 "case_id": "ovtest-memory-1",
                 "title": "ovtest memory smoke",
-                "goal": "Verify workflow engine can carry evidence across bash and wait operators.",
+                "goal": "Verify native ingest, completion polling, recall, and agent answer flow.",
                 "capability": "memory/store-retrieve",
                 "reference": {
-                    "expected_answer": "For systems programming I prefer Go over Python."
+                    "expected_answer": "For systems programming I prefer Go over Python.",
+                    "expected_step_id": "agent-answer",
                 },
                 "labels": ["source:ovtest", "native-workflow"],
                 "source_metadata": {},
@@ -22,40 +23,79 @@ def build_cases() -> dict:
         ],
         "steps": [
             {
-                "step_id": "emit-fact",
+                "step_id": "memory-ingest",
                 "case_id": "ovtest-memory-1",
-                "name": "emit_fact",
-                "operator_kind": "bash",
+                "name": "memory_ingest",
+                "operator_kind": "memory",
                 "depends_on": [],
                 "retry_limit": 0,
                 "timeout_seconds": 30,
                 "gate_policy": "hard",
                 "inputs": {
-                    "cmd": [
-                        "python3",
-                        "-c",
-                        "print('For systems programming I prefer Go over Python.')",
-                    ]
+                    "action": "ingest",
+                    "content": "For systems programming I prefer Go over Python.",
                 },
             },
             {
-                "step_id": "settle",
+                "step_id": "poll-ingest",
                 "case_id": "ovtest-memory-1",
-                "name": "settle",
-                "operator_kind": "wait",
-                "depends_on": ["emit-fact"],
+                "name": "poll_ingest",
+                "operator_kind": "poll",
+                "depends_on": ["memory-ingest"],
                 "retry_limit": 0,
-                "timeout_seconds": 5,
-                "gate_policy": "soft",
-                "inputs": {"seconds": 0},
+                "timeout_seconds": 120,
+                "gate_policy": "hard",
+                "inputs": {
+                    "interval_seconds": 1,
+                    "probe": {
+                        "operator_kind": "memory",
+                        "action": "status",
+                        "inputs": {
+                            "operation": {"$ref": "steps.memory-ingest.output.operation"},
+                        },
+                    },
+                    "success_when": {"path": "state", "equals": "completed"},
+                    "failure_when": {"path": "state", "equals": "failed"},
+                },
+            },
+            {
+                "step_id": "memory-recall",
+                "case_id": "ovtest-memory-1",
+                "name": "memory_recall",
+                "operator_kind": "memory",
+                "depends_on": ["poll-ingest"],
+                "retry_limit": 0,
+                "timeout_seconds": 30,
+                "gate_policy": "hard",
+                "inputs": {
+                    "action": "recall",
+                    "query": "Which language do I prefer for systems programming?",
+                    "node_limit": 5,
+                },
+            },
+            {
+                "step_id": "agent-answer",
+                "case_id": "ovtest-memory-1",
+                "name": "agent_answer",
+                "operator_kind": "agent",
+                "depends_on": ["memory-recall"],
+                "retry_limit": 0,
+                "timeout_seconds": 30,
+                "gate_policy": "hard",
+                "inputs": {
+                    "question": {
+                        "$template": "Use this recalled evidence to answer the preference question: {{ steps.memory-recall.output.evidence_text }}"
+                    },
+                    "metadata": {"source": "ovtest-memory"},
+                },
             },
         ],
         "execution_spec": {
-            "case_mode": "dag",
+            "case_mode": "single_path",
             "max_parallel_steps": 1,
             "fail_fast": True,
             "default_retry_limit": 0,
-            "default_timeout_seconds": 30,
+            "default_timeout_seconds": 120,
         },
     }
 

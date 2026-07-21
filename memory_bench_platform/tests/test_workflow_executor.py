@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 import urllib.error
 
 from memory_bench_platform.protocol import CaseRecord, ExecutionSpec, StepRecord
@@ -272,4 +273,208 @@ def test_agent_operator_passes_full_rendered_input_contract(monkeypatch, tmp_pat
     assert captured["messages"][-1]["content"] == "final question"
     assert captured["attachments"] == ["artifacts/history.json"]
     assert captured["metadata"]["question_id"] == "q-1"
+    assert output["step_results"][0].structured_output["output"] == {"text": "ok"}
     assert output["judge_results"][0].passed is True
+
+
+def test_workflow_applies_default_timeout_to_operator(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["timeout"] = kwargs["timeout"]
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("memory_bench_platform.workflow.subprocess.run", fake_run)
+    case = CaseRecord(
+        case_id="case-timeout",
+        run_id="run-1",
+        title="timeout",
+        goal="use default timeout",
+        capability="workflow/bash",
+        reference={"expected_answer": "ok"},
+    )
+    step = StepRecord(
+        step_id="bash-timeout",
+        case_id="case-timeout",
+        name="bash",
+        operator_kind="bash",
+        inputs={"cmd": ["echo", "ok"]},
+    )
+
+    execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[case],
+        steps=[step],
+        execution_spec=ExecutionSpec(default_timeout_seconds=7),
+        run_dir=tmp_path,
+    )
+
+    assert captured == {"cmd": ["echo", "ok"], "timeout": 7}
+
+
+def test_workflow_records_input_resolution_failure_without_running_operator(monkeypatch, tmp_path: Path):
+    called = {"agent": False}
+
+    def fake_run_agent_task(skill_id, rendered_input):
+        del skill_id, rendered_input
+        called["agent"] = True
+        return {"status": "ok", "turns": [{"text": "unexpected"}]}
+
+    monkeypatch.setattr("memory_bench_platform.workflow.run_agent_task", fake_run_agent_task)
+    case = CaseRecord(
+        case_id="case-resolution",
+        run_id="run-1",
+        title="resolution",
+        goal="fail missing output path",
+        capability="workflow/input-resolution",
+        reference={"expected_answer": "unused"},
+    )
+    first = StepRecord(
+        step_id="wait-first",
+        case_id="case-resolution",
+        name="wait",
+        operator_kind="wait",
+        inputs={"seconds": 0},
+    )
+    second = StepRecord(
+        step_id="agent-second",
+        case_id="case-resolution",
+        name="agent",
+        operator_kind="agent",
+        depends_on=["wait-first"],
+        gate_policy="hard",
+        inputs={"question": {"$ref": "steps.wait-first.output.missing"}},
+    )
+
+    output = execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[case],
+        steps=[first, second],
+        execution_spec=ExecutionSpec(fail_fast=True),
+        run_dir=tmp_path,
+    )
+
+    assert called["agent"] is False
+    assert output["step_results"][1].status == "failed"
+    assert "missing reference path" in output["step_results"][1].gate_detail
+
+
+def test_workflow_runs_qa_after_successful_setup_case(monkeypatch, tmp_path: Path):
+    def fake_run_agent_task(skill_id, rendered_input):
+        del skill_id
+        return {"status": "ok", "turns": [{"text": rendered_input.messages[-1]["content"]}]}
+
+    monkeypatch.setattr("memory_bench_platform.workflow.run_agent_task", fake_run_agent_task)
+    setup = CaseRecord(
+        case_id="sample-setup",
+        run_id="run-1",
+        title="setup",
+        goal="prepare memory",
+        capability="memory/ingest",
+        judge_mode="none",
+    )
+    qa = CaseRecord(
+        case_id="sample-q1",
+        run_id="run-1",
+        title="question",
+        goal="answer",
+        capability="memory/question-answering",
+        depends_on_cases=["sample-setup"],
+        reference={"expected_answer": "expected"},
+    )
+    steps = [
+        StepRecord(
+            step_id="setup-step",
+            case_id="sample-setup",
+            name="setup",
+            operator_kind="wait",
+            gate_policy="hard",
+            inputs={"seconds": 0},
+        ),
+        StepRecord(
+            step_id="qa-step",
+            case_id="sample-q1",
+            name="answer",
+            operator_kind="agent",
+            gate_policy="hard",
+            inputs={"question": "expected"},
+        ),
+    ]
+
+    output = execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[setup, qa],
+        steps=steps,
+        execution_spec=ExecutionSpec(fail_fast=True),
+        run_dir=tmp_path,
+    )
+
+    assert [item.step_id for item in output["step_results"]] == ["setup-step", "qa-step"]
+    assert [item.case_id for item in output["judge_results"]] == ["sample-q1"]
+    assert output["judge_results"][0].passed is True
+
+
+def test_workflow_skips_qa_when_setup_case_fails(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_run_agent_task(skill_id, rendered_input):
+        del skill_id
+        calls.append(rendered_input.task_id)
+        if rendered_input.task_id == "setup-step":
+            raise ValueError("setup failed")
+        return {"status": "ok", "turns": [{"text": "unexpected"}]}
+
+    monkeypatch.setattr("memory_bench_platform.workflow.run_agent_task", fake_run_agent_task)
+    setup = CaseRecord(
+        case_id="sample-setup",
+        run_id="run-1",
+        title="setup",
+        goal="prepare memory",
+        capability="memory/ingest",
+        judge_mode="none",
+    )
+    qa = CaseRecord(
+        case_id="sample-q1",
+        run_id="run-1",
+        title="question",
+        goal="answer",
+        capability="memory/question-answering",
+        depends_on_cases=["sample-setup"],
+        reference={"expected_answer": "expected"},
+    )
+    steps = [
+        StepRecord(
+            step_id="setup-step",
+            case_id="sample-setup",
+            name="setup",
+            operator_kind="agent",
+            gate_policy="hard",
+            inputs={"question": "prepare"},
+        ),
+        StepRecord(
+            step_id="qa-step",
+            case_id="sample-q1",
+            name="answer",
+            operator_kind="agent",
+            gate_policy="hard",
+            inputs={"question": "expected"},
+        ),
+    ]
+
+    output = execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[setup, qa],
+        steps=steps,
+        execution_spec=ExecutionSpec(fail_fast=True),
+        run_dir=tmp_path,
+    )
+
+    qa_result = next(item for item in output["step_results"] if item.step_id == "qa-step")
+    assert calls == ["setup-step"]
+    assert qa_result.status == "skipped"
+    assert "sample-setup" in qa_result.gate_detail

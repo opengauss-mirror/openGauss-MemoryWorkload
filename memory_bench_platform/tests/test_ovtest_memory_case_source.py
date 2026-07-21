@@ -9,7 +9,27 @@ def test_ovtest_memory_case_source_emits_native_workflow_shape():
     proc = subprocess.run([sys.executable, str(script)], text=True, capture_output=True, check=True)
     payload = json.loads(proc.stdout)
     assert payload["source_kind"] == "native_workflow"
-    assert payload["cases"]
-    assert payload["steps"]
-    operator_kinds = {step["operator_kind"] for step in payload["steps"]}
-    assert {"bash", "wait"} <= operator_kinds
+    case = payload["cases"][0]
+    assert case["reference"]["expected_step_id"] == "agent-answer"
+
+    steps = payload["steps"]
+    assert [step["step_id"] for step in steps] == [
+        "memory-ingest",
+        "poll-ingest",
+        "memory-recall",
+        "agent-answer",
+    ]
+    assert [step["operator_kind"] for step in steps] == ["memory", "poll", "memory", "agent"]
+    assert steps[0]["inputs"]["action"] == "ingest"
+    assert steps[0]["retry_limit"] == 0
+    assert steps[1]["depends_on"] == ["memory-ingest"]
+    assert steps[1]["inputs"]["probe"]["inputs"]["operation"] == {
+        "$ref": "steps.memory-ingest.output.operation"
+    }
+    assert steps[2]["depends_on"] == ["poll-ingest"]
+    assert steps[2]["inputs"]["action"] == "recall"
+    assert steps[3]["depends_on"] == ["memory-recall"]
+    assert steps[3]["inputs"]["question"] == {
+        "$template": "Use this recalled evidence to answer the preference question: {{ steps.memory-recall.output.evidence_text }}"
+    }
+    assert payload["execution_spec"]["case_mode"] == "single_path"
