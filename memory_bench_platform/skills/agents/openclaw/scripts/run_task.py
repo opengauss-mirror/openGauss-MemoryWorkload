@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -48,6 +49,19 @@ def build_openclaw_message(request: dict) -> str:
     return rendered or _extract_message(request)
 
 
+def session_id_from_key(session_key: str) -> str:
+    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+    return "-".join(
+        [
+            digest[:8],
+            digest[8:12],
+            digest[12:16],
+            digest[16:20],
+            digest[20:32],
+        ]
+    )
+
+
 def build_openclaw_command(request: dict) -> list[str]:
     metadata = request.get("metadata", {})
     agent_id = metadata.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID")
@@ -60,10 +74,10 @@ def build_openclaw_command(request: dict) -> list[str]:
     cmd = [_resolve_openclaw_bin(), "agent", "--message", build_openclaw_message(request), "--json"]
     if agent_id:
         cmd += ["--agent", str(agent_id)]
-    if session_key:
-        cmd += ["--session-key", str(session_key)]
     if session_id:
         cmd += ["--session-id", str(session_id)]
+    elif session_key:
+        cmd += ["--session-id", session_id_from_key(str(session_key))]
     if target:
         cmd += ["--to", str(target)]
 
@@ -86,20 +100,45 @@ def build_openclaw_command(request: dict) -> list[str]:
 def main() -> None:
     request = json.load(sys.stdin)
     cmd = build_openclaw_command(request)
-    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90, check=True)
+    configured_timeout = request.get("metadata", {}).get("timeout_seconds")
+    subprocess_timeout = max(90, int(configured_timeout or 60) + 30)
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=subprocess_timeout,
+        check=True,
+    )
     payload = json.loads(proc.stdout)
+    result_payload = payload.get("result", payload)
+    if not isinstance(result_payload, dict):
+        result_payload = {}
+    metadata = request.get("metadata", {})
+    configured_session_id = metadata.get("session_id")
+    configured_session_key = metadata.get("session_key")
+    resolved_session_id = (
+        str(configured_session_id)
+        if configured_session_id
+        else session_id_from_key(str(configured_session_key))
+        if configured_session_key
+        else ""
+    )
     response = {
         "status": payload.get("status", "ok"),
         "agent": "openclaw",
         "command": cmd,
         "request": request,
         "raw": payload,
-        "turns": payload.get("result", {}).get("payloads", []),
+        "output": {
+            "session_id": resolved_session_id,
+            "session_key": str(configured_session_key or ""),
+        },
+        "turns": result_payload.get("payloads", []),
         "artifacts": [],
         "metrics": [
             {
                 "name": "duration_ms",
-                "value": payload.get("result", {}).get("meta", {}).get("durationMs", 0),
+                "value": result_payload.get("meta", {}).get("durationMs", 0),
             }
         ],
     }

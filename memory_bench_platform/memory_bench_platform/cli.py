@@ -14,6 +14,7 @@ from .integration import (
     build_cases_from_source,
     execute_external_runner,
     execute_smoke_skill,
+    run_memory_plugin_task,
     resolve_benchmark_entrypoint,
     score_benchmark_run,
     validate_agent,
@@ -26,6 +27,7 @@ from .planner import RunPlanRequest, build_run_plan
 from .protocol import (
     CaseRecord,
     ExecutionSpec,
+    MemoryPluginTaskInput,
     ReportSummary,
     RunRecord,
     StepRecord,
@@ -49,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--benchmark", required=True)
     p_plan.add_argument("--agent", required=True)
     p_plan.add_argument("--memory-backend")
+    p_plan.add_argument(
+        "--memory-integration",
+        choices=["backend_direct", "agent_plugin"],
+        default="backend_direct",
+    )
     p_plan.add_argument("--hardware-profile")
     p_plan.add_argument("--data-path")
     p_plan.add_argument("--run-id")
@@ -58,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--benchmark", required=True)
     p_run.add_argument("--agent", required=True)
     p_run.add_argument("--memory-backend")
+    p_run.add_argument(
+        "--memory-integration",
+        choices=["backend_direct", "agent_plugin"],
+        default="backend_direct",
+    )
     p_run.add_argument("--hardware-profile")
     p_run.add_argument("--data-path")
     p_run.add_argument("--entrypoint")
@@ -98,6 +110,7 @@ def _plan_from_args(args: argparse.Namespace):
         agent_id=args.agent,
         run_id=getattr(args, "run_id", None),
         memory_backend=args.memory_backend,
+        memory_integration=args.memory_integration,
         hardware_profile=args.hardware_profile,
         data_path=args.data_path,
     )
@@ -207,6 +220,7 @@ def main(argv: list[str] | None = None) -> None:
             "benchmarks": [skill.id for skill in loaded["benchmarks"]],
             "agents": [skill.id for skill in loaded["agents"]],
             "memories": [skill.id for skill in loaded["memories"]],
+            "memory_plugins": [skill.id for skill in loaded["memory_plugins"]],
             "smokes": [skill.id for skill in loaded["smokes"]],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -235,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
                 args.benchmark,
                 args.agent,
                 args.memory_backend,
+                getattr(args, "memory_integration", "backend_direct"),
             )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -283,6 +298,7 @@ def main(argv: list[str] | None = None) -> None:
             args.benchmark,
             args.agent,
             args.memory_backend,
+            args.memory_integration,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -294,6 +310,7 @@ def main(argv: list[str] | None = None) -> None:
         args.benchmark,
         args.agent,
         args.memory_backend,
+        args.memory_integration,
     )
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
     source_kind = "external_benchmark_runner" if entrypoint.entrypoint_kind == "external_runner" else "benchmark_case_source"
@@ -317,6 +334,8 @@ def main(argv: list[str] | None = None) -> None:
                 key: value
                 for key, value in {
                     "data_path": args.data_path,
+                    "memory_integration": args.memory_integration,
+                    "memory_plugin_id": run_contract["selection"].get("memory_plugin_id"),
                     "version_overrides": version_overrides or None,
                 }.items()
                 if value
@@ -480,7 +499,12 @@ def main(argv: list[str] | None = None) -> None:
         print(str(run_dir))
         return
 
-    cases_payload = build_cases_from_source(args.benchmark, args.data_path)
+    cases_payload = build_cases_from_source(
+        args.benchmark,
+        args.data_path,
+        args.memory_integration,
+        run_record.run_id,
+    )
     declared_source_kind = str(cases_payload.get("source_kind", "") or "")
     if declared_source_kind:
         run_record.source_kind = declared_source_kind
@@ -495,6 +519,8 @@ def main(argv: list[str] | None = None) -> None:
         benchmark_id=str(run_contract["selection"]["benchmark_id"]),
         agent_id=str(run_contract["selection"]["agent_id"]),
         memory_id=resolved_memory_id,
+        memory_integration=args.memory_integration,
+        memory_plugin_id=str(run_contract["selection"].get("memory_plugin_id") or "") or None,
         run_contract=run_contract,
         version_selection=run_record.version_selection,
     )
@@ -502,6 +528,7 @@ def main(argv: list[str] | None = None) -> None:
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
     monitor.start_background_sampling()
+    plugin_finalize_payload = None
     try:
         workflow_output = execute_cases(
             run_id=run_record.run_id,
@@ -514,6 +541,30 @@ def main(argv: list[str] | None = None) -> None:
             run_dir=run_dir,
         )
     finally:
+        memory_plugin_id = runtime_context.memory_plugin_id
+        if memory_plugin_id:
+            try:
+                plugin_finalize_payload = run_memory_plugin_task(
+                    memory_plugin_id,
+                    MemoryPluginTaskInput(
+                        task_id="run-memory-plugin-finalize",
+                        action="finalize",
+                        inputs={},
+                        runtime_context=runtime_context,
+                        idempotency_key=f"{run_record.run_id}:memory-plugin-finalize",
+                    ),
+                ).model_dump(mode="json")
+            except Exception as exc:
+                plugin_finalize_payload = {
+                    "status": "failed",
+                    "state": "failed",
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+            storage.write_json_record(
+                run_dir,
+                "records/memory_plugin_finalize.json",
+                plugin_finalize_payload,
+            )
         monitor.stop_background_sampling()
     cpu_snapshot = monitor.capture_once()
 

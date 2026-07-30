@@ -4,7 +4,13 @@ from pathlib import Path
 
 import yaml
 
-from .manifests import AgentManifest, BenchmarkManifest, MemoryManifest, SmokeManifest
+from .manifests import (
+    AgentManifest,
+    BenchmarkManifest,
+    MemoryManifest,
+    MemoryPluginManifest,
+    SmokeManifest,
+)
 
 
 def _load_yaml(path: Path) -> dict:
@@ -31,10 +37,16 @@ def load_memory_skill(skills_root: Path, memory_id: str) -> MemoryManifest:
     return MemoryManifest.model_validate(_load_yaml(manifest_path))
 
 
+def load_memory_plugin_skill(skills_root: Path, plugin_id: str) -> MemoryPluginManifest:
+    manifest_path = skills_root / "memory_plugins" / plugin_id / "manifest.yaml"
+    return MemoryPluginManifest.model_validate(_load_yaml(manifest_path))
+
+
 def load_all_skills(skills_root: Path) -> dict[str, list]:
     benchmarks = []
     agents = []
     memories = []
+    memory_plugins = []
     smokes = []
     for manifest_path in sorted((skills_root / "benchmarks").glob("*/manifest.yaml")):
         benchmarks.append(BenchmarkManifest.model_validate(_load_yaml(manifest_path)))
@@ -44,8 +56,18 @@ def load_all_skills(skills_root: Path) -> dict[str, list]:
     if memory_root.exists():
         for manifest_path in sorted(memory_root.glob("*/manifest.yaml")):
             memories.append(MemoryManifest.model_validate(_load_yaml(manifest_path)))
+    memory_plugin_root = skills_root / "memory_plugins"
+    if memory_plugin_root.exists():
+        for manifest_path in sorted(memory_plugin_root.glob("*/manifest.yaml")):
+            memory_plugins.append(MemoryPluginManifest.model_validate(_load_yaml(manifest_path)))
     smoke_root = skills_root / "smoke"
     if smoke_root.exists():
         for manifest_path in sorted(smoke_root.glob("*/manifest.yaml")):
             smokes.append(SmokeManifest.model_validate(_load_yaml(manifest_path)))
-    return {"benchmarks": benchmarks, "agents": agents, "memories": memories, "smokes": smokes}
+    return {
+        "benchmarks": benchmarks,
+        "agents": agents,
+        "memories": memories,
+        "memory_plugins": memory_plugins,
+        "smokes": smokes,
+    }

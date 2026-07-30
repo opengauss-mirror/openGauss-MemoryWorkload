@@ -120,3 +120,95 @@ def test_locomo_task_builder_emits_one_setup_per_sample(tmp_path: Path):
     ]
     assert payload["cases"][1]["depends_on_cases"] == ["conv-1-setup"]
     assert payload["cases"][3]["depends_on_cases"] == ["conv-2-setup"]
+
+
+def test_locomo_agent_plugin_builder_uses_agent_only_for_ingest_and_qa(tmp_path: Path):
+    data_path = _write_dataset(tmp_path / "locomo.json", [_sample("conv-1")])
+
+    payload = build_tasks(data_path, "agent_plugin", "run-isolated")
+
+    assert payload["memory_integration"] == "agent_plugin"
+    assert [case["case_id"] for case in payload["cases"]] == [
+        "conv-1-plugin-setup",
+        "conv-1-q1",
+    ]
+    steps = payload["steps"]
+    assert [step["operator_kind"] for step in steps] == [
+        "memory_plugin",
+        "memory_plugin",
+        "memory_plugin",
+        "agent",
+        "memory_plugin",
+        "memory_plugin",
+        "agent",
+        "memory_plugin",
+        "memory_plugin",
+        "memory_plugin",
+        "agent",
+    ]
+    assert not any(
+        step["operator_kind"] == "memory" or step["inputs"].get("action") == "recall"
+        for step in steps
+    )
+    ingest_step = steps[3]
+    ingest_input = json.dumps(ingest_step["inputs"], ensure_ascii=False)
+    assert "LoCoMo conversation session for memory ingestion." in ingest_input
+    assert "[d1] A: first-session-private-text" in ingest_input
+    assert "Reply exactly INGEST_OK" in ingest_input
+    assert "OpenViking" not in json.dumps(steps, ensure_ascii=False)
+    assert "Transform the following raw conversation" not in ingest_input
+    assert "memory-ingestion notes" not in ingest_input
+    assert steps[1]["inputs"] == {
+        "action": "prepare",
+        "namespace": "run-isolated-conv-1",
+    }
+    assert steps[2]["inputs"] == {"action": "set_phase", "phase": "ingest"}
+    assert steps[4]["inputs"] == {
+        "action": "flush",
+        "session_key": "run-isolated:ingest-conv-1-session_1",
+        "agent_id": "locomo-eval",
+    }
+    assert steps[5]["inputs"]["operation"] == {
+        "$ref": "steps.conv-1-plugin-setup-session-1-flush.output.operation"
+    }
+    assert steps[9]["inputs"] == {"action": "set_phase", "phase": "qa"}
+    qa_step = steps[-1]
+    qa_input = json.dumps(qa_step["inputs"], ensure_ascii=False)
+    assert "What language does A prefer?" in qa_input
+    assert "evidence_text" not in qa_input
+    assert "Recalled memory evidence" not in qa_input
+    assert steps[3]["inputs"]["metadata"]["session_key"] == (
+        "run-isolated:ingest-conv-1-session_1"
+    )
+    assert qa_step["inputs"]["metadata"]["session_key"] == "run-isolated:qa-conv-1-q1"
+
+    cases = [CaseRecord(run_id="run-1", **item) for item in payload["cases"]]
+    workflow_steps = [StepRecord(**item) for item in steps]
+    validate_workflow(
+        cases=cases,
+        steps=workflow_steps,
+        execution_spec=ExecutionSpec(**payload["execution_spec"]),
+        memory_id="openviking",
+        memory_plugin_id="openclaw-openviking",
+    )
+
+
+def test_locomo_agent_plugin_builder_isolates_multiple_samples(tmp_path: Path):
+    data_path = _write_dataset(
+        tmp_path / "locomo.json",
+        [_sample("conv-1"), _sample("conv-2")],
+    )
+
+    payload = build_tasks(data_path, "agent_plugin", "run-isolated")
+
+    assert [case["case_id"] for case in payload["cases"]] == [
+        "conv-1-plugin-setup",
+        "conv-1-q1",
+        "conv-2-plugin-setup",
+        "conv-2-q1",
+    ]
+    prepare_steps = [step for step in payload["steps"] if step["name"] == "prepare_memory_plugin"]
+    assert [step["inputs"]["namespace"] for step in prepare_steps] == [
+        "run-isolated-conv-1",
+        "run-isolated-conv-2",
+    ]

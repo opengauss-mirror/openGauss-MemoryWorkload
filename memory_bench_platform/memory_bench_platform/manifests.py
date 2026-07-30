@@ -151,6 +151,18 @@ class MemoryManifest(BaseModel):
         return data
 
 
+class MemoryPluginManifest(BaseModel):
+    kind: Literal["memory_plugin"] = "memory_plugin"
+    id: str
+    version: str
+    agent: str
+    memory: str
+    entry: EntryPoints
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    phases: dict[str, Any] = Field(default_factory=dict)
+
+
 class SmokeManifest(BaseModel):
     kind: Literal["smoke"] = "smoke"
     id: str

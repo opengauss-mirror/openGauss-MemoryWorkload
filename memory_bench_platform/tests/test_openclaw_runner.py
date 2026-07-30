@@ -1,6 +1,10 @@
 import os
 
-from skills.agents.openclaw.scripts.run_task import build_openclaw_command, build_openclaw_message
+from skills.agents.openclaw.scripts.run_task import (
+    build_openclaw_command,
+    build_openclaw_message,
+    session_id_from_key,
+)
 
 
 def test_openclaw_runner_builds_agent_command_from_metadata(monkeypatch):
@@ -54,3 +58,22 @@ def test_openclaw_runner_flattens_full_rendered_input_into_message(monkeypatch):
     assert "[assistant] history turn 2" in prompt
     assert "[user] final question" in prompt
     assert cmd[3] == prompt
+
+
+def test_openclaw_runner_maps_semantic_session_key_to_stable_session_id(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_BIN", "/tmp/openclaw")
+    request = {
+        "task_id": "t3",
+        "messages": [{"role": "user", "content": "remember this"}],
+        "metadata": {
+            "agent_id": "locomo-eval",
+            "session_key": "run-1:ingest:session-1",
+        },
+    }
+
+    cmd = build_openclaw_command(request)
+
+    assert "--session-key" not in cmd
+    assert cmd[cmd.index("--session-id") + 1] == session_id_from_key(
+        "run-1:ingest:session-1"
+    )

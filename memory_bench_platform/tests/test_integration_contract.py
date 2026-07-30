@@ -21,6 +21,8 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
         "benchmark_id": "locomo",
         "agent_id": "openclaw",
         "memory_id": "openviking",
+        "memory_integration": "backend_direct",
+        "memory_plugin_id": None,
     }
     assert contract["execution"]["benchmark_ingest_unit"] == "session"
     assert contract["agent_runtime"]["protocol_mode"] == "stateful_session"
@@ -30,6 +32,34 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert contract["memory_runtime"]["complete_signal"] == "completed"
     assert contract["memory_runtime"]["runner"] == "scripts/run_operation.py"
     assert contract["memory_runtime"]["supported_actions"] == ["ingest", "status", "recall"]
+
+
+def test_build_run_contract_resolves_openclaw_openviking_plugin():
+    contract = build_run_contract(
+        "locomo",
+        "openclaw",
+        "openviking",
+        "agent_plugin",
+    )
+
+    assert contract["selection"]["memory_integration"] == "agent_plugin"
+    assert contract["selection"]["memory_plugin_id"] == "openclaw-openviking"
+    assert contract["memory_plugin_runtime"]["enabled"] is True
+    assert contract["memory_plugin_runtime"]["runner"] == "scripts/run_lifecycle.py"
+    assert contract["memory_plugin_runtime"]["actions"] == [
+        "validate",
+        "prepare",
+        "set_phase",
+        "flush",
+        "wait_settle",
+        "finalize",
+    ]
+    assert contract["memory_plugin_runtime"]["capabilities"]["explicit_flush"] is True
+    assert contract["memory_plugin_runtime"]["phases"]["ingest"] == {
+        "capture": True,
+        "recall": False,
+        "automatic_commit": False,
+    }
 
 
 def test_openviking_memory_manifest_declares_unified_runner():

@@ -62,6 +62,7 @@ def validate_workflow(
     steps: list[StepRecord],
     execution_spec: ExecutionSpec,
     memory_id: str | None,
+    memory_plugin_id: str | None = None,
 ) -> None:
     case_ids = [case.case_id for case in cases]
     duplicate_case_ids = _duplicates(case_ids)
@@ -111,6 +112,10 @@ def validate_workflow(
             action = str(step.inputs.get("action", "") or "")
             if action == "ingest" and step.retry_limit > 0:
                 raise ValueError("memory.ingest cannot retry")
+        elif step.operator_kind == "memory_plugin":
+            uses_typed_runtime = True
+            if not memory_plugin_id:
+                raise ValueError(f"memory plugin step {step.step_id} requires memory_plugin_id")
         elif step.operator_kind == "poll":
             uses_typed_runtime = True
             _validate_poll_step(step, execution_spec, memory_id)

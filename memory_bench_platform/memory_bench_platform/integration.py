@@ -10,9 +10,22 @@ from typing import Any
 from pydantic import ValidationError
 
 from .loader import load_all_skills
-from .manifests import AgentManifest, BenchmarkManifest, MemoryManifest, SmokeManifest
+from .manifests import (
+    AgentManifest,
+    BenchmarkManifest,
+    MemoryManifest,
+    MemoryPluginManifest,
+    SmokeManifest,
+)
 from .paths import PROJECT_ROOT, SKILLS_ROOT
-from .protocol import EntryPointRecord, MemoryTaskInput, MemoryTaskOutput, RenderedTaskInput
+from .protocol import (
+    EntryPointRecord,
+    MemoryPluginTaskInput,
+    MemoryPluginTaskOutput,
+    MemoryTaskInput,
+    MemoryTaskOutput,
+    RenderedTaskInput,
+)
 
 
 @dataclass(frozen=True)
@@ -21,10 +34,15 @@ class RunSkillBundle:
     benchmark: BenchmarkManifest
     agent: AgentManifest
     memory: MemoryManifest | None = None
+    memory_plugin: MemoryPluginManifest | None = None
 
     @property
     def memory_id(self) -> str | None:
         return self.memory.id if self.memory is not None else None
+
+    @property
+    def memory_plugin_id(self) -> str | None:
+        return self.memory_plugin.id if self.memory_plugin is not None else None
 
 
 def _manifest_path(kind: str, skill_id: str) -> Path:
@@ -53,6 +71,14 @@ def get_memory_manifest(skill_id: str) -> MemoryManifest:
         if manifest.id == skill_id:
             return manifest
     raise FileNotFoundError(f"memory skill not found: {skill_id}")
+
+
+def get_memory_plugin_manifest(skill_id: str) -> MemoryPluginManifest:
+    loaded = load_all_skills(SKILLS_ROOT)
+    for manifest in loaded["memory_plugins"]:
+        if manifest.id == skill_id:
+            return manifest
+    raise FileNotFoundError(f"memory plugin skill not found: {skill_id}")
 
 
 def get_smoke_manifest(skill_id: str) -> SmokeManifest:
@@ -142,6 +168,7 @@ def resolve_run_skill_bundle(
     benchmark_id: str,
     agent_id: str,
     memory_id: str | None = None,
+    memory_integration: str = "backend_direct",
     *,
     skills_root: Path = SKILLS_ROOT,
 ) -> RunSkillBundle:
@@ -152,11 +179,28 @@ def resolve_run_skill_bundle(
     memory = None
     if resolved_memory_id:
         memory = _find_manifest_by_id(loaded["memories"], resolved_memory_id, kind="memory")
+    memory_plugin = None
+    if memory_integration == "agent_plugin":
+        if memory is None:
+            raise ValueError("agent_plugin integration requires a memory backend")
+        matches = [
+            item
+            for item in loaded["memory_plugins"]
+            if item.agent == agent.id and item.memory == memory.id
+        ]
+        if not matches:
+            raise ValueError(
+                f"no memory plugin integration for agent={agent.id!r}, memory={memory.id!r}"
+            )
+        memory_plugin = matches[0]
+    elif memory_integration != "backend_direct":
+        raise ValueError(f"unsupported memory integration: {memory_integration}")
     bundle = RunSkillBundle(
         skills_root=skills_root,
         benchmark=benchmark,
         agent=agent,
         memory=memory,
+        memory_plugin=memory_plugin,
     )
     _validate_run_skill_bundle(bundle)
     return bundle
@@ -166,6 +210,7 @@ def build_run_contract(
     benchmark_id: str,
     agent_id: str,
     memory_id: str | None = None,
+    memory_integration: str = "backend_direct",
     *,
     skills_root: Path = SKILLS_ROOT,
 ) -> dict[str, Any]:
@@ -173,11 +218,13 @@ def build_run_contract(
         benchmark_id,
         agent_id,
         memory_id,
+        memory_integration,
         skills_root=skills_root,
     )
     benchmark = bundle.benchmark
     agent = bundle.agent
     memory = bundle.memory
+    memory_plugin = bundle.memory_plugin
     benchmark_execution = benchmark.execution or {}
     memory_runtime = memory.runtime if memory is not None else {}
     memory_ingest = memory.ingest if memory is not None else {}
@@ -189,6 +236,8 @@ def build_run_contract(
             "benchmark_id": benchmark.id,
             "agent_id": agent.id,
             "memory_id": bundle.memory_id,
+            "memory_integration": memory_integration,
+            "memory_plugin_id": bundle.memory_plugin_id,
         },
         "execution": {
             "benchmark_mode": benchmark_execution.get("mode"),
@@ -213,6 +262,13 @@ def build_run_contract(
             "accept_signal": memory_completion.get("accept_signal"),
             "complete_signal": memory_completion.get("complete_signal"),
         },
+        "memory_plugin_runtime": {
+            "enabled": memory_plugin is not None,
+            "runner": memory_plugin.entry.runner if memory_plugin is not None else None,
+            "actions": memory_plugin.runtime.get("actions", []) if memory_plugin is not None else [],
+            "capabilities": memory_plugin.capabilities if memory_plugin is not None else {},
+            "phases": memory_plugin.phases if memory_plugin is not None else {},
+        },
         "version_targets": {
             "benchmark": [target.model_dump(mode="json") for target in benchmark.version_policy.targets],
             "agent": [target.model_dump(mode="json") for target in agent.version_policy.targets],
@@ -221,18 +277,37 @@ def build_run_contract(
     }
 
 
-def build_benchmark_tasks(skill_id: str, source_path: str | None = None) -> dict:
+def build_benchmark_tasks(
+    skill_id: str,
+    source_path: str | None = None,
+    memory_integration: str = "backend_direct",
+    session_namespace: str | None = None,
+) -> dict:
     manifest = get_benchmark_manifest(skill_id)
     manifest_path = _manifest_path("benchmarks", skill_id)
     builder = manifest.entry.case_builder or manifest.entry.task_builder
     if not builder:
         raise ValueError(f"benchmark skill {skill_id} has no case_builder or task_builder")
     args = [source_path] if source_path else []
+    if memory_integration != "backend_direct":
+        args.extend(["--memory-integration", memory_integration])
+        if session_namespace:
+            args.extend(["--session-namespace", session_namespace])
     return run_json_script(_script_for_manifest(manifest_path, builder), args=args)
 
 
-def build_cases_from_source(skill_id: str, source_path: str | None = None) -> dict:
-    return build_benchmark_tasks(skill_id, source_path)
+def build_cases_from_source(
+    skill_id: str,
+    source_path: str | None = None,
+    memory_integration: str = "backend_direct",
+    session_namespace: str | None = None,
+) -> dict:
+    return build_benchmark_tasks(
+        skill_id,
+        source_path,
+        memory_integration,
+        session_namespace,
+    )
 
 
 def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
@@ -262,6 +337,27 @@ def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput
         return MemoryTaskOutput.model_validate(payload)
     except ValidationError as exc:
         raise ValueError(f"memory skill {skill_id} runner returned invalid response") from exc
+
+
+def run_memory_plugin_task(
+    skill_id: str,
+    request: MemoryPluginTaskInput,
+) -> MemoryPluginTaskOutput:
+    manifest = get_memory_plugin_manifest(skill_id)
+    manifest_path = _manifest_path("memory_plugins", skill_id)
+    if not manifest.entry.runner:
+        raise ValueError(f"memory plugin skill {skill_id} has no runner")
+    try:
+        payload = run_json_script(
+            _script_for_manifest(manifest_path, manifest.entry.runner),
+            stdin_payload=request.model_dump(mode="json"),
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"memory plugin skill {skill_id} runner returned invalid JSON") from exc
+    try:
+        return MemoryPluginTaskOutput.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"memory plugin skill {skill_id} runner returned invalid response") from exc
 
 
 def score_benchmark_run(skill_id: str, run_dir: Path, source_path: str | None = None) -> dict:

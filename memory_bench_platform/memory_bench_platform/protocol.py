@@ -45,7 +45,7 @@ class StepRecord(BaseModel):
     step_id: str
     case_id: str
     name: str
-    operator_kind: Literal["bash", "http", "agent", "wait", "memory", "poll"]
+    operator_kind: Literal["bash", "http", "agent", "wait", "memory", "memory_plugin", "poll"]
     depends_on: list[str] = Field(default_factory=list)
     retry_limit: int = 0
     timeout_seconds: int | None = None
@@ -109,6 +109,8 @@ class WorkflowRuntimeContext(BaseModel):
     benchmark_id: str
     agent_id: str
     memory_id: str | None = None
+    memory_integration: Literal["backend_direct", "agent_plugin"] = "backend_direct"
+    memory_plugin_id: str | None = None
     run_contract: dict[str, Any] = Field(default_factory=dict)
     version_selection: dict[str, Any] = Field(default_factory=dict)
 
@@ -125,6 +127,31 @@ class MemoryTaskOutput(BaseModel):
     status: Literal["ok", "failed"]
     state: Literal["accepted", "running", "completed", "failed"]
     operation: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    metrics: list[dict[str, Any]] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    error: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryPluginTaskInput(BaseModel):
+    task_id: str
+    action: Literal[
+        "validate",
+        "prepare",
+        "set_phase",
+        "flush",
+        "wait_settle",
+        "enter_qa",
+        "finalize",
+    ]
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    runtime_context: WorkflowRuntimeContext
+    idempotency_key: str
+
+
+class MemoryPluginTaskOutput(BaseModel):
+    status: Literal["ok", "failed"]
+    state: Literal["accepted", "running", "completed", "failed"]
     output: dict[str, Any] = Field(default_factory=dict)
     metrics: list[dict[str, Any]] = Field(default_factory=list)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)

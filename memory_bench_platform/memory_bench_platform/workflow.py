@@ -8,7 +8,7 @@ import urllib.error
 from datetime import datetime
 from pathlib import Path
 
-from .integration import run_agent_task, run_memory_task
+from .integration import run_agent_task, run_memory_plugin_task, run_memory_task
 from .judges import run_builtin_judge
 from .protocol import (
     ArtifactRecord,
@@ -54,9 +54,11 @@ def _execute_step_operator(
         step,
         agent_id=agent_id,
         memory_id=memory_id,
+        memory_plugin_id=runtime_context.memory_plugin_id,
         runtime_context=runtime_context,
         agent_runner=run_agent_task,
         memory_runner=run_memory_task,
+        memory_plugin_runner=run_memory_plugin_task,
         subprocess_runner=subprocess.run,
         urlopen=urllib.request.urlopen,
         sleep=_sleep,
@@ -89,6 +91,7 @@ def execute_cases(
         steps=steps,
         execution_spec=execution_spec,
         memory_id=memory_id,
+        memory_plugin_id=runtime_context.memory_plugin_id,
     )
 
     steps_by_case: dict[str, list[StepRecord]] = {}

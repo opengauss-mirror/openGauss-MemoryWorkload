@@ -1,0 +1,31 @@
+kind: memory_plugin
+id: openclaw-openviking
+version: 0.1.0
+agent: openclaw
+memory: openviking
+entry:
+  runner: scripts/run_lifecycle.py
+runtime:
+  actions:
+    - validate
+    - prepare
+    - set_phase
+    - flush
+    - wait_settle
+    - finalize
+capabilities:
+  auto_capture: true
+  auto_recall: true
+  qa_read_only: true
+  wait_settle: true
+  explicit_flush: true
+  exact_operation_status: true
+  namespace_isolation: true
+phases:
+  ingest:
+    capture: true
+    recall: false
+    automatic_commit: false
+  qa:
+    capture: false
+    recall: true

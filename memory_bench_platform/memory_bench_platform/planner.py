@@ -14,6 +14,7 @@ class RunPlanRequest:
     benchmark_version: str | None = None
     agent_version: str | None = None
     memory_backend: str | None = None
+    memory_integration: str = "backend_direct"
     hardware_profile: str | None = None
     data_path: str | None = None
 
@@ -26,6 +27,7 @@ class RunPlan:
     benchmark_version: str | None
     agent_version: str | None
     memory_backend: str | None
+    memory_integration: str
     hardware_profile: str | None
     data_path: str | None
 
@@ -53,6 +55,7 @@ def build_run_plan(request: RunPlanRequest) -> RunPlan:
         benchmark_version=request.benchmark_version,
         agent_version=request.agent_version,
         memory_backend=request.memory_backend,
+        memory_integration=request.memory_integration,
         hardware_profile=request.hardware_profile,
         data_path=request.data_path,
     )

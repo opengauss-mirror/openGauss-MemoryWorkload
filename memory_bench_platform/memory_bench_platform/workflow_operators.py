@@ -4,7 +4,13 @@ import json
 from typing import Any, Callable
 import urllib.request
 
-from .protocol import MemoryTaskInput, RenderedTaskInput, StepRecord, WorkflowRuntimeContext
+from .protocol import (
+    MemoryPluginTaskInput,
+    MemoryTaskInput,
+    RenderedTaskInput,
+    StepRecord,
+    WorkflowRuntimeContext,
+)
 
 
 def dispatch_step_operator(
@@ -12,9 +18,11 @@ def dispatch_step_operator(
     *,
     agent_id: str,
     memory_id: str | None,
+    memory_plugin_id: str | None,
     runtime_context: WorkflowRuntimeContext,
     agent_runner: Callable[..., dict[str, Any]],
     memory_runner: Callable[..., Any],
+    memory_plugin_runner: Callable[..., Any],
     subprocess_runner: Callable[..., Any],
     urlopen: Callable[..., Any],
     sleep: Callable[[float], None],
@@ -31,6 +39,13 @@ def dispatch_step_operator(
         return _execute_http(step, urlopen)
     if step.operator_kind == "memory":
         return _execute_memory(step, memory_id, runtime_context, memory_runner)
+    if step.operator_kind == "memory_plugin":
+        return _execute_memory_plugin(
+            step,
+            memory_plugin_id,
+            runtime_context,
+            memory_plugin_runner,
+        )
     if step.operator_kind == "poll":
         return _execute_poll(
             step,
@@ -153,6 +168,34 @@ def _execute_memory(
     if payload["status"] != "ok":
         error = payload.get("error", {})
         payload["error_message"] = str(error.get("message") or "memory operator failed")
+    return payload
+
+
+def _execute_memory_plugin(
+    step: StepRecord,
+    memory_plugin_id: str | None,
+    runtime_context: WorkflowRuntimeContext,
+    memory_plugin_runner: Callable[..., Any],
+) -> dict[str, Any]:
+    if not memory_plugin_id:
+        raise ValueError(f"memory plugin step {step.step_id} requires memory_plugin_id")
+    action = str(step.inputs.get("action", "") or "")
+    inputs = {key: value for key, value in step.inputs.items() if key != "action"}
+    request = MemoryPluginTaskInput(
+        task_id=step.step_id,
+        action=action,
+        inputs=inputs,
+        runtime_context=runtime_context,
+        idempotency_key=f"{runtime_context.run_id}:{step.case_id}:{step.step_id}",
+    )
+    response = memory_plugin_runner(memory_plugin_id, request)
+    payload = response.model_dump(mode="json")
+    unified_output = dict(payload.get("output", {}))
+    unified_output["state"] = payload["state"]
+    payload["output"] = unified_output
+    if payload["status"] != "ok":
+        error = payload.get("error", {})
+        payload["error_message"] = str(error.get("message") or "memory plugin operator failed")
     return payload
 
 
