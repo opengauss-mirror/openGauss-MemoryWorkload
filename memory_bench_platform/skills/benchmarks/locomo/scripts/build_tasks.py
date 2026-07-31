@@ -132,7 +132,7 @@ def _build_backend_direct_tasks(data_path: Path) -> dict:
                     },
                     "labels": [f"category:{category}", "source:locomo"],
                     "source_metadata": {"sample_id": sample_id, "question_index": idx},
-                    "judge_mode": "builtin",
+                    "judge_mode": "external",
                 }
             )
             steps.append(
@@ -379,7 +379,7 @@ def _build_agent_plugin_tasks(data_path: Path, session_namespace: str = "") -> d
                         "memory-integration:agent-plugin",
                     ],
                     "source_metadata": {"sample_id": sample_id, "question_index": idx},
-                    "judge_mode": "builtin",
+                    "judge_mode": "external",
                 }
             )
             steps.append(

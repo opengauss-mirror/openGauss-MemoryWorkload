@@ -269,6 +269,7 @@ def build_run_contract(
             "capabilities": memory_plugin.capabilities if memory_plugin is not None else {},
             "phases": memory_plugin.phases if memory_plugin is not None else {},
         },
+        "judge_runtime": benchmark.judging or {},
         "version_targets": {
             "benchmark": [target.model_dump(mode="json") for target in benchmark.version_policy.targets],
             "agent": [target.model_dump(mode="json") for target in agent.version_policy.targets],

@@ -258,6 +258,16 @@ PYTHONPATH=. python3 -m memory_bench_platform.cli run \
   --run-id locomo-openclaw-full-small
 ```
 
+LoCoMo Native Workflow 默认使用 LLM Judge，不再使用字符串精确或包含匹配。运行前需要提供：
+
+```bash
+export LOCOMO_API_KEY=<judge-api-key>
+export LOCOMO_BASE_URL=<openai-compatible-base-url>
+export LOCOMO_METRIC_MODEL=<judge-model>
+```
+
+Judge 配置由 Benchmark manifest 声明并进入 Run Contract。每道 QA 完成后，平台直接生成正式 `JudgeResult`，统一写入 `records/judge_results.json`、`reports/summary.json`、`reports/case_results.json` 和 HTML 报告。缺少 Judge 配置时，Case 会标记为 `judge-config-missing`，不会回退到字符串判断。
+
 ### 运行 LongMemEval
 
 ```bash

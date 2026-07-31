@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .integration import run_agent_task, run_memory_plugin_task, run_memory_task
-from .judges import run_builtin_judge
+from .judges import run_builtin_judge, run_llm_judge
 from .protocol import (
     ArtifactRecord,
     CaseRecord,
@@ -471,7 +471,7 @@ def execute_cases(
                     break
 
         case_execution_status[case.case_id] = "failed" if case_failed else "passed"
-        if case.judge_mode != "builtin":
+        if case.judge_mode == "none":
             continue
 
         traces.append(
@@ -490,20 +490,37 @@ def execute_cases(
             trace_events=[item.model_dump(mode="json") for item in traces if item.case_id == case.case_id],
             artifacts=[item.model_dump(mode="json") for item in artifacts if item.case_id == case.case_id],
         )
-        judge_result = run_builtin_judge(run_id, judge_input)
         if unsatisfied_case_dependencies:
-            judge_result.passed = False
-            judge_result.label = "case-dependency-failed"
-            judge_result.score = 0.0
-            judge_result.rationale = (
-                "Required setup case did not complete successfully: "
-                + ", ".join(unsatisfied_case_dependencies)
+            judge_result = JudgeResult(
+                judge_id=f"{case.case_id}-{case.judge_mode}",
+                run_id=run_id,
+                case_id=case.case_id,
+                passed=False,
+                label="case-dependency-failed",
+                score=0.0,
+                rationale=(
+                    "Required setup case did not complete successfully: "
+                    + ", ".join(unsatisfied_case_dependencies)
+                ),
             )
-        elif case_failed and judge_result.passed:
-            judge_result.passed = False
-            judge_result.label = "gate-failed"
-            judge_result.score = 0.0
-            judge_result.rationale = "One or more hard gates failed before final judge."
+        elif case_failed:
+            judge_result = JudgeResult(
+                judge_id=f"{case.case_id}-{case.judge_mode}",
+                run_id=run_id,
+                case_id=case.case_id,
+                passed=False,
+                label="gate-failed",
+                score=0.0,
+                rationale="One or more hard gates failed before final judge.",
+            )
+        elif case.judge_mode == "external":
+            judge_result = run_llm_judge(
+                run_id,
+                judge_input,
+                runtime_config=runtime_context.run_contract.get("judge_runtime", {}),
+            )
+        else:
+            judge_result = run_builtin_judge(run_id, judge_input)
         judge_results.append(judge_result)
         traces.append(
             TraceEventRecord(

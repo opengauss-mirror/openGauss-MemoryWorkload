@@ -32,6 +32,18 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert contract["memory_runtime"]["complete_signal"] == "completed"
     assert contract["memory_runtime"]["runner"] == "scripts/run_operation.py"
     assert contract["memory_runtime"]["supported_actions"] == ["ingest", "status", "recall"]
+    assert contract["judge_runtime"] == {
+        "mode": "external",
+        "type": "llm",
+        "prompt_style": "locomo",
+        "api_format": "openai",
+        "timeout_seconds": 60,
+        "env": {
+            "api_key": "LOCOMO_API_KEY",
+            "base_url": "LOCOMO_BASE_URL",
+            "model": "LOCOMO_METRIC_MODEL",
+        },
+    }
 
 
 def test_build_run_contract_resolves_openclaw_openviking_plugin():

@@ -47,3 +47,11 @@ execution:
       external_runner: ../../../../tools/test_entrypoints/run_locomo_openclaw_import.sh
 judging:
   mode: external
+  type: llm
+  prompt_style: locomo
+  api_format: openai
+  timeout_seconds: 60
+  env:
+    api_key: LOCOMO_API_KEY
+    base_url: LOCOMO_BASE_URL
+    model: LOCOMO_METRIC_MODEL

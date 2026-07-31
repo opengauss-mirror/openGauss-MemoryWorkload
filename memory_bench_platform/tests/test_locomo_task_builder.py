@@ -60,7 +60,7 @@ def test_locomo_task_builder_emits_sample_setup_and_dependent_qa(tmp_path: Path)
     ]
     setup_case, qa_case = payload["cases"]
     assert setup_case["judge_mode"] == "none"
-    assert qa_case["judge_mode"] == "builtin"
+    assert qa_case["judge_mode"] == "external"
     assert qa_case["depends_on_cases"] == ["conv-1-setup"]
     assert qa_case["reference"]["expected_step_id"] == "conv-1-q1-agent-answer"
 
@@ -181,6 +181,7 @@ def test_locomo_agent_plugin_builder_uses_agent_only_for_ingest_and_qa(tmp_path:
         "run-isolated:ingest-conv-1-session_1"
     )
     assert qa_step["inputs"]["metadata"]["session_key"] == "run-isolated:qa-conv-1-q1"
+    assert payload["cases"][-1]["judge_mode"] == "external"
 
     cases = [CaseRecord(run_id="run-1", **item) for item in payload["cases"]]
     workflow_steps = [StepRecord(**item) for item in steps]

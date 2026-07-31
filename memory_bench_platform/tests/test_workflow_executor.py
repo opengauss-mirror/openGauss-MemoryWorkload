@@ -2,7 +2,13 @@ from pathlib import Path
 from types import SimpleNamespace
 import urllib.error
 
-from memory_bench_platform.protocol import CaseRecord, ExecutionSpec, StepRecord
+from memory_bench_platform.protocol import (
+    CaseRecord,
+    ExecutionSpec,
+    JudgeResult,
+    StepRecord,
+    WorkflowRuntimeContext,
+)
 from memory_bench_platform.workflow import execute_cases
 
 
@@ -216,6 +222,75 @@ def test_builtin_judge_can_target_expected_step(monkeypatch, tmp_path: Path):
         run_dir=tmp_path,
     )
     assert output["judge_results"][0].passed is True
+
+
+def test_workflow_uses_external_llm_judge(monkeypatch, tmp_path: Path):
+    def fake_run_agent_task(skill_id: str, rendered_input):
+        del skill_id, rendered_input
+        return {"status": "ok", "turns": [{"text": "May 7, 2023"}]}
+
+    captured = {}
+
+    def fake_llm_judge(run_id, judge_input, *, runtime_config):
+        captured["run_id"] = run_id
+        captured["question"] = judge_input.reference["question"]
+        captured["runtime_config"] = runtime_config
+        return JudgeResult(
+            judge_id="case-llm",
+            run_id=run_id,
+            case_id=judge_input.case_id,
+            score=1.0,
+            label="correct",
+            passed=True,
+            rationale="Equivalent date.",
+        )
+
+    monkeypatch.setattr("memory_bench_platform.workflow.run_agent_task", fake_run_agent_task)
+    monkeypatch.setattr("memory_bench_platform.workflow.run_llm_judge", fake_llm_judge)
+    case = CaseRecord(
+        case_id="case-llm",
+        run_id="run-1",
+        title="semantic judge",
+        goal="answer",
+        capability="memory/question-answering",
+        reference={
+            "question": "When?",
+            "expected_answer": "7 May 2023",
+            "expected_step_id": "answer-step",
+        },
+        judge_mode="external",
+    )
+    step = StepRecord(
+        step_id="answer-step",
+        case_id="case-llm",
+        name="answer",
+        operator_kind="agent",
+        gate_policy="hard",
+        inputs={"question": "When?", "metadata": {}},
+    )
+    output = execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[case],
+        steps=[step],
+        execution_spec=ExecutionSpec(fail_fast=True),
+        runtime_context=WorkflowRuntimeContext(
+            run_id="run-1",
+            run_dir=str(tmp_path),
+            benchmark_id="locomo",
+            agent_id="generic-cli",
+            run_contract={"judge_runtime": {"mode": "external", "type": "llm"}},
+        ),
+        run_dir=tmp_path,
+    )
+
+    assert output["judge_results"][0].passed is True
+    assert output["judge_results"][0].label == "correct"
+    assert captured == {
+        "run_id": "run-1",
+        "question": "When?",
+        "runtime_config": {"mode": "external", "type": "llm"},
+    }
 
 
 def test_agent_operator_passes_full_rendered_input_contract(monkeypatch, tmp_path: Path):

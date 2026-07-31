@@ -55,6 +55,14 @@
   - 归类为 external runner 导出或平台 importer 问题
   - 不应再归因到 `OpenViking tag` 本身
 
+## Native Judge 约束
+
+- Native Workflow 的 LoCoMo QA 必须使用 Benchmark manifest 声明的 LLM Judge。
+- 不得使用字符串完全相等或包含关系作为正式准确率。
+- Judge 配置通过 `LOCOMO_API_KEY`、`LOCOMO_BASE_URL` 和 `LOCOMO_METRIC_MODEL` 注入。
+- LLM Judge 结果应直接进入统一的 `JudgeResult`、summary、case results 和 HTML 报告，不应再产生独立且口径不同的正式分数。
+- Judge 配置缺失或调用失败时应明确标记错误，不得静默退回字符串评分。
+
 ## locomo_test_remote 的职责边界
 
 - `memory_bench_platform`

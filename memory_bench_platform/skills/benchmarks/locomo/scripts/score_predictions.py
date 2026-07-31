@@ -110,8 +110,8 @@ def score_run(run_dir: Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("Usage: score_predictions.py RUN_DIR")
+    if len(sys.argv) not in {2, 3}:
+        raise SystemExit("Usage: score_predictions.py RUN_DIR [DATA_PATH]")
     print(json.dumps(score_run(Path(sys.argv[1])), ensure_ascii=False))
 
 
