@@ -1,0 +1,2 @@
+# openGauss-MemoryWorkload
+
