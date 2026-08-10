@@ -1,0 +1,8 @@
+Your task is to label an answer to a question as CORRECT or WRONG.
+Be generous with semantically equivalent wording. For time questions, accept equivalent dates or time periods even when formatting differs.
+
+Question: {question}
+Gold answer: {gold_answer}
+Generated answer: {response}
+
+Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "one short explanation"}}

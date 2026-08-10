@@ -70,6 +70,7 @@ def test_llm_judge_uses_semantic_grade(monkeypatch):
         "run-1",
         _input(),
         runtime_config={
+            "profile": "locomo_qa@1",
             "api_format": "openai",
             "timeout_seconds": 12,
             "env": {
@@ -98,9 +99,127 @@ def test_llm_judge_does_not_fall_back_to_string_matching(monkeypatch):
 
     result = run_llm_judge("run-1", _input())
 
-    assert result.passed is False
+    assert result.passed is None
+    assert result.score is None
     assert result.label == "judge-config-missing"
     assert "MEMORY_BENCH_JUDGE_API_KEY" in result.rationale
+
+
+def test_llm_judge_timeout_is_ungraded(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+
+    def fail_urlopen(request, timeout):
+        del request, timeout
+        raise TimeoutError("judge timed out")
+
+    result = run_llm_judge(
+        "run-1",
+        _input(),
+        runtime_config={
+            "profile": "locomo_qa@1",
+            "env": {
+                "api_key": "TEST_JUDGE_KEY",
+                "base_url": "TEST_JUDGE_URL",
+                "model": "TEST_JUDGE_MODEL",
+            }
+        },
+        urlopen=fail_urlopen,
+    )
+
+    assert result.passed is None
+    assert result.score is None
+    assert result.label == "judge-error"
+
+
+def test_longmemeval_prompt_uses_question_type(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"is_correct": "CORRECT", "reasoning": "Equivalent."}
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+    judge_input = _input().model_copy(deep=True)
+    judge_input.reference["question_type"] = "knowledge-update"
+    judge_input.reference["question_id"] = "q-update"
+    result = run_llm_judge(
+        "run-1",
+        judge_input,
+        runtime_config={
+            "prompt_style": "longmemeval",
+            "env": {
+                "api_key": "TEST_JUDGE_KEY",
+                "base_url": "TEST_JUDGE_URL",
+                "model": "TEST_JUDGE_MODEL",
+            },
+        },
+        urlopen=fake_urlopen,
+    )
+
+    assert result.passed is True
+    assert "knowledge-update" in captured["body"]["messages"][1]["content"]
+
+
+def test_retrieval_observation_is_judged(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({"choices": [{"message": {"content": '{"is_correct":"CORRECT","reasoning":"Evidence matches."}'}}]})
+
+    judge_input = _input().model_copy(deep=True)
+    judge_input.reference["evaluation_extractor"] = "evidence_text"
+    judge_input.step_results[0]["structured_output"] = {
+        "output": {"evidence_text": "Caroline attended on May 7, 2023."}
+    }
+    result = run_llm_judge(
+        "run-1",
+        judge_input,
+        runtime_config={
+            "profile": "locomo_qa@1",
+            "env": {"api_key": "TEST_JUDGE_KEY", "base_url": "TEST_JUDGE_URL", "model": "TEST_JUDGE_MODEL"},
+        },
+        urlopen=fake_urlopen,
+    )
+    assert result.passed is True
+    assert "May 7, 2023" in captured["body"]["messages"][1]["content"]
+
+
+def test_unknown_judge_profile_is_not_treated_as_locomo(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+    result = run_llm_judge(
+        "run-1",
+        _input(),
+        runtime_config={
+            "profile": "unknown@1",
+            "env": {"api_key": "TEST_JUDGE_KEY", "base_url": "TEST_JUDGE_URL", "model": "TEST_JUDGE_MODEL"},
+        },
+    )
+    assert result.passed is None
+    assert result.label == "judge-profile-invalid"
 
 
 def test_legacy_score_cli_accepts_optional_data_path(monkeypatch, capsys):

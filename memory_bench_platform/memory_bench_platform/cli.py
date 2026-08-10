@@ -157,9 +157,21 @@ def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step
         response = ""
         if matched_results:
             structured = matched_results[-1].structured_output
-            response = (
-                str(structured.get("agent_answer") or structured.get("text_output") or structured.get("stdout_text") or "")
-            )
+            extractor = str(case.reference.get("evaluation_extractor") or "qa_answer") if case else "qa_answer"
+            if extractor == "evidence_text":
+                output = structured.get("output", {}) if isinstance(structured, dict) else {}
+                response = str(
+                    (output.get("evidence_text") if isinstance(output, dict) else "")
+                    or structured.get("evidence_text")
+                    or ""
+                )
+            else:
+                response = str(
+                    structured.get("agent_answer")
+                    or structured.get("text_output")
+                    or structured.get("stdout_text")
+                    or ""
+                )
             raw = structured.get("raw", {}) if isinstance(structured, dict) else {}
             raw_stderr = str(raw.get("stderr", "") or "") if isinstance(raw, dict) else ""
         else:
@@ -180,6 +192,98 @@ def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step
             }
         )
     return rows
+
+
+def _summarize_native_evaluation(
+    cases: list[CaseRecord],
+    steps: list[StepRecord],
+    judge_results: list,
+    step_results: list,
+) -> dict:
+    valid_results = [item for item in judge_results if item.passed is not None]
+    passed_cases = sum(1 for item in valid_results if item.passed is True)
+    failed_cases = sum(1 for item in valid_results if item.passed is False)
+    ungraded_cases = len(judge_results) - len(valid_results)
+
+    result_by_id = {item.step_id: item for item in step_results}
+    setup_case_ids = [
+        case.case_id
+        for case in cases
+        if "phase:setup" in case.labels
+    ]
+    ready_checkpoints = 0
+    checkpoint_rows: list[dict] = []
+    ready_latencies: list[int] = []
+    for case_id in setup_case_ids:
+        expected = [step for step in steps if step.case_id == case_id]
+        ready = all(
+            step.step_id in result_by_id and result_by_id[step.step_id].status == "passed"
+            for step in expected
+        )
+        barrier_steps = [
+            step
+            for step in expected
+            if step.operator_kind == "poll"
+            or str(step.inputs.get("action") or "")
+            in {"flush", "commit", "wait_ready", "status"}
+        ]
+        latency_ms = sum(
+            result_by_id[step.step_id].duration_ms or 0
+            for step in barrier_steps
+            if step.step_id in result_by_id
+        )
+        case = next(item for item in cases if item.case_id == case_id)
+        checkpoint_rows.append(
+            {
+                "setup_case_id": case_id,
+                "checkpoint_id": case.source_metadata.get("checkpoint_id"),
+                "ready": ready,
+                "readiness_latency_ms": latency_ms,
+                "failed_steps": [
+                    step.step_id
+                    for step in expected
+                    if step.step_id not in result_by_id
+                    or result_by_id[step.step_id].status != "passed"
+                ],
+            }
+        )
+        if ready:
+            ready_checkpoints += 1
+            ready_latencies.append(latency_ms)
+    executed_runtime = [item for item in step_results if item.status != "skipped"]
+    runtime_failures = [item for item in executed_runtime if item.status == "failed"]
+
+    benchmark_score = (
+        round(passed_cases / len(valid_results), 4)
+        if valid_results
+        else None
+    )
+    checkpoint_ready_rate = (
+        round(ready_checkpoints / len(setup_case_ids), 4)
+        if setup_case_ids
+        else None
+    )
+    runtime_failure_rate = (
+        round(len(runtime_failures) / len(executed_runtime), 4)
+        if executed_runtime
+        else 0.0
+    )
+    readiness_latency_ms = (
+        round(sum(ready_latencies) / len(ready_latencies), 3)
+        if ready_latencies
+        else 0.0
+    )
+    return {
+        "case_total": len(judge_results),
+        "case_passed": passed_cases,
+        "case_failed": failed_cases,
+        "case_ungraded": ungraded_cases,
+        "benchmark_score": benchmark_score,
+        "checkpoint_ready_rate": checkpoint_ready_rate,
+        "runtime_failure_rate": runtime_failure_rate,
+        "readiness_latency_ms": readiness_latency_ms,
+        "checkpoints": checkpoint_rows,
+    }
 
 
 def _write_smoke_result(run_dir: Path, result: dict) -> None:
@@ -554,10 +658,36 @@ def main(argv: list[str] | None = None) -> None:
             "records/compatibility_result.json",
             compatibility.model_dump(mode="json"),
         )
+        storage.write_json_record(
+            run_dir,
+            "records/runtime_capabilities.json",
+            compatibility.resolved_capabilities,
+        )
+        storage.write_json_record(
+            run_dir,
+            "records/evaluation_profile.json",
+            {
+                "default": scenario.evaluation.model_dump(mode="json"),
+                "checkpoints": [
+                    {
+                        "sample_id": sample.sample_id,
+                        "checkpoint_id": event.event_id,
+                        "evaluation": event.evaluation.model_dump(mode="json"),
+                    }
+                    for sample in scenario.samples
+                    for event in sample.timeline
+                    if event.evaluation is not None
+                ],
+            },
+        )
         if not compatibility.compatible:
             missing = ", ".join(compatibility.missing_capabilities)
             raise ValueError(f"runtime is incompatible with benchmark scenario: {missing}")
-        cases_payload = compose_run_plan(scenario, binding)
+        cases_payload = compose_run_plan(
+            scenario,
+            binding,
+            compatibility.resolved_capabilities,
+        )
         storage.write_json_record(
             run_dir,
             "records/composed_run_plan.json",
@@ -634,9 +764,20 @@ def main(argv: list[str] | None = None) -> None:
     cpu_snapshot = monitor.capture_once()
 
     judge_results = workflow_output["judge_results"]
-    passed_cases = sum(1 for item in judge_results if item.passed)
-    failed_cases = len(judge_results) - passed_cases
-    final_status = "passed" if judge_results and failed_cases == 0 else "partial"
+    evaluation_summary = _summarize_native_evaluation(
+        cases,
+        steps,
+        judge_results,
+        workflow_output["step_results"],
+    )
+    if not judge_results or evaluation_summary["benchmark_score"] is None:
+        final_status = "failed"
+    elif evaluation_summary["case_ungraded"] > 0:
+        final_status = "partial"
+    else:
+        final_status = (
+            "passed" if evaluation_summary["case_failed"] == 0 else "partial"
+        )
     run_record.status = final_status
     run_record.ended_at = datetime.now()
     storage.write_run_record(run_dir, run_record)
@@ -665,8 +806,39 @@ def main(argv: list[str] | None = None) -> None:
     )
     storage.write_json_record(
         run_dir,
+        "records/checkpoint_readiness.json",
+        {
+            "checkpoint_ready_rate": evaluation_summary["checkpoint_ready_rate"],
+            "readiness_latency_ms": evaluation_summary["readiness_latency_ms"],
+            "runtime_failure_rate": evaluation_summary["runtime_failure_rate"],
+            "checkpoints": evaluation_summary["checkpoints"],
+        },
+    )
+    evaluation_metrics = [
+        {
+            "metric_id": f"{run_record.run_id}-{name.replace('_', '-')}",
+            "run_id": run_record.run_id,
+            "case_id": None,
+            "step_id": None,
+            "scope": "run",
+            "name": name,
+            "value": value,
+            "unit": "ratio" if name.endswith("rate") or name == "benchmark_score" else "ms",
+            "dimension": {},
+        }
+        for name, value in (
+            ("benchmark_score", evaluation_summary["benchmark_score"]),
+            ("checkpoint_ready_rate", evaluation_summary["checkpoint_ready_rate"]),
+            ("runtime_failure_rate", evaluation_summary["runtime_failure_rate"]),
+            ("readiness_latency_ms", evaluation_summary["readiness_latency_ms"]),
+        )
+        if value is not None
+    ]
+    storage.write_json_record(
+        run_dir,
         "records/metrics.json",
         [item.model_dump(mode="json") for item in workflow_output["metrics"]]
+        + evaluation_metrics
         + [
             {
                 "metric_id": f"{run_record.run_id}-cpu-idle",
@@ -685,10 +857,18 @@ def main(argv: list[str] | None = None) -> None:
     summary_record = ReportSummary(
         run_id=run_record.run_id,
         status=final_status,
-        case_total=len(judge_results),
-        case_passed=passed_cases,
-        case_failed=failed_cases,
-        resource_summary={"cpu": cpu_snapshot},
+        case_total=evaluation_summary["case_total"],
+        case_passed=evaluation_summary["case_passed"],
+        case_failed=evaluation_summary["case_failed"],
+        case_ungraded=evaluation_summary["case_ungraded"],
+        benchmark_score=evaluation_summary["benchmark_score"],
+        checkpoint_ready_rate=evaluation_summary["checkpoint_ready_rate"],
+        runtime_failure_rate=evaluation_summary["runtime_failure_rate"],
+        readiness_latency_ms=evaluation_summary["readiness_latency_ms"],
+        resource_summary={
+            "cpu": cpu_snapshot,
+            "evaluation": evaluation_summary,
+        },
         category_summary={},
     )
     write_summary(run_dir, summary_record.model_dump(mode="json"))

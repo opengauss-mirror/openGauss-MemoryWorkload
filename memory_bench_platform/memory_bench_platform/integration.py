@@ -236,6 +236,13 @@ def build_run_contract(
     memory_ingest = memory.ingest if memory is not None else {}
     memory_recall = memory.recall if memory is not None else {}
     memory_completion = memory.completion if memory is not None else {}
+    judge_runtime = dict(benchmark.judging or {})
+    prompt_template = judge_runtime.get("prompt_template")
+    if prompt_template:
+        prompt_path = skills_root / "benchmarks" / benchmark.id / str(prompt_template)
+        if not prompt_path.is_file():
+            raise ValueError(f"benchmark judge prompt template not found: {prompt_path}")
+        judge_runtime["prompt_template_text"] = prompt_path.read_text(encoding="utf-8")
 
     return {
         "selection": {
@@ -275,7 +282,7 @@ def build_run_contract(
             "capabilities": memory_plugin.capabilities if memory_plugin is not None else {},
             "phases": memory_plugin.phases if memory_plugin is not None else {},
         },
-        "judge_runtime": benchmark.judging or {},
+        "judge_runtime": judge_runtime,
         "version_targets": {
             "benchmark": [target.model_dump(mode="json") for target in benchmark.version_policy.targets],
             "agent": [target.model_dump(mode="json") for target in agent.version_policy.targets],

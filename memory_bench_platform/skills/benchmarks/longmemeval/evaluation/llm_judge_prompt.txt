@@ -1,0 +1,10 @@
+Determine whether the generated answer correctly answers the question using the reference answer.
+Accept semantically equivalent wording. For temporal-reasoning duration questions, tolerate an off-by-one difference. For knowledge updates, accept the latest value. For preferences, accept correct use of the stated preference.
+
+Question type: {question_type}
+Question: {question}
+Reference answer or rubric: {gold_answer}
+Generated answer: {response}
+Unanswerable question: {abstention}
+
+Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "one short explanation"}}

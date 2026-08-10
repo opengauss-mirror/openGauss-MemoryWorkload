@@ -1,0 +1,39 @@
+kind: benchmark
+id: example-benchmark
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  targets:
+    - name: example-benchmark
+      scope: benchmark_tooling
+      version_source: upstream_release_tag
+      upstream: https://example.com/replace-with-official-benchmark-repository
+      record_runtime_version: true
+  record_runtime_version: true
+entry:
+  scenario_builder: scripts/build_scenario.py
+  validator: scripts/validate.py
+judging:
+  mode: external
+  type: llm
+  profile: example_qa@1
+  extractor: qa_answer
+  prompt_template: evaluation/llm_judge_prompt.txt
+integration:
+  protocol_version: benchmark/1
+requirements:
+  memory:
+    actions: [ingest, recall]
+evaluation:
+  target: qa_answer
+  profile: llm_judge@1
+  primary_metric: accuracy

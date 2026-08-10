@@ -1,6 +1,8 @@
 # LongMemEval Benchmark Skill
 
-负责为 LongMemEval 提供统一的任务展开入口。
+负责把 LongMemEval 的带时间戳多 Session 历史转换为平台通用 Benchmark Scenario。
+
+Benchmark Skill 只保留 Session、时间戳、问题、标准答案和题型，不生成 Memory 写入、Commit、等待或 Agent QA 步骤；这些步骤由 Runtime Composer 根据运行模式生成。
 
 ## 接入约束
 

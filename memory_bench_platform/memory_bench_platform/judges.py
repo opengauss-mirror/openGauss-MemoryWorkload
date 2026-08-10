@@ -7,6 +7,7 @@ from typing import Any
 import urllib.request
 
 from .protocol import JudgeInput, JudgeResult
+from .evaluation import extract_observation
 
 
 SYSTEM_PROMPT = "You are an expert grader that determines if answers to questions match a gold standard answer"
@@ -37,6 +38,24 @@ Do NOT include both CORRECT and WRONG in your response, or it will break the eva
 Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
 """
 
+LONGMEMEVAL_ACCURACY_TEMPLATE = """
+Determine whether the model response correctly answers the question using the reference answer.
+Accept semantically equivalent wording. For temporal-reasoning questions, do not penalize an
+off-by-one difference when the requested answer is a duration. For knowledge-update questions,
+accept the response when it contains the latest value even if it also mentions older information.
+For preference questions, accept a response that correctly uses the stated personal preference.
+
+Question type: {question_type}
+Question: {question}
+Reference answer or rubric: {gold_answer}
+Generated answer: {response}
+Unanswerable question: {abstention}
+
+If the question is unanswerable, mark it correct only when the response recognizes that the
+available information is insufficient. Respond with JSON only:
+{{"is_correct": "CORRECT" or "WRONG", "reasoning": "one short explanation"}}
+"""
+
 
 def _normalize(text: str) -> str:
     text = text.lower().strip()
@@ -44,29 +63,9 @@ def _normalize(text: str) -> str:
     return text
 
 
-def _extract_answer(judge_input: JudgeInput) -> str:
-    expected_step_id = str(judge_input.reference.get("expected_step_id", "") or "")
-    step_results = judge_input.step_results
-    if expected_step_id:
-        prioritized = [item for item in step_results if item.get("step_id") == expected_step_id]
-        remaining = [item for item in step_results if item.get("step_id") != expected_step_id]
-        step_results = prioritized + remaining
-
-    for result in step_results:
-        structured = result.get("structured_output", {})
-        candidate = (
-            structured.get("agent_answer")
-            or structured.get("text_output")
-            or structured.get("stdout_text")
-        )
-        if candidate:
-            return str(candidate).strip()
-    return ""
-
-
 def run_builtin_judge(run_id: str, judge_input: JudgeInput) -> JudgeResult:
     expected = _normalize(str(judge_input.reference.get("expected_answer", "")))
-    actual = _normalize(_extract_answer(judge_input))
+    actual = _normalize(extract_observation(judge_input))
 
     passed = False
     label = "missing-answer"
@@ -135,6 +134,42 @@ def _llm_response_text(payload: dict[str, Any], api_format: str) -> str:
     return str(message.get("content", "") or "").strip() if isinstance(message, dict) else ""
 
 
+def _judge_prompt(runtime_config: dict[str, Any], judge_input: JudgeInput, actual: str) -> str:
+    question = str(judge_input.reference.get("question", "") or "").strip()
+    expected = str(judge_input.reference.get("expected_answer", "") or "").strip()
+    profile = str(runtime_config.get("profile") or runtime_config.get("prompt_style") or "").strip().lower()
+    template = runtime_config.get("prompt_template_text")
+    if isinstance(template, str) and template.strip():
+        return template.format(
+            question=question,
+            gold_answer=expected,
+            response=actual,
+            question_type=str(judge_input.reference.get("question_type", "") or ""),
+            abstention=(
+                "yes"
+                if str(judge_input.reference.get("question_id", "")).endswith("_abs")
+                else "no"
+            ),
+        )
+    if profile in {"longmemeval", "longmemeval_qa@1"}:
+        question_type = str(judge_input.reference.get("question_type", "") or "")
+        question_id = str(judge_input.reference.get("question_id", judge_input.case_id) or "")
+        return LONGMEMEVAL_ACCURACY_TEMPLATE.format(
+            question_type=question_type,
+            question=question,
+            gold_answer=expected,
+            response=actual,
+            abstention="yes" if question_id.endswith("_abs") else "no",
+        )
+    if profile in {"locomo", "locomo_qa@1"}:
+        return LOCOMO_ACCURACY_TEMPLATE.format(
+            question=question,
+            gold_answer=expected,
+            response=actual,
+        )
+    raise ValueError(f"unknown judge profile: {profile or '<missing>'}")
+
+
 def run_llm_judge(
     run_id: str,
     judge_input: JudgeInput,
@@ -145,7 +180,18 @@ def run_llm_judge(
     runtime_config = runtime_config or {}
     question = str(judge_input.reference.get("question", "") or "").strip()
     expected = str(judge_input.reference.get("expected_answer", "") or "").strip()
-    actual = _extract_answer(judge_input)
+    try:
+        actual = extract_observation(judge_input)
+    except ValueError as exc:
+        return JudgeResult(
+            judge_id=f"{judge_input.case_id}-llm",
+            run_id=run_id,
+            case_id=judge_input.case_id,
+            score=None,
+            label="judge-profile-invalid",
+            passed=None,
+            rationale=str(exc),
+        )
     if not actual:
         return JudgeResult(
             judge_id=f"{judge_input.case_id}-llm",
@@ -161,9 +207,9 @@ def run_llm_judge(
             judge_id=f"{judge_input.case_id}-llm",
             run_id=run_id,
             case_id=judge_input.case_id,
-            score=0.0,
+            score=None,
             label="judge-input-invalid",
-            passed=False,
+            passed=None,
             rationale="LLM judge requires both question and expected_answer.",
         )
 
@@ -176,19 +222,26 @@ def run_llm_judge(
             judge_id=f"{judge_input.case_id}-llm",
             run_id=run_id,
             case_id=judge_input.case_id,
-            score=0.0,
+            score=None,
             label="judge-config-missing",
-            passed=False,
+            passed=None,
             rationale="Missing LLM judge configuration: " + ", ".join(missing),
         )
 
     api_format = str(runtime_config.get("api_format") or "openai").strip().lower()
     timeout = float(runtime_config.get("timeout_seconds") or 60)
-    prompt = LOCOMO_ACCURACY_TEMPLATE.format(
-        question=question,
-        gold_answer=expected,
-        response=actual,
-    )
+    try:
+        prompt = _judge_prompt(runtime_config, judge_input, actual)
+    except ValueError as exc:
+        return JudgeResult(
+            judge_id=f"{judge_input.case_id}-llm",
+            run_id=run_id,
+            case_id=judge_input.case_id,
+            score=None,
+            label="judge-profile-invalid",
+            passed=None,
+            rationale=str(exc),
+        )
     if api_format == "anthropic":
         endpoint = base_url.rstrip("/")
         endpoint += "/messages" if endpoint.endswith("/v1") else "/v1/messages"
@@ -236,9 +289,9 @@ def run_llm_judge(
             judge_id=f"{judge_input.case_id}-llm",
             run_id=run_id,
             case_id=judge_input.case_id,
-            score=0.0,
+            score=None,
             label="judge-error",
-            passed=False,
+            passed=None,
             rationale=f"LLM judge failed: {type(exc).__name__}: {exc}",
         )
 

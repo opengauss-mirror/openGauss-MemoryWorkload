@@ -51,4 +51,9 @@ capabilities:
   readiness:
     supported: true
     scoped_by_operation: true
+  scope:
+    supported: true
+    scoped_ingest: true
+    scoped_recall: true
+    isolation_level: episode
   evidence_output: true

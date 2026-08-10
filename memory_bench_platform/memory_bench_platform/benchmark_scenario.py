@@ -66,6 +66,13 @@ class BenchmarkScenario(BaseModel):
     execution_spec: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def require_unique_sample_ids(self) -> "BenchmarkScenario":
+        sample_ids = [sample.sample_id for sample in self.samples]
+        if len(sample_ids) != len(set(sample_ids)):
+            raise ValueError("scenario sample_id values must be unique")
+        return self
+
 
 class RunBinding(BaseModel):
     benchmark_id: str

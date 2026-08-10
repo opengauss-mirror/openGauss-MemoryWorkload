@@ -189,6 +189,8 @@ skills/memories/<memory-id>/
 
 Memory 统一通过 `run_operation.py` 实现声明支持的 action。Golden Case 验证 operation ID、状态、identity、memories 和 evidence 的结构映射；Recall 内容质量由 Benchmark 评价。
 
+平台统一规定 `ScenarioSample = Memory Episode`。Runtime 为每个 Episode 生成 `run_id + sample_id/namespace_hint` 的 `scope_id`：同一 Episode 内的 Session、Checkpoint 和时间推理共享记忆，不同 Episode 与不同 Run 默认隔离。`backend_direct` 由 Memory Adapter 将 Scope 映射到后端身份或 Namespace；`agent_plugin` 由插件的 `prepare` 映射到 Agent 上下文 Namespace。两种模式必须声明并通过 Scope 能力校验。
+
 ## 8. Manifest 与能力匹配
 
 所有 Integration Skill 声明协议和 SDK 版本：
@@ -228,6 +230,8 @@ Benchmark requirements ⊆ Agent/Memory capabilities
 ```
 
 能力不兼容时应在 Workflow 启动前失败，不能等到运行中缺少 action 才暴露问题。Agent 和 Memory 不使用 Evaluation Profile；能力字段只用于兼容性判断，不用于评分。
+
+Benchmark 的评测契约拆成 Observation Extractor 与 Scorer/Judge：Extractor 根据 Evaluation Target 提取 `qa_answer`、`evidence_text` 等标准观察值，Profile 决定评分 Prompt、rubric 和 Metric。Profile 与 Prompt 属于 Benchmark Skill；未知 Profile、缺失 Prompt 或未知 Extractor 必须失败，禁止静默退回其他 Benchmark 的规则。
 
 ### 8.1 公共执行 Envelope
 

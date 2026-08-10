@@ -79,13 +79,13 @@ def test_composer_builds_backend_direct_workflow(tmp_path: Path):
         "conv-1-q1",
     ]
     assert [step["operator_kind"] for step in payload["steps"]] == [
-        "memory", "memory", "poll", "memory", "memory", "poll", "memory", "agent"
+        "memory", "memory", "memory", "poll", "memory", "poll", "memory", "agent"
     ]
     assert [
         step["inputs"].get("action")
         for step in payload["steps"]
         if step["operator_kind"] == "memory"
-    ] == ["ingest", "flush", "ingest", "flush", "recall"]
+    ] == ["ingest", "ingest", "flush", "flush", "recall"]
     assert payload["steps"][-1]["inputs"]["messages"][0]["content"]["$template"].startswith(
         "Recalled memory evidence:\n"
     )

@@ -104,6 +104,7 @@ def execute_cases(
     metrics: list[MetricRecord] = []
     artifacts: list[ArtifactRecord] = []
     case_execution_status: dict[str, str] = {}
+    case_failure_kind: dict[str, str] = {}
 
     stdout_dir = run_dir / "artifacts" / "step-stdout"
     stderr_dir = run_dir / "artifacts" / "step-stderr"
@@ -471,6 +472,19 @@ def execute_cases(
                     break
 
         case_execution_status[case.case_id] = "failed" if case_failed else "passed"
+        if case_failed:
+            failed_step_ids = {
+                item.step_id
+                for item in case_step_results
+                if item.status == "failed" or item.gate_passed is False
+            }
+            readiness_failed = any(
+                "wait-ready" in step_id or "wait_ready" in step_id
+                for step_id in failed_step_ids
+            )
+            case_failure_kind[case.case_id] = (
+                "runtime-not-ready" if readiness_failed else "runtime-error"
+            )
         if case.judge_mode == "none":
             continue
 
@@ -491,13 +505,22 @@ def execute_cases(
             artifacts=[item.model_dump(mode="json") for item in artifacts if item.case_id == case.case_id],
         )
         if unsatisfied_case_dependencies:
+            dependency_kinds = {
+                case_failure_kind.get(dependency, "runtime-error")
+                for dependency in unsatisfied_case_dependencies
+            }
+            label = (
+                "runtime-not-ready"
+                if "runtime-not-ready" in dependency_kinds
+                else "runtime-error"
+            )
             judge_result = JudgeResult(
                 judge_id=f"{case.case_id}-{case.judge_mode}",
                 run_id=run_id,
                 case_id=case.case_id,
-                passed=False,
-                label="case-dependency-failed",
-                score=0.0,
+                passed=None,
+                label=label,
+                score=None,
                 rationale=(
                     "Required setup case did not complete successfully: "
                     + ", ".join(unsatisfied_case_dependencies)
@@ -508,9 +531,9 @@ def execute_cases(
                 judge_id=f"{case.case_id}-{case.judge_mode}",
                 run_id=run_id,
                 case_id=case.case_id,
-                passed=False,
-                label="gate-failed",
-                score=0.0,
+                passed=None,
+                label=case_failure_kind.get(case.case_id, "runtime-error"),
+                score=None,
                 rationale="One or more hard gates failed before final judge.",
             )
         elif case.judge_mode == "external":

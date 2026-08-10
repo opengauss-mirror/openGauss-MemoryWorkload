@@ -1,0 +1,11 @@
+{
+  "episode_id": "persona-12",
+  "sessions": [
+    {"session_id": "session-2", "occurred_at": "2026-01-02", "messages": [{"role": "user", "content": "I now prefer tea."}]},
+    {"session_id": "session-1", "occurred_at": "2026-01-01", "messages": [{"role": "user", "content": "I used to prefer coffee."}]}
+  ],
+  "evaluation_at": "2026-01-03",
+  "questions": [
+    {"question_id": "q1", "question": "What do I prefer now?", "reference": "tea", "category": "preference-update"}
+  ]
+}

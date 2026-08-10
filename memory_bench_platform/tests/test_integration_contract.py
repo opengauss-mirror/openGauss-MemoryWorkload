@@ -32,18 +32,11 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert contract["memory_runtime"]["complete_signal"] == "completed"
     assert contract["memory_runtime"]["runner"] == "scripts/run_operation.py"
     assert contract["memory_runtime"]["supported_actions"] == ["ingest", "flush", "status", "recall"]
-    assert contract["judge_runtime"] == {
-        "mode": "external",
-        "type": "llm",
-        "prompt_style": "locomo",
-        "api_format": "openai",
-        "timeout_seconds": 60,
-        "env": {
-            "api_key": "LOCOMO_API_KEY",
-            "base_url": "LOCOMO_BASE_URL",
-            "model": "LOCOMO_METRIC_MODEL",
-        },
-    }
+    judge_runtime = contract["judge_runtime"]
+    assert judge_runtime["profile"] == "locomo_qa@1"
+    assert judge_runtime["extractor"] == "qa_answer"
+    assert judge_runtime["prompt_template"] == "evaluation/llm_judge_prompt.txt"
+    assert "Gold answer: {gold_answer}" in judge_runtime["prompt_template_text"]
 
 
 def test_build_run_contract_resolves_openclaw_openviking_plugin():

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from skills.benchmarks.longmemeval.scripts.build_tasks import build_cases
+from skills.benchmarks.longmemeval.scripts.build_scenario import build_scenario
 from skills.benchmarks.longmemeval.scripts.validate import validate
 
 
@@ -36,3 +37,17 @@ def test_longmemeval_case_source_parses_official_shape(tmp_path: Path):
     validation = validate(data_path)
     assert validation["status"] == "ok"
     assert validation["has_haystack_sessions"] is True
+
+
+def test_longmemeval_golden_scenario_matches_checked_fixture():
+    golden = Path("skills/benchmarks/longmemeval/tests/golden")
+    actual = build_scenario(golden / "source_sample.json")
+    expected = json.loads((golden / "expected_scenario.json").read_text(encoding="utf-8"))
+
+    assert actual == expected
+    serialized = json.dumps(actual, ensure_ascii=False)
+    assert "memory_integration" not in serialized
+    assert "flush" not in serialized
+    assert "wait_ready" not in serialized
+    assert "openclaw" not in serialized.lower()
+    assert "openviking" not in serialized.lower()

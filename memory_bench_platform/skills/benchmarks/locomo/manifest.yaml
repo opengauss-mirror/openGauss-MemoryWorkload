@@ -48,7 +48,9 @@ execution:
 judging:
   mode: external
   type: llm
-  prompt_style: locomo
+  profile: locomo_qa@1
+  extractor: qa_answer
+  prompt_template: evaluation/llm_judge_prompt.txt
   api_format: openai
   timeout_seconds: 60
   env:

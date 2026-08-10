@@ -1,0 +1,18 @@
+[
+  {
+    "question_id": "q-golden-1",
+    "question_type": "temporal-reasoning",
+    "question": "When did the user start the new job?",
+    "answer": "March 2024",
+    "question_date": "2024-04-01",
+    "haystack_session_ids": ["session-a"],
+    "haystack_dates": ["2024-03-05"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "I started my new job this month."},
+        {"role": "assistant", "content": "Congratulations on the new job."}
+      ]
+    ],
+    "answer_session_ids": ["session-a"]
+  }
+]

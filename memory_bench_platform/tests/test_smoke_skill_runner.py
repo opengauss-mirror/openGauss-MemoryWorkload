@@ -103,7 +103,7 @@ def test_smoke_static_validate_allows_empty_gateway_state_dir_for_runtime_defaul
     assert "gateway_state_dir_empty" not in payload["issues"]
 
 
-def test_smoke_run_uses_remote_entrypoint_when_available(tmp_path: Path):
+def test_smoke_run_uses_remote_entrypoint_when_available(monkeypatch, tmp_path: Path):
     script_path = (
         Path(__file__).resolve().parents[1]
         / "skills"
@@ -141,7 +141,7 @@ def test_smoke_run_uses_remote_entrypoint_when_available(tmp_path: Path):
 
         return _Proc()
 
-    module.subprocess.run = _fake_run
+    monkeypatch.setattr(module.subprocess, "run", _fake_run)
 
     result = module._run_locomo_smoke(probe, tmp_path / "run")
 

@@ -166,3 +166,34 @@ def test_case_results_use_expected_step_id_without_case_prefix():
     rows = _extract_case_result_rows([case], [judge], [step_result])
 
     assert rows[0]["response"] == "expected"
+
+
+def test_case_results_extract_retrieval_evidence():
+    case = CaseRecord(
+        case_id="case-retrieval",
+        run_id="run-1",
+        title="case",
+        goal="retrieve",
+        capability="memory/retrieval",
+        reference={
+            "expected_answer": "tea",
+            "expected_step_id": "memory-recall",
+            "evaluation_extractor": "evidence_text",
+        },
+    )
+    step_result = StepResultRecord(
+        step_result_id="memory-recall-1",
+        step_id="memory-recall",
+        attempt=1,
+        status="passed",
+        structured_output={"output": {"evidence_text": "The user prefers tea."}},
+    )
+    judge = JudgeResult(
+        judge_id="case-retrieval-llm",
+        run_id="run-1",
+        case_id="case-retrieval",
+        passed=True,
+        score=1.0,
+    )
+    rows = _extract_case_result_rows([case], [judge], [step_result])
+    assert rows[0]["response"] == "The user prefers tea."

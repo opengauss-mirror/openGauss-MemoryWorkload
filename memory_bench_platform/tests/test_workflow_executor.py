@@ -95,7 +95,8 @@ def test_workflow_skips_step_when_dependency_failed(monkeypatch, tmp_path: Path)
         run_dir=tmp_path,
     )
     assert output["step_results"][0].status == "failed"
-    assert output["judge_results"][0].passed is False
+    assert output["judge_results"][0].passed is None
+    assert output["judge_results"][0].label == "runtime-error"
 
 
 def test_workflow_supports_http_operator(monkeypatch, tmp_path: Path):
@@ -177,7 +178,8 @@ def test_workflow_captures_http_operator_failure(monkeypatch, tmp_path: Path):
         run_dir=tmp_path,
     )
     assert output["step_results"][0].status == "failed"
-    assert output["judge_results"][0].passed is False
+    assert output["judge_results"][0].passed is None
+    assert output["judge_results"][0].label == "runtime-error"
 
 
 def test_builtin_judge_can_target_expected_step(monkeypatch, tmp_path: Path):

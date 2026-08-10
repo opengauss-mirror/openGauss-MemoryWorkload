@@ -227,6 +227,11 @@ class ReportSummary(BaseModel):
     case_total: int
     case_passed: int
     case_failed: int
+    case_ungraded: int = 0
+    benchmark_score: float | None = None
+    checkpoint_ready_rate: float | None = None
+    runtime_failure_rate: float | None = None
+    readiness_latency_ms: float | None = None
     resource_summary: dict[str, Any] = Field(default_factory=dict)
     category_summary: dict[str, Any] = Field(default_factory=dict)
 

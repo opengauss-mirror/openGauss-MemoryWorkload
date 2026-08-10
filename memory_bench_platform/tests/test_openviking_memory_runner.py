@@ -141,6 +141,36 @@ def test_ingest_uses_explicit_session_id():
     assert result["operation"]["session_id"] == "session-explicit"
 
 
+def test_episode_scope_changes_identity_and_preserves_event_time():
+    runner = _load_runner()
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _JsonResponse({"status": "ok", "result": {"message_id": "message-1"}})
+
+    result = runner.run_operation(
+        _request(
+            "ingest",
+            {
+                "content": "I prefer tea.",
+                "occurred_at": "2026-01-02T10:00:00Z",
+                "scope_id": "run-1:persona-12",
+            },
+        ),
+        environ=_environment(),
+        urlopen=fake_urlopen,
+    )
+
+    scoped_agent = captured["headers"]["x-openviking-agent"]
+    assert scoped_agent.startswith("agent-1--episode-")
+    assert captured["body"]["content"] == "[Occurred at: 2026-01-02T10:00:00Z]\nI prefer tea."
+    assert result["operation"]["scope_id"] == "run-1:persona-12"
+    assert result["operation"]["target_identity"]["agent_id"] == scoped_agent
+
+
 def test_flush_uses_commit_api_and_returns_task_operation():
     runner = _load_runner()
 

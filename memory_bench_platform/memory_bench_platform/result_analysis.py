@@ -48,7 +48,8 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     if refreshed is not None:
         summary, case_results, external_result = refreshed
 
-    failures = [item for item in case_results if not bool(item.get("passed"))]
+    failures = [item for item in case_results if item.get("passed") is False]
+    ungraded = [item for item in case_results if item.get("passed") is None]
     buckets = _bucket_failures(failures)
     external_output_dir = _resolve_external_output_dir(run_dir)
     chain_diagnostics: dict[str, Any] = {}
@@ -82,6 +83,10 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "case_total": summary["case_total"],
         "case_passed": summary["case_passed"],
         "case_failed": summary["case_failed"],
+        "case_ungraded": int(summary.get("case_ungraded", len(ungraded)) or 0),
+        "checkpoint_ready_rate": summary.get("checkpoint_ready_rate"),
+        "runtime_failure_rate": summary.get("runtime_failure_rate"),
+        "readiness_latency_ms": summary.get("readiness_latency_ms"),
         "category_summary": summary.get("category_summary", {}),
         "failure_summary": _summarize_failures(case_results, buckets),
         "failure_buckets": buckets,
@@ -224,7 +229,9 @@ def _extract_benchmark_id(run_record: dict[str, Any]) -> str | None:
 def _compute_accuracy(summary: dict[str, Any], external_result: dict[str, Any] | None) -> float:
     if external_result is not None:
         return float(external_result.get("summary", {}).get("overall_accuracy", 0.0))
-    total = int(summary.get("case_total", 0) or 0)
+    if summary.get("benchmark_score") is not None:
+        return float(summary["benchmark_score"])
+    total = int(summary.get("case_total", 0) or 0) - int(summary.get("case_ungraded", 0) or 0)
     passed = int(summary.get("case_passed", 0) or 0)
     return round(passed / total, 4) if total else 0.0
 
@@ -263,11 +270,13 @@ def _bucket_failures(failures: list[dict[str, Any]]) -> dict[str, list[dict[str,
 
 
 def _summarize_failures(case_results: list[dict[str, Any]], buckets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    correct_count = sum(1 for item in case_results if bool(item.get("passed")))
-    wrong_count = sum(1 for item in case_results if not bool(item.get("passed")))
+    correct_count = sum(1 for item in case_results if item.get("passed") is True)
+    wrong_count = sum(1 for item in case_results if item.get("passed") is False)
+    ungraded_count = sum(1 for item in case_results if item.get("passed") is None)
     return {
         "correct_count": correct_count,
         "wrong_count": wrong_count,
+        "ungraded_count": ungraded_count,
         "retrieval_miss_count": len(buckets.get("retrieval_miss", [])),
         "unsupported_no_info_count": len(buckets.get("unsupported_no_info", [])),
         "format_or_empty_count": len(buckets.get("format_or_empty", [])),

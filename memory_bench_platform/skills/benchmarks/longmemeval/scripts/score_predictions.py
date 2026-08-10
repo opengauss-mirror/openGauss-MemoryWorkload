@@ -60,30 +60,39 @@ def score_run(run_dir: Path, ref_path: Path) -> dict[str, Any]:
     api_key = os.environ.get("LONGMEMEVAL_API_KEY", "")
     base_url = os.environ.get("LONGMEMEVAL_BASE_URL", "")
     metric_model = os.environ.get("LONGMEMEVAL_METRIC_MODEL", "custom")
-    client = OpenAI(api_key=api_key, base_url=base_url) if (api_key and OpenAI is not None) else None
+    client = (
+        OpenAI(api_key=api_key, base_url=base_url)
+        if (api_key and base_url and metric_model and OpenAI is not None)
+        else None
+    )
+    if client is None or not base_url or not metric_model:
+        return {
+            "status": "invalid",
+            "reason": "LongMemEval LLM Judge configuration is required; lexical fallback is disabled",
+            "primary_metric": "accuracy",
+            "metrics": [],
+            "artifacts": [{"path": str(hypotheses_path), "kind": "hypotheses"}],
+        }
     for row in case_results:
         ref = qid2ref.get(row["case_id"])
         if ref is None:
             continue
         total += 1
-        if client is not None:
-            prompt = get_anscheck_prompt(
-                ref["question_type"],
-                ref["question"],
-                ref["answer"],
-                str(row.get("response", "")),
-                abstention="_abs" in ref["question_id"],
-            )
-            completion = client.chat.completions.create(
-                model=metric_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=10,
-            )
-            eval_response = (completion.choices[0].message.content or "").strip().lower()
-            label = "yes" in eval_response
-        else:
-            label = str(row.get("expected_answer", "")).lower() in str(row.get("response", "")).lower()
+        prompt = get_anscheck_prompt(
+            ref["question_type"],
+            ref["question"],
+            ref["answer"],
+            str(row.get("response", "")),
+            abstention="_abs" in ref["question_id"],
+        )
+        completion = client.chat.completions.create(
+            model=metric_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=10,
+        )
+        eval_response = (completion.choices[0].message.content or "").strip().lower()
+        label = "yes" in eval_response
         autoeval_rows.append(
             {
                 "question_id": row["case_id"],
@@ -99,11 +108,25 @@ def score_run(run_dir: Path, ref_path: Path) -> dict[str, Any]:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     return {
         "status": "ok",
+        "primary_metric": "accuracy",
+        "metrics": [
+            {
+                "name": "accuracy",
+                "value": round(correct / total, 4) if total else 0.0,
+                "scope": "run",
+                "unit": "ratio",
+                "direction": "higher_is_better",
+            }
+        ],
+        "artifacts": [
+            {"path": str(hypotheses_path), "kind": "hypotheses"},
+            {"path": str(eval_path), "kind": "judge_results"},
+        ],
         "hypotheses_path": str(hypotheses_path),
         "eval_results_path": str(eval_path),
         "overall_accuracy": round(correct / total, 4) if total else 0.0,
         "total_scored": total,
-        "scoring_mode": "llm" if client is not None else "lexical_fallback",
+        "scoring_mode": "llm",
     }
 
 

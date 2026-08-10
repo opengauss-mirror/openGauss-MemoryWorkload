@@ -1,0 +1,5 @@
+Determine whether the generated answer is semantically equivalent to the reference answer.
+Question: {question}
+Reference answer: {gold_answer}
+Generated answer: {response}
+Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "one short explanation"}}

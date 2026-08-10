@@ -2,6 +2,7 @@ from pathlib import Path
 
 import yaml
 from skills.benchmarks.longmemeval.scripts.build_tasks import build_cases
+from skills.benchmarks.longmemeval.scripts.build_scenario import build_scenario
 from skills.benchmarks.longmemeval.scripts.validate import validate
 
 
@@ -21,11 +22,12 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     )
 
 
-def test_longmemeval_manifest_declares_case_builder():
+def test_longmemeval_manifest_declares_scenario_builder():
     manifest = yaml.safe_load(
         Path("skills/benchmarks/longmemeval/manifest.yaml").read_text(encoding="utf-8")
     )
     assert manifest["entry"]["case_builder"] == "scripts/build_tasks.py"
+    assert manifest["entry"]["scenario_builder"] == "scripts/build_scenario.py"
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "longmemeval-benchmark"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
@@ -37,6 +39,13 @@ def test_longmemeval_builder_uses_case_source_shape():
     assert "cases" in payload
     assert "steps" in payload
     assert "execution_spec" in payload
+
+
+def test_longmemeval_scenario_builder_uses_runtime_independent_shape():
+    payload = build_scenario()
+    assert payload["source_kind"] == "benchmark_scenario"
+    assert payload["benchmark_id"] == "longmemeval"
+    assert payload["samples"] == []
 
 
 def test_longmemeval_validator_reports_missing_source_when_no_path():

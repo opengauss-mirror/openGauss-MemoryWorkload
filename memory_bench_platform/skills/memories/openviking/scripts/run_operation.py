@@ -26,6 +26,7 @@ def run_operation(
     inputs = request.get("inputs", {})
     if not isinstance(inputs, dict):
         inputs = {}
+    environment = _scoped_environment(environment, inputs)
     started = time.perf_counter()
     temporary_config: Path | None = None
     temporary_home: Path | None = None
@@ -81,6 +82,9 @@ def _run_ingest(
     content = inputs.get("content")
     if not isinstance(content, str) or not content:
         return _failed_result("invalid_input", "memory.ingest requires inputs.content", secrets)
+    occurred_at = str(inputs.get("occurred_at") or inputs.get("timestamp") or "").strip()
+    if occurred_at:
+        content = f"[Occurred at: {occurred_at}]\n{content}"
     session_id = _session_id(request, inputs)
     base_url = str(environment.get("OPENVIKING_API_URL") or "http://127.0.0.1:1933").rstrip("/")
     encoded_session_id = urllib.parse.quote(session_id, safe="")
@@ -98,6 +102,7 @@ def _run_ingest(
         "status_probe": "none",
         "type": "memory_ingest",
     }
+    _attach_scope(operation, inputs, environment)
     return {
         "status": "ok",
         "state": "completed",
@@ -155,6 +160,7 @@ def _run_flush(
         "status_probe": "task",
         "type": "memory_flush",
     }
+    _attach_scope(operation, inputs, environment, source_operation)
     return {
         "status": "ok",
         "state": "accepted",
@@ -301,11 +307,8 @@ def _run_recall(
             "count": len(memories),
             "memories": memories,
             "evidence_text": "\n".join(dict.fromkeys(evidence)),
-            "target_identity": {
-                "account_id": str(environment.get("OPENVIKING_ACCOUNT_ID", "")),
-                "user_id": str(environment.get("OPENVIKING_USER_ID", "")),
-                "agent_id": str(environment.get("OPENVIKING_AGENT_ID", "")),
-            },
+            "scope_id": str(inputs.get("scope_id") or ""),
+            "target_identity": _target_identity(environment),
         },
         "metrics": [],
         "artifacts": [],
@@ -326,15 +329,20 @@ def _prepare_cli_environment(
     os.chmod(settings_path, 0o600)
     cli_environment["HOME"] = str(temporary_home)
     configured_path = str(environment.get("OPENVIKING_CLI_CONFIG_FILE", "") or "")
-    if configured_path:
-        return cli_environment, None, temporary_home
-
     api_key = str(
         environment.get("OPENVIKING_API_KEY")
         or environment.get("OPENVIKING_ROOT_API_KEY")
         or ""
     )
-    config = {
+    config: dict[str, Any] = {}
+    if configured_path:
+        try:
+            loaded = json.loads(Path(configured_path).read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+    config.update({
         "url": str(environment.get("OPENVIKING_API_URL") or "http://127.0.0.1:1933"),
         "api_key": api_key,
         "account": str(environment.get("OPENVIKING_ACCOUNT_ID", "")),
@@ -342,7 +350,7 @@ def _prepare_cli_environment(
         "agent_id": str(environment.get("OPENVIKING_AGENT_ID", "")),
         "output": "json",
         "echo_command": False,
-    }
+    })
     root_key = str(environment.get("OPENVIKING_ROOT_API_KEY", "") or "")
     if root_key:
         config["root_api_key"] = root_key
@@ -419,6 +427,44 @@ def _request_headers(environment: dict[str, str]) -> dict[str, str]:
         if value:
             headers[header_name] = value
     return headers
+
+
+def _scoped_environment(environment: dict[str, str], inputs: dict[str, Any]) -> dict[str, str]:
+    operation = inputs.get("operation", {})
+    if not isinstance(operation, dict):
+        operation = {}
+    scope_id = str(inputs.get("scope_id") or operation.get("scope_id") or "").strip()
+    if not scope_id:
+        return environment
+    scoped = dict(environment)
+    base_agent = str(environment.get("OPENVIKING_AGENT_ID") or "memory-bench")
+    digest = hashlib.sha256(scope_id.encode("utf-8")).hexdigest()[:16]
+    scoped["OPENVIKING_AGENT_ID"] = f"{base_agent[:40]}--episode-{digest}"
+    return scoped
+
+
+def _target_identity(environment: dict[str, str]) -> dict[str, str]:
+    return {
+        "account_id": str(environment.get("OPENVIKING_ACCOUNT_ID", "")),
+        "user_id": str(environment.get("OPENVIKING_USER_ID", "")),
+        "agent_id": str(environment.get("OPENVIKING_AGENT_ID", "")),
+    }
+
+
+def _attach_scope(
+    operation: dict[str, Any],
+    inputs: dict[str, Any],
+    environment: dict[str, str],
+    source_operation: dict[str, Any] | None = None,
+) -> None:
+    scope_id = str(
+        inputs.get("scope_id")
+        or (source_operation or {}).get("scope_id")
+        or ""
+    ).strip()
+    if scope_id:
+        operation["scope_id"] = scope_id
+        operation["target_identity"] = _target_identity(environment)
 
 
 def _normalize_state(status: str) -> str:
