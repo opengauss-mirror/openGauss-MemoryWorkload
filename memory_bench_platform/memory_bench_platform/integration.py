@@ -26,6 +26,7 @@ from .protocol import (
     MemoryTaskOutput,
     RenderedTaskInput,
 )
+from .benchmark_scenario import BenchmarkScenario
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,12 @@ def execute_smoke_skill(skill_id: str, run_dir: Path) -> dict[str, Any]:
 def validate_benchmark(skill_id: str, source_path: str | None = None) -> dict:
     manifest = get_benchmark_manifest(skill_id)
     manifest_path = _manifest_path("benchmarks", skill_id)
-    script = manifest.entry.validator or manifest.entry.case_builder or manifest.entry.task_builder
+    script = (
+        manifest.entry.validator
+        or manifest.entry.scenario_builder
+        or manifest.entry.case_builder
+        or manifest.entry.task_builder
+    )
     if not script:
         raise ValueError(f"benchmark skill {skill_id} has no validator or case_builder/task_builder")
     args = [source_path] if source_path else []
@@ -297,6 +303,17 @@ def build_benchmark_tasks(
     return run_json_script(_script_for_manifest(manifest_path, builder), args=args)
 
 
+def build_benchmark_scenario(skill_id: str, source_path: str | None = None) -> BenchmarkScenario:
+    manifest = get_benchmark_manifest(skill_id)
+    manifest_path = _manifest_path("benchmarks", skill_id)
+    builder = manifest.entry.scenario_builder
+    if not builder:
+        raise ValueError(f"benchmark skill {skill_id} has no scenario_builder")
+    args = [source_path] if source_path else []
+    payload = run_json_script(_script_for_manifest(manifest_path, builder), args=args)
+    return BenchmarkScenario.model_validate(payload)
+
+
 def build_cases_from_source(
     skill_id: str,
     source_path: str | None = None,
@@ -377,6 +394,8 @@ def classify_entrypoint(entry: dict[str, Any]) -> str:
         return "external_runner"
     if entry.get("case_builder") or entry.get("task_builder"):
         return "case_builder"
+    if entry.get("scenario_builder"):
+        return "scenario_builder"
     return "unknown"
 
 
@@ -398,6 +417,15 @@ def resolve_benchmark_entrypoint(skill_id: str, entrypoint_id: str | None = None
             )
         raise ValueError(f"unsupported benchmark entrypoint: {skill_id}:{entrypoint_id}")
 
+    if manifest.entry.scenario_builder:
+        return EntryPointRecord(
+            entrypoint_id="default",
+            entrypoint_kind="scenario_builder",
+            command=[
+                sys.executable,
+                str(_script_for_manifest(manifest_path, manifest.entry.scenario_builder)),
+            ],
+        )
     builder = manifest.entry.case_builder or manifest.entry.task_builder
     if not builder:
         raise ValueError(f"benchmark skill {skill_id} has no case_builder/task_builder")

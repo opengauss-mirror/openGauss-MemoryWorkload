@@ -10,17 +10,22 @@ from pathlib import Path
 from .backends import validate_openviking_source
 from .external_report_import import import_external_result
 from .integration import (
+    build_benchmark_scenario,
     build_run_contract,
     build_cases_from_source,
     execute_external_runner,
     execute_smoke_skill,
     run_memory_plugin_task,
+    resolve_run_skill_bundle,
     resolve_benchmark_entrypoint,
     score_benchmark_run,
     validate_agent,
     validate_benchmark,
     validate_smoke,
 )
+from .benchmark_scenario import RunBinding
+from .compatibility import resolve_compatibility
+from .composer import compose_run_plan
 from .loader import load_agent_skill, load_all_skills, load_benchmark_skill
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
@@ -313,7 +318,13 @@ def main(argv: list[str] | None = None) -> None:
         args.memory_integration,
     )
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
-    source_kind = "external_benchmark_runner" if entrypoint.entrypoint_kind == "external_runner" else "benchmark_case_source"
+    source_kind = (
+        "external_benchmark_runner"
+        if entrypoint.entrypoint_kind == "external_runner"
+        else "benchmark_scenario"
+        if entrypoint.entrypoint_kind == "scenario_builder"
+        else "benchmark_case_source"
+    )
     run_record = RunRecord(
         run_id=plan.run_id,
         source_id=f"{plan.benchmark_id}:{entrypoint.entrypoint_id}" if args.entrypoint else plan.benchmark_id,
@@ -499,12 +510,66 @@ def main(argv: list[str] | None = None) -> None:
         print(str(run_dir))
         return
 
-    cases_payload = build_cases_from_source(
-        args.benchmark,
-        args.data_path,
-        args.memory_integration,
-        run_record.run_id,
-    )
+    if entrypoint.entrypoint_kind == "scenario_builder":
+        scenario = build_benchmark_scenario(args.benchmark, args.data_path)
+        bundle = resolve_run_skill_bundle(
+            args.benchmark,
+            args.agent,
+            args.memory_backend,
+            args.memory_integration,
+        )
+        binding = RunBinding(
+            benchmark_id=args.benchmark,
+            agent_id=args.agent,
+            agent_runtime_id=str(bundle.agent.runtime.get("agent_id") or "").strip() or None,
+            agent_local=(
+                bool(bundle.agent.runtime.get("local", False))
+                or os.environ.get("MEMORY_BENCH_AGENT_LOCAL", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
+            memory_id=bundle.memory_id,
+            memory_integration=args.memory_integration,
+            memory_plugin_id=bundle.memory_plugin_id,
+            run_id=run_record.run_id,
+        )
+        compatibility = resolve_compatibility(
+            scenario,
+            binding,
+            agent=bundle.agent,
+            memory=bundle.memory,
+            memory_plugin=bundle.memory_plugin,
+        )
+        storage.write_json_record(
+            run_dir,
+            "records/benchmark_scenario.json",
+            scenario.model_dump(mode="json"),
+        )
+        storage.write_json_record(
+            run_dir,
+            "records/run_binding.json",
+            binding.model_dump(mode="json"),
+        )
+        storage.write_json_record(
+            run_dir,
+            "records/compatibility_result.json",
+            compatibility.model_dump(mode="json"),
+        )
+        if not compatibility.compatible:
+            missing = ", ".join(compatibility.missing_capabilities)
+            raise ValueError(f"runtime is incompatible with benchmark scenario: {missing}")
+        cases_payload = compose_run_plan(scenario, binding)
+        storage.write_json_record(
+            run_dir,
+            "records/composed_run_plan.json",
+            cases_payload,
+        )
+    else:
+        cases_payload = build_cases_from_source(
+            args.benchmark,
+            args.data_path,
+            args.memory_integration,
+            run_record.run_id,
+        )
     declared_source_kind = str(cases_payload.get("source_kind", "") or "")
     if declared_source_kind:
         run_record.source_kind = declared_source_kind

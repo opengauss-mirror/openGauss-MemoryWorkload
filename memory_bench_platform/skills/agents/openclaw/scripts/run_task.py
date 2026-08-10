@@ -113,6 +113,12 @@ def main() -> None:
     result_payload = payload.get("result", payload)
     if not isinstance(result_payload, dict):
         result_payload = {}
+    result_meta = result_payload.get("meta", {})
+    if not isinstance(result_meta, dict):
+        result_meta = {}
+    prompt_report = result_meta.get("systemPromptReport", {})
+    if not isinstance(prompt_report, dict):
+        prompt_report = {}
     metadata = request.get("metadata", {})
     configured_session_id = metadata.get("session_id")
     configured_session_key = metadata.get("session_key")
@@ -123,6 +129,7 @@ def main() -> None:
         if configured_session_key
         else ""
     )
+    gateway_session_key = str(prompt_report.get("sessionKey") or "")
     response = {
         "status": payload.get("status", "ok"),
         "agent": "openclaw",
@@ -132,6 +139,11 @@ def main() -> None:
         "output": {
             "session_id": resolved_session_id,
             "session_key": str(configured_session_key or ""),
+            "session_handle": {
+                "session_id": resolved_session_id,
+                "session_key": str(configured_session_key or ""),
+                "gateway_session_key": gateway_session_key,
+            },
         },
         "turns": result_payload.get("payloads", []),
         "artifacts": [],

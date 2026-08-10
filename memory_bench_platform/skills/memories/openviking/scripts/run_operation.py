@@ -35,6 +35,8 @@ def run_operation(
         cli_environment, temporary_config, temporary_home = _prepare_cli_environment(environment)
         if action == "ingest":
             result = _run_ingest(request, inputs, environment, urlopen, secrets)
+        elif action == "flush":
+            result = _run_flush(inputs, environment, urlopen, secrets)
         elif action == "status":
             result = _run_status(
                 inputs,
@@ -90,6 +92,41 @@ def _run_ingest(
         urlopen,
         timeout,
     )
+    operation = {
+        "resource_id": session_id,
+        "session_id": session_id,
+        "status_probe": "none",
+        "type": "memory_ingest",
+    }
+    return {
+        "status": "ok",
+        "state": "completed",
+        "operation": operation,
+        "output": {
+            "accepted": True,
+            "session_id": session_id,
+        },
+        "metrics": [],
+        "artifacts": [],
+        "error": {},
+    }
+
+
+def _run_flush(
+    inputs: dict[str, Any],
+    environment: dict[str, str],
+    urlopen: Callable[..., Any],
+    secrets: list[str],
+) -> dict[str, Any]:
+    source_operation = inputs.get("operation", {})
+    if not isinstance(source_operation, dict):
+        source_operation = {}
+    session_id = str(inputs.get("session_id") or source_operation.get("session_id") or "").strip()
+    if not session_id:
+        return _failed_result("invalid_input", "memory.flush requires inputs.session_id", secrets)
+    base_url = str(environment.get("OPENVIKING_API_URL") or "http://127.0.0.1:1933").rstrip("/")
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    timeout = float(inputs.get("request_timeout_seconds", 30))
     commit_result = _post_json(
         f"{base_url}/api/v1/sessions/{encoded_session_id}/commit",
         {"keep_recent_count": 0},
@@ -116,6 +153,7 @@ def _run_ingest(
         "session_id": session_id,
         "archive_uri": archive_uri,
         "status_probe": "task",
+        "type": "memory_flush",
     }
     return {
         "status": "ok",

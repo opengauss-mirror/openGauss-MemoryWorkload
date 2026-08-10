@@ -29,6 +29,7 @@ runtime:
   benchmark_unit: session
   actions:
     - ingest
+    - flush
     - status
     - recall
 ingest:
@@ -38,3 +39,16 @@ recall:
 completion:
   accept_signal: accepted
   complete_signal: completed
+integration:
+  protocol_version: memory/1
+capabilities:
+  actions: [ingest, flush, status, recall]
+  async_ingest: true
+  commit:
+    supported: true
+    required_after_ingest: true
+    notes: flush maps the generic memory lifecycle to OpenViking session commit
+  readiness:
+    supported: true
+    scoped_by_operation: true
+  evidence_output: true

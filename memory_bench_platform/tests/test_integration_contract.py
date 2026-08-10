@@ -31,7 +31,7 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert contract["memory_runtime"]["accept_signal"] == "accepted"
     assert contract["memory_runtime"]["complete_signal"] == "completed"
     assert contract["memory_runtime"]["runner"] == "scripts/run_operation.py"
-    assert contract["memory_runtime"]["supported_actions"] == ["ingest", "status", "recall"]
+    assert contract["memory_runtime"]["supported_actions"] == ["ingest", "flush", "status", "recall"]
     assert contract["judge_runtime"] == {
         "mode": "external",
         "type": "llm",
@@ -62,11 +62,14 @@ def test_build_run_contract_resolves_openclaw_openviking_plugin():
         "validate",
         "prepare",
         "set_phase",
+        "commit",
+        "wait_ready",
         "flush",
         "wait_settle",
         "finalize",
     ]
     assert contract["memory_plugin_runtime"]["capabilities"]["explicit_flush"] is True
+    assert contract["memory_plugin_runtime"]["capabilities"]["extraction_trigger"] == "agent_native_compact"
     assert contract["memory_plugin_runtime"]["phases"]["ingest"] == {
         "capture": True,
         "recall": False,
@@ -78,7 +81,7 @@ def test_openviking_memory_manifest_declares_unified_runner():
     manifest = get_memory_manifest("openviking")
 
     assert manifest.entry.runner == "scripts/run_operation.py"
-    assert manifest.runtime["actions"] == ["ingest", "status", "recall"]
+    assert manifest.runtime["actions"] == ["ingest", "flush", "status", "recall"]
 
 
 def test_resolve_run_skill_bundle_rejects_incompatible_memory_unit(tmp_path: Path):

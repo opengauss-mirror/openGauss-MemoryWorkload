@@ -10,6 +10,8 @@ runtime:
     - validate
     - prepare
     - set_phase
+    - commit
+    - wait_ready
     - flush
     - wait_settle
     - finalize
@@ -19,8 +21,16 @@ capabilities:
   qa_read_only: true
   wait_settle: true
   explicit_flush: true
+  extraction_trigger: agent_native_compact
   exact_operation_status: true
   namespace_isolation: true
+  commit:
+    supported: true
+    required_after_ingest: true
+    owner: agent_memory_adapter
+  readiness:
+    supported: true
+    scoped_by_operation: true
 phases:
   ingest:
     capture: true
@@ -29,3 +39,8 @@ phases:
   qa:
     capture: false
     recall: true
+integration:
+  protocol_version: memory-plugin/1
+lifecycle:
+  phases: [ingest, qa]
+  actions: [validate, prepare, set_phase, commit, wait_ready, finalize]

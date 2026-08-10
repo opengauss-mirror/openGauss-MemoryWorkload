@@ -70,6 +70,7 @@ class VersionPolicy(BaseModel):
 
 class EntryPoints(BaseModel):
     case_builder: str | None = None
+    scenario_builder: str | None = None
     task_builder: str | None = None
     scorer: str | None = None
     validator: str | None = None
@@ -95,6 +96,9 @@ class BenchmarkManifest(BaseModel):
     dataset: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
     judging: dict[str, Any] = Field(default_factory=dict)
+    requirements: dict[str, Any] = Field(default_factory=dict)
+    evaluation: dict[str, Any] = Field(default_factory=dict)
+    integration: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -117,6 +121,8 @@ class AgentManifest(BaseModel):
     io: dict[str, Any] = Field(default_factory=dict)
     lifecycle: dict[str, Any] = Field(default_factory=dict)
     collection: dict[str, Any] = Field(default_factory=dict)
+    integration: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -139,6 +145,8 @@ class MemoryManifest(BaseModel):
     ingest: dict[str, Any] = Field(default_factory=dict)
     recall: dict[str, Any] = Field(default_factory=dict)
     completion: dict[str, Any] = Field(default_factory=dict)
+    integration: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -161,6 +169,8 @@ class MemoryPluginManifest(BaseModel):
     runtime: dict[str, Any] = Field(default_factory=dict)
     capabilities: dict[str, Any] = Field(default_factory=dict)
     phases: dict[str, Any] = Field(default_factory=dict)
+    integration: dict[str, Any] = Field(default_factory=dict)
+    lifecycle: dict[str, Any] = Field(default_factory=dict)
 
 
 class SmokeManifest(BaseModel):

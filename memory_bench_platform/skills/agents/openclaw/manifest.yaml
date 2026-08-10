@@ -35,6 +35,7 @@ entry:
 runtime:
   mode: service
   default_memory_skill: openviking
+  agent_id: main
 io:
   protocol_mode: stateful_session
 lifecycle:
@@ -42,3 +43,10 @@ lifecycle:
 collection:
   stdout: true
   stderr: true
+integration:
+  protocol_version: agent/1
+capabilities:
+  structured_input: true
+  multi_turn: true
+  stateful_session: true
+  tool_calling: true

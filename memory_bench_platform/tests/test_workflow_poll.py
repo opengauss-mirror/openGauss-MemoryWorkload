@@ -165,7 +165,18 @@ def test_ovtest_memory_native_workflow_renders_recall_evidence_into_agent(monkey
     def fake_run_memory_task(skill_id, request):
         assert skill_id == "openviking"
         if request.action == "ingest":
-            return MemoryTaskOutput(status="ok", state="accepted", operation={"task_id": "task-1"})
+            return MemoryTaskOutput(
+                status="ok",
+                state="completed",
+                operation={"session_id": "session-1"},
+                output={"session_id": "session-1"},
+            )
+        if request.action == "flush":
+            return MemoryTaskOutput(
+                status="ok",
+                state="accepted",
+                operation={"task_id": "task-1", "session_id": "session-1"},
+            )
         if request.action == "status":
             status_calls["count"] += 1
             state = "running" if status_calls["count"] == 1 else "completed"

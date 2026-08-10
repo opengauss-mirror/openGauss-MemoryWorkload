@@ -2,6 +2,12 @@
 
 负责将 LoCoMo 数据集整理为平台统一的多轮记忆任务。
 
+## Scenario 边界
+
+- `scripts/build_scenario.py` 只输出 Sample、按时间排序的 Session、末尾 QA Checkpoint、问题、标准答案和题型。
+- Benchmark Skill 不再根据 `backend_direct / agent_plugin` 生成运行步骤。
+- Memory 写入、提交、等待、Recall、Agent QA 和插件阶段切换统一由 Platform Composer 根据 Run Binding 与 Runtime Capabilities 生成。
+
 ## 平台派生关系
 
 - `memory_bench_platform` 是 LoCoMo 评测的主入口与归档/分析框架。

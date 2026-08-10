@@ -9,7 +9,12 @@ from pydantic import BaseModel, Field
 class RunRecord(BaseModel):
     run_id: str
     source_id: str
-    source_kind: Literal["benchmark_case_source", "native_workflow", "external_benchmark_runner"]
+    source_kind: Literal[
+        "benchmark_case_source",
+        "benchmark_scenario",
+        "native_workflow",
+        "external_benchmark_runner",
+    ]
     operator_targets: list[str] = Field(default_factory=list)
     benchmark_skill_version: str | None = None
     benchmark_version: str | None = None
@@ -117,7 +122,16 @@ class WorkflowRuntimeContext(BaseModel):
 
 class MemoryTaskInput(BaseModel):
     task_id: str
-    action: Literal["ingest", "status", "recall", "consistency"]
+    action: Literal[
+        "ingest",
+        "flush",
+        "commit",
+        "status",
+        "wait_ready",
+        "recall",
+        "inspect_memory",
+        "consistency",
+    ]
     inputs: dict[str, Any] = Field(default_factory=dict)
     runtime_context: WorkflowRuntimeContext
     idempotency_key: str
@@ -139,6 +153,8 @@ class MemoryPluginTaskInput(BaseModel):
         "validate",
         "prepare",
         "set_phase",
+        "commit",
+        "wait_ready",
         "flush",
         "wait_settle",
         "enter_qa",
@@ -217,7 +233,7 @@ class ReportSummary(BaseModel):
 
 class EntryPointRecord(BaseModel):
     entrypoint_id: str
-    entrypoint_kind: Literal["case_builder", "external_runner"]
+    entrypoint_kind: Literal["case_builder", "scenario_builder", "external_runner"]
     command: list[str] = Field(default_factory=list)
     output_dir: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

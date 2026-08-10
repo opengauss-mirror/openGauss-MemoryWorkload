@@ -60,7 +60,7 @@ class _JsonResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
-def test_ingest_uses_session_api_and_returns_task_operation():
+def test_ingest_uses_session_message_api_without_committing():
     runner = _load_runner()
     calls = []
     content = "For systems programming I prefer Go over Python."
@@ -79,20 +79,7 @@ def test_ingest_uses_session_api_and_returns_task_operation():
                 "timeout": timeout,
             }
         )
-        if len(calls) == 1:
-            return _JsonResponse({"status": "ok", "result": {"message_id": "message-1"}})
-        return _JsonResponse(
-            {
-                "status": "ok",
-                "result": {
-                    "session_id": expected_session_id,
-                    "status": "accepted",
-                    "task_id": "task-1",
-                    "archive_uri": f"viking://session/{expected_session_id}/history/archive_001",
-                    "archived": True,
-                },
-            }
-        )
+        return _JsonResponse({"status": "ok", "result": {"message_id": "message-1"}})
 
     def fail_command(*args, **kwargs):
         del args, kwargs
@@ -107,11 +94,9 @@ def test_ingest_uses_session_api_and_returns_task_operation():
 
     assert [call["url"] for call in calls] == [
         f"http://openviking.test:1933/api/v1/sessions/{expected_session_id}/messages",
-        f"http://openviking.test:1933/api/v1/sessions/{expected_session_id}/commit",
     ]
-    assert [call["method"] for call in calls] == ["POST", "POST"]
+    assert [call["method"] for call in calls] == ["POST"]
     assert calls[0]["body"] == {"role": "user", "content": content}
-    assert calls[1]["body"] == {"keep_recent_count": 0}
     for call in calls:
         assert call["headers"]["content-type"] == "application/json"
         assert call["headers"]["x-api-key"] == "secret-api-key"
@@ -120,13 +105,12 @@ def test_ingest_uses_session_api_and_returns_task_operation():
         assert call["headers"]["x-openviking-agent"] == "agent-1"
         assert call["timeout"] == 30
     assert result["status"] == "ok"
-    assert result["state"] == "accepted"
+    assert result["state"] == "completed"
     assert result["operation"] == {
-        "task_id": "task-1",
         "resource_id": expected_session_id,
         "session_id": expected_session_id,
-        "archive_uri": f"viking://session/{expected_session_id}/history/archive_001",
-        "status_probe": "task",
+        "status_probe": "none",
+        "type": "memory_ingest",
     }
     serialized = json.dumps(result)
     assert content not in serialized
@@ -140,20 +124,7 @@ def test_ingest_uses_explicit_session_id():
     def fake_urlopen(request, timeout):
         del timeout
         calls.append(request.full_url)
-        if len(calls) == 1:
-            return _JsonResponse({"status": "ok", "result": {"message_id": "message-1"}})
-        return _JsonResponse(
-            {
-                "status": "ok",
-                "result": {
-                    "session_id": "session-explicit",
-                    "status": "accepted",
-                    "task_id": "task-1",
-                    "archive_uri": "viking://session/session-explicit/history/archive_001",
-                    "archived": True,
-                },
-            }
-        )
+        return _JsonResponse({"status": "ok", "result": {"message_id": "message-1"}})
 
     result = runner.run_operation(
         _request(
@@ -166,12 +137,47 @@ def test_ingest_uses_explicit_session_id():
 
     assert calls == [
         "http://openviking.test:1933/api/v1/sessions/session-explicit/messages",
-        "http://openviking.test:1933/api/v1/sessions/session-explicit/commit",
     ]
     assert result["operation"]["session_id"] == "session-explicit"
 
 
-def test_ingest_fails_when_commit_omits_task_id():
+def test_flush_uses_commit_api_and_returns_task_operation():
+    runner = _load_runner()
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        assert request.full_url.endswith("/api/v1/sessions/session-1/commit")
+        assert json.loads(request.data.decode("utf-8")) == {"keep_recent_count": 0}
+        return _JsonResponse({
+            "status": "ok",
+            "result": {
+                "session_id": "session-1",
+                "status": "accepted",
+                "task_id": "task-1",
+                "archive_uri": "viking://session/session-1/history/archive_001",
+                "archived": True,
+            },
+        })
+
+    result = runner.run_operation(
+        _request("flush", {"session_id": "session-1"}),
+        environ=_environment(),
+        urlopen=fake_urlopen,
+    )
+
+    assert result["status"] == "ok"
+    assert result["state"] == "accepted"
+    assert result["operation"] == {
+        "task_id": "task-1",
+        "resource_id": "session-1",
+        "session_id": "session-1",
+        "archive_uri": "viking://session/session-1/history/archive_001",
+        "status_probe": "task",
+        "type": "memory_flush",
+    }
+
+
+def test_flush_fails_when_commit_omits_task_id():
     runner = _load_runner()
     call_count = 0
 
@@ -179,8 +185,6 @@ def test_ingest_fails_when_commit_omits_task_id():
         nonlocal call_count
         del request, timeout
         call_count += 1
-        if call_count == 1:
-            return _JsonResponse({"status": "ok", "result": {"message_id": "message-1"}})
         return _JsonResponse(
             {
                 "status": "ok",
@@ -194,7 +198,7 @@ def test_ingest_fails_when_commit_omits_task_id():
         )
 
     result = runner.run_operation(
-        _request("ingest", {"content": "remember this", "session_id": "session-1"}),
+        _request("flush", {"session_id": "session-1"}),
         environ=_environment(),
         urlopen=fake_urlopen,
     )

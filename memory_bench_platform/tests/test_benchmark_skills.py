@@ -11,6 +11,7 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     )
     assert manifest["execution"]["mode"] == "multi_turn"
     assert manifest["execution"]["requires_stateful_agent"] is True
+    assert manifest["entry"]["scenario_builder"] == "scripts/build_scenario.py"
     assert manifest["version_policy"]["default_selection"] == "latest_official_release_tag"
     assert manifest["version_policy"]["targets"][0]["name"] == "locomo-benchmark"
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"

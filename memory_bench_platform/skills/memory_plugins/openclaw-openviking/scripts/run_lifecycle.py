@@ -44,13 +44,13 @@ def _openclaw_bin() -> str:
     raise FileNotFoundError("openclaw binary not found")
 
 
-def _run_openclaw(*args: str) -> str:
+def _run_openclaw(*args: str, timeout: float = 60) -> str:
     proc = subprocess.run(
         [_openclaw_bin(), *args],
         text=True,
         capture_output=True,
         check=False,
-        timeout=60,
+        timeout=timeout,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "openclaw command failed")
@@ -279,46 +279,64 @@ def _active_task_count(base_url: str, timeout: float, headers: dict[str, str]) -
 def _flush(request: dict[str, Any]) -> dict[str, Any]:
     inputs = request.get("inputs", {})
     session_key = str(inputs.get("session_key") or "").strip()
-    session_id = str(inputs.get("session_id") or "").strip()
+    session_handle = inputs.get("session_handle", {})
+    if not isinstance(session_handle, dict):
+        session_handle = {}
+    session_id = str(inputs.get("session_id") or session_handle.get("session_id") or "").strip()
     if not session_id and session_key:
         session_id = session_id_from_key(session_key)
     if not session_id:
         raise ValueError("flush requires session_key or session_id")
 
     agent_id = str(inputs.get("agent_id") or "main")
-    base_url = _base_url()
-    headers = _task_headers(agent_id)
-    if not base_url or not headers.get("X-API-Key"):
-        raise RuntimeError("OpenViking plugin API URL and tenant API key are required for flush")
-    timeout = float(inputs.get("request_timeout_seconds", 30))
-    result = _request_json(
-        f"{base_url}/api/v1/sessions/{urllib.parse.quote(session_id, safe='')}/commit",
-        method="POST",
-        headers=headers,
-        timeout=timeout,
-        body={"keep_recent_count": 0},
+    gateway_session_key = str(
+        inputs.get("gateway_session_key")
+        or session_handle.get("gateway_session_key")
+        or f"agent:{agent_id}:explicit:{session_id}"
+    ).strip()
+    compact_timeout = max(1.0, float(inputs.get("compact_timeout_seconds", 600)))
+    result = _parse_json_output(
+        _run_openclaw(
+            "gateway",
+            "call",
+            "sessions.compact",
+            "--params",
+            json.dumps({"key": gateway_session_key}),
+            "--json",
+            "--timeout",
+            str(int(compact_timeout * 1000)),
+            timeout=compact_timeout + 30,
+        )
     )
+    if not isinstance(result, dict):
+        raise RuntimeError("OpenClaw sessions.compact returned an invalid response")
+    if result.get("compacted") is not True:
+        raise RuntimeError(
+            f"OpenClaw sessions.compact did not compact session {gateway_session_key!r}: "
+            f"{result.get('reason') or 'compacted=false'}"
+        )
     task_id = _find_first_string(result, {"task_id", "taskId"})
-    if not task_id:
-        raise RuntimeError("OpenViking plugin flush did not return a task_id")
     operation = {
-        "id": task_id,
+        "id": task_id or f"compact:{session_id}",
         "task_id": task_id,
-        "type": "memory_commit",
+        "type": "agent_compact",
         "session_id": session_id,
         "session_key": session_key,
+        "gateway_session_key": gateway_session_key,
         "agent_id": agent_id,
-        "effective_agent_id": _effective_agent_id(agent_id),
+        "state": "completed",
     }
     return _ok(
         {
             "operation": operation,
-            "accepted": True,
-            "archived": bool(result.get("archived", False)),
+            "completed": True,
+            "compacted": True,
             "task_id": task_id,
             "session_id": session_id,
+            "gateway_session_key": gateway_session_key,
+            "compact_result": result,
         },
-        state="accepted",
+        state="completed",
     )
 
 
@@ -342,12 +360,22 @@ def _wait_settle(request: dict[str, Any]) -> dict[str, Any]:
     grace = float(inputs.get("grace_seconds", os.environ.get("OPENVIKING_PLUGIN_GRACE_SECONDS", "5")))
     timeout = float(inputs.get("timeout_seconds", os.environ.get("OPENVIKING_PLUGIN_SETTLE_TIMEOUT", "600")))
     interval = max(0.5, float(inputs.get("interval_seconds", 2)))
-    base_url = _base_url()
     operation = inputs.get("operation", {})
     if not isinstance(operation, dict):
         operation = {}
     task_id = str(inputs.get("task_id") or operation.get("task_id") or operation.get("id") or "")
     agent_id = str(operation.get("agent_id") or inputs.get("agent_id") or "main")
+    if str(operation.get("state") or "").lower() in TERMINAL_SUCCESS:
+        return _ok(
+            {
+                "method": "adapter_completed",
+                "task_id": str(operation.get("task_id") or ""),
+                "backend_status": "completed",
+                "poll_count": 0,
+                "elapsed_seconds": 0.0,
+            }
+        )
+    base_url = _base_url()
     headers = _task_headers(agent_id)
     time.sleep(max(0.0, grace))
     started = time.monotonic()
@@ -487,9 +515,9 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         return _prepare(request)
     if action == "set_phase":
         return _set_phase(request)
-    if action == "flush":
+    if action in {"commit", "flush"}:
         return _flush(request)
-    if action == "wait_settle":
+    if action in {"wait_ready", "wait_settle"}:
         return _wait_settle(request)
     if action == "enter_qa":
         return _enter_qa()
