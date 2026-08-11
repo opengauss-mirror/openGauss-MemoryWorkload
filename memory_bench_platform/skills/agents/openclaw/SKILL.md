@@ -1,5 +1,12 @@
 # OpenClaw Agent Skill
 
+Agent 任务支持两种传输方式：
+
+- 配置 `OPENCLAW_GATEWAY_URL`（或显式设置 `OPENCLAW_TRANSPORT=http`）时，通过 OpenClaw Gateway 的 `/v1/responses` HTTP Body 传递完整上下文，适合 Recall 证据较大的任务。
+- 未配置 Gateway URL 时保留原有 CLI 调用，兼容已有环境。
+
+HTTP 模式可使用 `OPENCLAW_GATEWAY_TOKEN` 认证。插件的配置、Commit 和生命周期管理仍由 Memory Plugin Adapter 负责，不由本 Agent Runner 处理。
+
 负责将统一任务适配到 OpenClaw 运行时。
 
 ## 接入约束

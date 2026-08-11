@@ -2,7 +2,10 @@ import os
 
 from skills.agents.openclaw.scripts.run_task import (
     build_openclaw_command,
+    build_openclaw_http_request,
     build_openclaw_message,
+    extract_openclaw_response_text,
+    resolve_transport,
     session_id_from_key,
 )
 
@@ -77,3 +80,52 @@ def test_openclaw_runner_maps_semantic_session_key_to_stable_session_id(monkeypa
     assert cmd[cmd.index("--session-id") + 1] == session_id_from_key(
         "run-1:ingest:session-1"
     )
+
+
+def test_openclaw_http_runner_puts_large_context_in_request_body(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
+    monkeypatch.setenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:38789")
+    monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "secret-token")
+    large_context = "memory evidence\n" * 20000
+    request = {
+        "task_id": "large-context",
+        "system_prompt": "Use recalled evidence only.",
+        "messages": [{"role": "user", "content": large_context}],
+        "metadata": {
+            "agent_id": "main",
+            "session_key": "run-1:qa:q1",
+            "model": "openai/gpt-5.6-luna",
+        },
+    }
+
+    url, headers, body = build_openclaw_http_request(request)
+
+    assert resolve_transport() == "http"
+    assert url == "http://127.0.0.1:38789/v1/responses"
+    assert body["model"] == "openclaw/main"
+    assert large_context.strip() in body["input"]
+    assert len(body["input"]) > 300000
+    assert headers["X-OpenClaw-Session-Key"] == "run-1:qa:q1"
+    assert headers["X-OpenClaw-Model"] == "openai/gpt-5.6-luna"
+    assert headers["Authorization"] == "Bearer secret-token"
+
+
+def test_openclaw_runner_defaults_to_cli_without_gateway_url(monkeypatch):
+    monkeypatch.delenv("OPENCLAW_TRANSPORT", raising=False)
+    monkeypatch.delenv("OPENCLAW_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("OPENCLAW_GATEWAY_BASE_URL", raising=False)
+
+    assert resolve_transport() == "cli"
+
+
+def test_openclaw_http_runner_extracts_responses_api_text():
+    payload = {
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "answer from OpenClaw"}],
+            }
+        ]
+    }
+
+    assert extract_openclaw_response_text(payload) == "answer from OpenClaw"
