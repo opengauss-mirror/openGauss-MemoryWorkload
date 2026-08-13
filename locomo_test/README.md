@@ -4,10 +4,10 @@
 
 ## 1. 准备环境
 
-进入测试目录：
+从 MemoryWorkloadTest 仓库根目录统一安装平台和 LoCoMo 执行层：
 
 ```bash
-cd /data1/sundechao/omv2/locomo/openclaw
+cd /path/to/MemoryWorkloadTest
 ```
 
 安装依赖：
@@ -16,6 +16,10 @@ cd /data1/sundechao/omv2/locomo/openclaw
 python3 -m pip install -e .
 python3 -m locomo_test.cli --help
 ```
+
+`locomo_test` 会调用 `memory_bench_platform` 的桥接模块，因此仓库根目录是官方安装入口。
+只有在 `memory-bench-platform` 已单独安装或可从包索引获取时，才应进入
+`locomo_test` 子目录单独安装。
 
 需要提前准备：
 

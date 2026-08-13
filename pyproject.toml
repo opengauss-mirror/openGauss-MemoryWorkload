@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-workload-test"
+version = "0.1.0"
+description = "Unified installation for MemoryWorkloadTest platform and LoCoMo runner"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7",
+  "jsonschema>=4.22",
+  "PyYAML>=6.0.1",
+  "requests>=2.31",
+  "httpx>=0.27",
+  "websocket-client>=1.6",
+  "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2"]
+
+[project.scripts]
+memory-bench = "memory_bench_platform.cli:main"
+locomo-test = "locomo_test.cli:main"
+
+[tool.setuptools]
+packages = [
+  "memory_bench_platform",
+  "memory_bench_platform.adapters",
+  "memory_bench_platform.adapters.locomo",
+  "locomo_test",
+]
+
+[tool.setuptools.package-dir]
+memory_bench_platform = "memory_bench_platform/memory_bench_platform"
+locomo_test = "locomo_test/locomo_test"

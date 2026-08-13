@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from .benchmark_scenario import BenchmarkScenario, RunBinding, ScenarioQuestion, TimelineEvent
+from .evaluation_profiles import resolve_evaluation_profile
 
 
 def _slug(value: str) -> str:
@@ -265,29 +266,30 @@ def _compose_backend_direct(
                 event_slug = _slug(timeline_event.event_id)
                 flush_step_id = f"{setup_case_id}-{event_slug}-flush"
                 wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
-                if not commit_required:
-                    continue
-                steps.append(
-                    _step(
-                        flush_step_id,
-                        setup_case_id,
-                        f"flush_{timeline_event.event_id}",
-                        "memory",
-                        depends_on=[previous_step_id],
-                        timeout_seconds=30,
-                        inputs={
-                            "action": "flush",
-                            "session_id": {
-                                "$ref": f"steps.{ingest_step_id}.output.session_id"
+                readiness_operation_step_id = ingest_step_id
+                if commit_required:
+                    steps.append(
+                        _step(
+                            flush_step_id,
+                            setup_case_id,
+                            f"flush_{timeline_event.event_id}",
+                            "memory",
+                            depends_on=[previous_step_id],
+                            timeout_seconds=30,
+                            inputs={
+                                "action": "flush",
+                                "session_id": {
+                                    "$ref": f"steps.{ingest_step_id}.output.session_id"
+                                },
+                                "operation": {
+                                    "$ref": f"steps.{ingest_step_id}.output.operation"
+                                },
+                                "scope_id": scope_id,
                             },
-                            "operation": {
-                                "$ref": f"steps.{ingest_step_id}.output.operation"
-                            },
-                            "scope_id": scope_id,
-                        },
+                        )
                     )
-                )
-                previous_step_id = flush_step_id
+                    previous_step_id = flush_step_id
+                    readiness_operation_step_id = flush_step_id
                 if readiness_required:
                     steps.append(
                         _step(
@@ -295,7 +297,7 @@ def _compose_backend_direct(
                             setup_case_id,
                             f"wait_ready_{timeline_event.event_id}",
                             "poll",
-                            depends_on=[flush_step_id],
+                            depends_on=[previous_step_id],
                             timeout_seconds=600,
                             inputs={
                                 "interval_seconds": 1,
@@ -304,7 +306,7 @@ def _compose_backend_direct(
                                     "action": "status",
                                     "inputs": {
                                         "operation": {
-                                            "$ref": f"steps.{flush_step_id}.output.operation"
+                                            "$ref": f"steps.{readiness_operation_step_id}.output.operation"
                                         },
                                         "scope_id": scope_id,
                                     },
@@ -321,6 +323,8 @@ def _compose_backend_direct(
             assert evaluation is not None
             checkpoint_cases: list[str] = []
             for question_index, question in enumerate(evaluation.questions, start=1):
+                evaluation_profile = evaluation.profile or scenario.evaluation.profile
+                profile_handler = resolve_evaluation_profile(evaluation_profile)
                 case_id = _question_case_id(
                     cases,
                     sample.sample_id,
@@ -341,13 +345,9 @@ def _compose_backend_direct(
                         expected_step_id,
                         integration=binding.memory_integration,
                         case_id=case_id,
-                        judge_mode=(
-                            "external"
-                            if (evaluation.profile or scenario.evaluation.profile) == "llm_judge@1"
-                            else "builtin"
-                        ),
+                        judge_mode=profile_handler.judge_mode,
                         evaluation_target=evaluation.target,
-                        evaluation_profile=evaluation.profile or scenario.evaluation.profile,
+                        evaluation_profile=evaluation_profile,
                         evaluation_at=event.timestamp,
                     )
                 )
@@ -529,42 +529,48 @@ def _compose_agent_plugin(
                 event_slug = _slug(timeline_event.event_id)
                 commit_step_id = f"{setup_case_id}-{event_slug}-commit"
                 wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
-                if not commit_required:
-                    continue
-                steps.append(
-                    _step(
-                        commit_step_id,
-                        setup_case_id,
-                        f"commit_{timeline_event.event_id}",
-                        "memory_plugin",
-                        depends_on=[previous_step_id],
-                        inputs={
-                            "action": "commit",
-                            "session_key": session_key,
-                            "session_handle": {
-                                "$ref": f"steps.{agent_step_id}.output.session_handle"
+                readiness_operation_step_id: str | None = None
+                if commit_required:
+                    steps.append(
+                        _step(
+                            commit_step_id,
+                            setup_case_id,
+                            f"commit_{timeline_event.event_id}",
+                            "memory_plugin",
+                            depends_on=[previous_step_id],
+                            inputs={
+                                "action": "commit",
+                                "session_key": session_key,
+                                "session_handle": {
+                                    "$ref": f"steps.{agent_step_id}.output.session_handle"
+                                },
+                                "agent_id": binding.agent_runtime_id or "main",
                             },
-                            "agent_id": binding.agent_runtime_id or "main",
-                        },
+                        )
                     )
-                )
-                previous_step_id = commit_step_id
+                    previous_step_id = commit_step_id
+                    readiness_operation_step_id = commit_step_id
                 if readiness_required:
+                    wait_inputs: dict[str, Any] = {
+                        "action": "wait_ready",
+                        "session_key": session_key,
+                        "timeout_seconds": 600,
+                        "grace_seconds": 0,
+                        "interval_seconds": 2,
+                    }
+                    if readiness_operation_step_id:
+                        wait_inputs["operation"] = {
+                            "$ref": f"steps.{readiness_operation_step_id}.output.operation"
+                        }
                     steps.append(
                         _step(
                             wait_step_id,
                             setup_case_id,
                             f"wait_ready_{timeline_event.event_id}",
                             "memory_plugin",
-                            depends_on=[commit_step_id],
+                            depends_on=[previous_step_id],
                             timeout_seconds=660,
-                            inputs={
-                                "action": "wait_ready",
-                                "operation": {"$ref": f"steps.{commit_step_id}.output.operation"},
-                                "timeout_seconds": 600,
-                                "grace_seconds": 0,
-                                "interval_seconds": 2,
-                            },
+                            inputs=wait_inputs,
                         )
                     )
                     previous_step_id = wait_step_id
@@ -589,6 +595,8 @@ def _compose_agent_plugin(
                 )
             checkpoint_cases: list[str] = []
             for question_index, question in enumerate(evaluation.questions, start=1):
+                evaluation_profile = evaluation.profile or scenario.evaluation.profile
+                profile_handler = resolve_evaluation_profile(evaluation_profile)
                 case_id = _question_case_id(
                     cases,
                     sample.sample_id,
@@ -607,13 +615,9 @@ def _compose_agent_plugin(
                         agent_step_id,
                         integration=binding.memory_integration,
                         case_id=case_id,
-                        judge_mode=(
-                            "external"
-                            if (evaluation.profile or scenario.evaluation.profile) == "llm_judge@1"
-                            else "builtin"
-                        ),
+                        judge_mode=profile_handler.judge_mode,
                         evaluation_target=evaluation.target,
-                        evaluation_profile=evaluation.profile or scenario.evaluation.profile,
+                        evaluation_profile=evaluation_profile,
                         evaluation_at=event.timestamp,
                     )
                 )

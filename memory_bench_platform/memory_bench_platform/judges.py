@@ -8,6 +8,7 @@ import urllib.request
 
 from .protocol import JudgeInput, JudgeResult
 from .evaluation import extract_observation
+from .evaluation_profiles import resolve_evaluation_profile
 
 
 SYSTEM_PROMPT = "You are an expert grader that determines if answers to questions match a gold standard answer"
@@ -72,13 +73,18 @@ def run_builtin_judge(run_id: str, judge_input: JudgeInput) -> JudgeResult:
     rationale = "No agent answer extracted from step results."
     score = 0.0
 
+    profile = str(judge_input.reference.get("evaluation_profile") or "").strip() or None
+    handler = resolve_evaluation_profile(profile)
+    if handler.judge_mode != "builtin":
+        raise ValueError(f"evaluation profile {handler.profile!r} requires an external judge")
+
     if actual:
         if actual == expected:
             passed = True
             label = "exact-match"
             rationale = "Agent answer matches expected answer after normalization."
             score = 1.0
-        elif expected and expected in actual:
+        elif handler.builtin_strategy == "contains_match" and expected and expected in actual:
             passed = True
             label = "contains-match"
             rationale = "Agent answer contains expected answer after normalization."

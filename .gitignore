@@ -1,6 +1,7 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+*.egg-info/
 
 /runs/
 locomo_test/configs/env.toml

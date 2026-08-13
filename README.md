@@ -2,6 +2,14 @@
 
 `memory_bench_platform` 是一个面向记忆系统和 Agent 工作流的 benchmark 测试底座。它的核心目标不是重新实现每个 benchmark 或 Agent，而是提供统一的编排、Skill 装载、执行归档、资源采样、结果分析和 HTML 报告能力，让 LoCoMo、LongMemEval、OpenClaw、OpenViking 等不同对象可以用同一套测试入口接入和复用。
 
+仓库的官方安装入口在根目录，一次安装平台和 LoCoMo 执行层：
+
+```bash
+python3 -m pip install -e .
+memory-bench --help
+locomo-test --help
+```
+
 ## 系统定位
 
 平台定位为“中心编排器 + 双侧 Skill 插件 + 统一结果闭环”。

@@ -82,6 +82,31 @@ def test_synchronous_runtime_omits_commit_and_wait_ready():
     assert not any("wait-ready" in step["step_id"] for step in plan["steps"])
 
 
+def test_async_direct_runtime_waits_for_ingest_without_commit():
+    plan = compose_run_plan(
+        _scenario(),
+        _binding("backend_direct"),
+        {
+            "memory": {
+                "async_ingest": True,
+                "commit": {"required_after_ingest": False},
+                "readiness": {"supported": True},
+            }
+        },
+    )
+
+    assert not any(
+        step["inputs"].get("action") == "flush" for step in plan["steps"]
+    )
+    waits = [step for step in plan["steps"] if "wait-ready" in step["step_id"]]
+    assert len(waits) == 2
+    assert all(
+        ".output.operation" in step["inputs"]["probe"]["inputs"]["operation"]["$ref"]
+        and "-ingest.output.operation" in step["inputs"]["probe"]["inputs"]["operation"]["$ref"]
+        for step in waits
+    )
+
+
 def test_multi_checkpoint_plugin_reenters_ingest_after_qa():
     plan = compose_run_plan(
         _scenario(),
@@ -106,6 +131,35 @@ def test_multi_checkpoint_plugin_reenters_ingest_after_qa():
         if step["operator_kind"] == "memory_plugin" and step["inputs"].get("action") == "prepare"
     )
     assert prepare["inputs"]["scope_id"] == "run-golden:sample-1"
+
+
+def test_async_plugin_waits_without_commit():
+    plan = compose_run_plan(
+        _scenario(),
+        _binding("agent_plugin"),
+        {
+            "memory_plugin": {
+                "commit": {"required_after_ingest": False},
+                "readiness": {"supported": True},
+            }
+        },
+    )
+
+    plugin_steps = [
+        step for step in plan["steps"] if step["operator_kind"] == "memory_plugin"
+    ]
+    assert not any(step["inputs"].get("action") == "commit" for step in plugin_steps)
+    waits = [step for step in plugin_steps if step["inputs"].get("action") == "wait_ready"]
+    assert len(waits) == 2
+    assert all("operation" not in step["inputs"] for step in waits)
+    assert all(step["inputs"].get("session_key") for step in waits)
+
+
+def test_unknown_evaluation_profile_is_rejected():
+    scenario = _scenario()
+    scenario.evaluation.profile = "unknown_profile@1"
+    with pytest.raises(ValueError, match="unsupported evaluation profile"):
+        compose_run_plan(scenario, _binding("backend_direct"), {})
 
 
 def test_scenario_rejects_duplicate_episode_ids():
