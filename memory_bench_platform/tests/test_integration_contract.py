@@ -37,6 +37,11 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert judge_runtime["extractor"] == "qa_answer"
     assert judge_runtime["prompt_template"] == "evaluation/llm_judge_prompt.txt"
     assert "Gold answer: {gold_answer}" in judge_runtime["prompt_template_text"]
+    assert contract["evaluation_validity"] == {
+        "minimum_coverage": 1.0,
+        "minimum_checkpoint_ready_rate": 1.0,
+        "maximum_runtime_failure_rate": 0.0,
+    }
 
 
 def test_build_run_contract_resolves_openclaw_openviking_plugin():
@@ -75,6 +80,8 @@ def test_openviking_memory_manifest_declares_unified_runner():
 
     assert manifest.entry.runner == "scripts/run_operation.py"
     assert manifest.runtime["actions"] == ["ingest", "flush", "status", "recall"]
+    assert manifest.integration["protocol_version"] == "memory/1"
+    assert manifest.capabilities["outputs"]["recall"] == ["output.evidence_text"]
 
 
 def test_resolve_run_skill_bundle_rejects_incompatible_memory_unit(tmp_path: Path):

@@ -27,6 +27,7 @@ from .protocol import (
     RenderedTaskInput,
 )
 from .benchmark_scenario import BenchmarkScenario
+from .evaluation_profiles import resolve_evaluation_governance
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,15 @@ def build_run_contract(
             "phases": memory_plugin.phases if memory_plugin is not None else {},
         },
         "judge_runtime": judge_runtime,
+        "evaluation_validity": {
+            "minimum_coverage": float(benchmark.evaluation.get("minimum_coverage", 1.0)),
+            "minimum_checkpoint_ready_rate": float(
+                benchmark.evaluation.get("minimum_checkpoint_ready_rate", 1.0)
+            ),
+            "maximum_runtime_failure_rate": float(
+                benchmark.evaluation.get("maximum_runtime_failure_rate", 0.0)
+            ),
+        },
         "version_targets": {
             "benchmark": [target.model_dump(mode="json") for target in benchmark.version_policy.targets],
             "agent": [target.model_dump(mode="json") for target in agent.version_policy.targets],
@@ -318,7 +328,9 @@ def build_benchmark_scenario(skill_id: str, source_path: str | None = None) -> B
         raise ValueError(f"benchmark skill {skill_id} has no scenario_builder")
     args = [source_path] if source_path else []
     payload = run_json_script(_script_for_manifest(manifest_path, builder), args=args)
-    return BenchmarkScenario.model_validate(payload)
+    scenario = BenchmarkScenario.model_validate(payload)
+    resolve_evaluation_governance(manifest, scenario)
+    return scenario
 
 
 def build_cases_from_source(
@@ -359,9 +371,13 @@ def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput
     except json.JSONDecodeError as exc:
         raise ValueError(f"memory skill {skill_id} runner returned invalid JSON") from exc
     try:
-        return MemoryTaskOutput.model_validate(payload)
+        result = MemoryTaskOutput.model_validate(
+            _bind_operation_context(_normalize_runtime_error(payload), request)
+        )
     except ValidationError as exc:
         raise ValueError(f"memory skill {skill_id} runner returned invalid response") from exc
+    _validate_memory_action_output(request.action, result)
+    return result
 
 
 def run_memory_plugin_task(
@@ -380,9 +396,94 @@ def run_memory_plugin_task(
     except json.JSONDecodeError as exc:
         raise ValueError(f"memory plugin skill {skill_id} runner returned invalid JSON") from exc
     try:
-        return MemoryPluginTaskOutput.model_validate(payload)
+        result = MemoryPluginTaskOutput.model_validate(
+            _bind_operation_context(_normalize_runtime_error(payload), request)
+        )
     except ValidationError as exc:
         raise ValueError(f"memory plugin skill {skill_id} runner returned invalid response") from exc
+    _validate_memory_plugin_action_output(request.action, result)
+    return result
+
+
+def _nested_value(payload: dict[str, Any], path: str) -> Any:
+    current: Any = payload
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _normalize_runtime_error(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    if normalized.get("status") != "failed" and normalized.get("state") != "failed":
+        return normalized
+    error = normalized.get("error", {})
+    error = dict(error) if isinstance(error, dict) else {}
+    error_type = str(error.get("type") or "runtime_error")
+    error.setdefault("type", error_type)
+    error.setdefault("code", error_type.lower())
+    error.setdefault("category", "runtime")
+    error.setdefault("retryable", False)
+    error.setdefault("message", "runtime operation failed")
+    normalized["error"] = error
+    return normalized
+
+
+def _bind_operation_context(
+    payload: dict[str, Any], request: MemoryTaskInput | MemoryPluginTaskInput
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    operation = normalized.get("operation", {})
+    operation = dict(operation) if isinstance(operation, dict) else {}
+    if request.checkpoint_id:
+        operation.setdefault("checkpoint_id", request.checkpoint_id)
+    if request.scope_id:
+        operation.setdefault("scope_id", request.scope_id)
+    normalized["operation"] = operation
+    output = normalized.get("output", {})
+    output = dict(output) if isinstance(output, dict) else {}
+    nested_operation = output.get("operation")
+    if isinstance(nested_operation, dict):
+        merged = dict(nested_operation)
+        merged.update(operation)
+        output["operation"] = merged
+    normalized["output"] = output
+    return normalized
+
+
+def _require_runtime_fields(kind: str, action: str, payload: dict[str, Any], fields: set[str]) -> None:
+    missing = sorted(field for field in fields if _nested_value(payload, field) in (None, ""))
+    if missing:
+        raise ValueError(
+            f"{kind} action {action!r} returned incomplete response; missing: {', '.join(missing)}"
+        )
+
+
+def _validate_memory_action_output(action: str, result: MemoryTaskOutput) -> None:
+    if result.status != "ok":
+        return
+    required = {
+        "ingest": {"operation.session_id"},
+        "flush": {"operation.task_id"},
+        "status": {"state"},
+        "recall": {"output.evidence_text"},
+    }.get(action, set())
+    _require_runtime_fields("memory", action, result.model_dump(mode="json"), required)
+
+
+def _validate_memory_plugin_action_output(action: str, result: MemoryPluginTaskOutput) -> None:
+    if result.status != "ok":
+        return
+    required = {
+        "commit": {"operation.task_id"},
+        "flush": {"operation.task_id"},
+        "wait_ready": {"state"},
+        "wait_settle": {"state"},
+    }.get(action, set())
+    _require_runtime_fields(
+        "memory plugin", action, result.model_dump(mode="json"), required
+    )
 
 
 def score_benchmark_run(skill_id: str, run_dir: Path, source_path: str | None = None) -> dict:

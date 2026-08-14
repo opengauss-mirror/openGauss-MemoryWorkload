@@ -226,6 +226,37 @@ def test_builtin_judge_can_target_expected_step(monkeypatch, tmp_path: Path):
     assert output["judge_results"][0].passed is True
 
 
+def test_agent_response_is_normalized_to_standard_answer_field(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        "memory_bench_platform.workflow.run_agent_task",
+        lambda _skill_id, _rendered: {"status": "ok", "turns": [{"text": "tea"}]},
+    )
+    case = CaseRecord(
+        case_id="case-agent-contract",
+        run_id="run-1",
+        title="agent contract",
+        goal="answer",
+        capability="memory/question-answering",
+        reference={"expected_answer": "tea", "expected_step_id": "answer"},
+    )
+    step = StepRecord(
+        step_id="answer",
+        case_id=case.case_id,
+        name="answer",
+        operator_kind="agent",
+        inputs={"question": "preference?", "metadata": {}},
+    )
+    output = execute_cases(
+        run_id="run-1",
+        agent_id="generic-cli",
+        cases=[case],
+        steps=[step],
+        execution_spec=ExecutionSpec(),
+        run_dir=tmp_path,
+    )
+    assert output["step_results"][0].structured_output["agent_answer"] == "tea"
+
+
 def test_workflow_uses_external_llm_judge(monkeypatch, tmp_path: Path):
     def fake_run_agent_task(skill_id: str, rendered_input):
         del skill_id, rendered_input

@@ -54,6 +54,8 @@ def _request(tmp_path: Path) -> MemoryTaskInput:
             memory_id="demo-memory",
         ),
         idempotency_key="run-1:case-1:recall-step",
+        checkpoint_id="checkpoint-1",
+        scope_id="run-1:sample-1",
     )
 
 
@@ -70,6 +72,7 @@ print(json.dumps({
     "operation": {"task_id": request["task_id"]},
     "output": {
         "query": request["inputs"]["query"],
+        "evidence_text": "preferred language",
         "environment_marker": os.environ.get("MEMORY_RUNNER_TEST_MARKER"),
     },
     "metrics": [],
@@ -86,7 +89,10 @@ print(json.dumps({
     assert result.status == "ok"
     assert result.state == "completed"
     assert result.operation["task_id"] == "recall-step"
+    assert result.operation["checkpoint_id"] == "checkpoint-1"
+    assert result.operation["scope_id"] == "run-1:sample-1"
     assert result.output["query"] == "preferred language"
+    assert result.output["evidence_text"] == "preferred language"
     assert result.output["environment_marker"] == "inherited"
 
 
@@ -113,3 +119,36 @@ def test_run_memory_task_rejects_invalid_response_model(tmp_path: Path, monkeypa
 
     with pytest.raises(ValueError, match="invalid response"):
         run_memory_task("demo-memory", _request(tmp_path))
+
+
+def test_run_memory_task_rejects_missing_action_output(tmp_path: Path, monkeypatch):
+    runner = """
+import json
+print(json.dumps({
+    "status": "ok", "state": "completed", "operation": {},
+    "output": {}, "metrics": [], "artifacts": [], "error": {}
+}))
+"""
+    skills_root = _write_memory_skill(tmp_path, runner)
+    monkeypatch.setattr("memory_bench_platform.integration.SKILLS_ROOT", skills_root)
+
+    with pytest.raises(ValueError, match="output.evidence_text"):
+        run_memory_task("demo-memory", _request(tmp_path))
+
+
+def test_failed_memory_response_gets_standard_error_fields(tmp_path: Path, monkeypatch):
+    runner = """
+import json
+print(json.dumps({
+    "status": "failed", "state": "failed", "operation": {}, "output": {},
+    "metrics": [], "artifacts": [],
+    "error": {"type": "TimeoutError", "message": "not ready"}
+}))
+"""
+    skills_root = _write_memory_skill(tmp_path, runner)
+    monkeypatch.setattr("memory_bench_platform.integration.SKILLS_ROOT", skills_root)
+
+    result = run_memory_task("demo-memory", _request(tmp_path))
+    assert result.error["code"] == "timeouterror"
+    assert result.error["category"] == "runtime"
+    assert result.error["retryable"] is False

@@ -255,6 +255,7 @@ def _compose_backend_direct(
                             "timestamp": timeline_event.timestamp,
                             "occurred_at": timeline_event.timestamp,
                             "scope_id": scope_id,
+                            "checkpoint_id": event.event_id,
                         },
                     )
                 )
@@ -262,6 +263,7 @@ def _compose_backend_direct(
                 previous_step_id = ingest_step_id
 
             commit_required, readiness_required = _direct_barrier_policy(runtime_capabilities)
+            readiness_operations: list[tuple[TimelineEvent, str]] = []
             for timeline_event, ingest_step_id in ingested_events:
                 event_slug = _slug(timeline_event.event_id)
                 flush_step_id = f"{setup_case_id}-{event_slug}-flush"
@@ -285,12 +287,17 @@ def _compose_backend_direct(
                                     "$ref": f"steps.{ingest_step_id}.output.operation"
                                 },
                                 "scope_id": scope_id,
+                                "checkpoint_id": event.event_id,
                             },
                         )
                     )
                     previous_step_id = flush_step_id
                     readiness_operation_step_id = flush_step_id
-                if readiness_required:
+                readiness_operations.append((timeline_event, readiness_operation_step_id))
+            if readiness_required:
+                for timeline_event, readiness_operation_step_id in readiness_operations:
+                    event_slug = _slug(timeline_event.event_id)
+                    wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                     steps.append(
                         _step(
                             wait_step_id,
@@ -309,6 +316,7 @@ def _compose_backend_direct(
                                             "$ref": f"steps.{readiness_operation_step_id}.output.operation"
                                         },
                                         "scope_id": scope_id,
+                                        "checkpoint_id": event.event_id,
                                     },
                                 },
                                 "success_when": {"path": "state", "equals": "completed"},
@@ -363,6 +371,7 @@ def _compose_backend_direct(
                             "query": question.question,
                             "node_limit": 10,
                             "scope_id": scope_id,
+                            "checkpoint_id": event.event_id,
                             "evaluation_at": event.timestamp,
                         },
                     )
@@ -507,6 +516,7 @@ def _compose_agent_plugin(
                             "metadata": {
                                 "sample_id": sample.sample_id,
                                 "scope_id": scope_id,
+                                "checkpoint_id": event.event_id,
                                 "event_id": timeline_event.event_id,
                                 "session_key": session_key,
                                 **(
@@ -525,6 +535,7 @@ def _compose_agent_plugin(
                 previous_step_id = agent_step_id
 
             commit_required, readiness_required = _plugin_barrier_policy(runtime_capabilities)
+            readiness_operations: list[tuple[TimelineEvent, str, str | None]] = []
             for timeline_event, agent_step_id, session_key in ingested_events:
                 event_slug = _slug(timeline_event.event_id)
                 commit_step_id = f"{setup_case_id}-{event_slug}-commit"
@@ -545,15 +556,25 @@ def _compose_agent_plugin(
                                     "$ref": f"steps.{agent_step_id}.output.session_handle"
                                 },
                                 "agent_id": binding.agent_runtime_id or "main",
+                                "scope_id": scope_id,
+                                "checkpoint_id": event.event_id,
                             },
                         )
                     )
                     previous_step_id = commit_step_id
                     readiness_operation_step_id = commit_step_id
-                if readiness_required:
+                readiness_operations.append(
+                    (timeline_event, session_key, readiness_operation_step_id)
+                )
+            if readiness_required:
+                for timeline_event, session_key, readiness_operation_step_id in readiness_operations:
+                    event_slug = _slug(timeline_event.event_id)
+                    wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                     wait_inputs: dict[str, Any] = {
                         "action": "wait_ready",
                         "session_key": session_key,
+                        "scope_id": scope_id,
+                        "checkpoint_id": event.event_id,
                         "timeout_seconds": 600,
                         "grace_seconds": 0,
                         "interval_seconds": 2,

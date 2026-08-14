@@ -66,6 +66,7 @@ def run_operation(
             shutil.rmtree(temporary_home, ignore_errors=True)
 
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+    result.setdefault("protocol_version", "memory/1")
     result.setdefault("metrics", []).append(
         {"name": "memory_runner_ms", "value": elapsed_ms, "unit": "ms"}
     )
@@ -396,6 +397,7 @@ def _run_cli(
 
 def _failed_result(error_type: str, message: str, secrets: list[str]) -> dict[str, Any]:
     return {
+        "protocol_version": "memory/1",
         "status": "failed",
         "state": "failed",
         "operation": {},
@@ -404,6 +406,9 @@ def _failed_result(error_type: str, message: str, secrets: list[str]) -> dict[st
         "artifacts": [],
         "error": {
             "type": error_type,
+            "code": error_type.lower(),
+            "category": "runtime",
+            "retryable": error_type in {"TimeoutError", "command_failed"},
             "message": _sanitize(message, secrets),
         },
     }

@@ -30,7 +30,7 @@ class RunRecord(BaseModel):
     environment: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None
     ended_at: datetime | None = None
-    status: Literal["pending", "running", "passed", "failed", "partial", "stubbed"]
+    status: Literal["pending", "running", "passed", "failed", "partial", "invalid", "stubbed"]
 
 
 class CaseRecord(BaseModel):
@@ -121,6 +121,7 @@ class WorkflowRuntimeContext(BaseModel):
 
 
 class MemoryTaskInput(BaseModel):
+    protocol_version: Literal["memory/1"] = "memory/1"
     task_id: str
     action: Literal[
         "ingest",
@@ -135,9 +136,12 @@ class MemoryTaskInput(BaseModel):
     inputs: dict[str, Any] = Field(default_factory=dict)
     runtime_context: WorkflowRuntimeContext
     idempotency_key: str
+    checkpoint_id: str | None = None
+    scope_id: str | None = None
 
 
 class MemoryTaskOutput(BaseModel):
+    protocol_version: Literal["memory/1"] = "memory/1"
     status: Literal["ok", "failed"]
     state: Literal["accepted", "running", "completed", "failed"]
     operation: dict[str, Any] = Field(default_factory=dict)
@@ -148,6 +152,7 @@ class MemoryTaskOutput(BaseModel):
 
 
 class MemoryPluginTaskInput(BaseModel):
+    protocol_version: Literal["memory-plugin/1"] = "memory-plugin/1"
     task_id: str
     action: Literal[
         "validate",
@@ -163,11 +168,15 @@ class MemoryPluginTaskInput(BaseModel):
     inputs: dict[str, Any] = Field(default_factory=dict)
     runtime_context: WorkflowRuntimeContext
     idempotency_key: str
+    checkpoint_id: str | None = None
+    scope_id: str | None = None
 
 
 class MemoryPluginTaskOutput(BaseModel):
+    protocol_version: Literal["memory-plugin/1"] = "memory-plugin/1"
     status: Literal["ok", "failed"]
     state: Literal["accepted", "running", "completed", "failed"]
+    operation: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] = Field(default_factory=dict)
     metrics: list[dict[str, Any]] = Field(default_factory=list)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
@@ -223,15 +232,18 @@ class JudgeResult(BaseModel):
 
 class ReportSummary(BaseModel):
     run_id: str
-    status: Literal["pending", "running", "passed", "failed", "partial", "stubbed"]
+    status: Literal["pending", "running", "passed", "failed", "partial", "invalid", "stubbed"]
     case_total: int
     case_passed: int
     case_failed: int
     case_ungraded: int = 0
     benchmark_score: float | None = None
+    raw_benchmark_score: float | None = None
+    evaluation_coverage: float | None = None
     checkpoint_ready_rate: float | None = None
     runtime_failure_rate: float | None = None
     readiness_latency_ms: float | None = None
+    run_validity: dict[str, Any] = Field(default_factory=dict)
     resource_summary: dict[str, Any] = Field(default_factory=dict)
     category_summary: dict[str, Any] = Field(default_factory=dict)
 

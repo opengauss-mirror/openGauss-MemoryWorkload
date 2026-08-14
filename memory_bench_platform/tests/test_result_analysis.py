@@ -358,7 +358,7 @@ def test_analyze_run_preserves_partial_status_for_invalid_locomo_result(tmp_path
                 "source_id": "locomo:locomo_test_remote",
                 "source_kind": "external_benchmark_runner",
                 "agent_id": "openclaw",
-                "status": "partial",
+                "status": "invalid",
             }
         ),
         encoding="utf-8",

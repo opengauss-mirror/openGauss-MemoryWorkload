@@ -23,6 +23,7 @@ from .integration import (
     validate_benchmark,
     validate_smoke,
 )
+from .evaluation_profiles import resolve_evaluation_governance
 from .benchmark_scenario import RunBinding
 from .compatibility import resolve_compatibility
 from .composer import compose_run_plan
@@ -253,7 +254,7 @@ def _summarize_native_evaluation(
     executed_runtime = [item for item in step_results if item.status != "skipped"]
     runtime_failures = [item for item in executed_runtime if item.status == "failed"]
 
-    benchmark_score = (
+    raw_benchmark_score = (
         round(passed_cases / len(valid_results), 4)
         if valid_results
         else None
@@ -273,17 +274,61 @@ def _summarize_native_evaluation(
         if ready_latencies
         else 0.0
     )
+    evaluation_coverage = (
+        round(len(valid_results) / len(judge_results), 4) if judge_results else 0.0
+    )
     return {
         "case_total": len(judge_results),
         "case_passed": passed_cases,
         "case_failed": failed_cases,
         "case_ungraded": ungraded_cases,
-        "benchmark_score": benchmark_score,
+        "benchmark_score": raw_benchmark_score,
+        "raw_benchmark_score": raw_benchmark_score,
+        "evaluation_coverage": evaluation_coverage,
         "checkpoint_ready_rate": checkpoint_ready_rate,
         "runtime_failure_rate": runtime_failure_rate,
         "readiness_latency_ms": readiness_latency_ms,
         "checkpoints": checkpoint_rows,
     }
+
+
+def _apply_native_run_validity(summary: dict, config: dict | None = None) -> dict:
+    config = config or {}
+    minimum_coverage = float(config.get("minimum_coverage", 1.0))
+    minimum_checkpoint_ready_rate = float(
+        config.get("minimum_checkpoint_ready_rate", 1.0)
+    )
+    maximum_runtime_failure_rate = float(
+        config.get("maximum_runtime_failure_rate", 0.0)
+    )
+    reasons = []
+    if float(summary.get("evaluation_coverage", 0.0)) < minimum_coverage:
+        reasons.append("evaluation_coverage_below_minimum")
+    checkpoint_rate = summary.get("checkpoint_ready_rate")
+    if checkpoint_rate is not None and float(checkpoint_rate) < minimum_checkpoint_ready_rate:
+        reasons.append("checkpoint_ready_rate_below_minimum")
+    if float(summary.get("runtime_failure_rate", 0.0)) > maximum_runtime_failure_rate:
+        reasons.append("runtime_failure_rate_above_maximum")
+    validity = {
+        "valid": not reasons,
+        "reasons": reasons,
+        "thresholds": {
+            "minimum_coverage": minimum_coverage,
+            "minimum_checkpoint_ready_rate": minimum_checkpoint_ready_rate,
+            "maximum_runtime_failure_rate": maximum_runtime_failure_rate,
+        },
+        "observed": {
+            "evaluation_coverage": summary.get("evaluation_coverage"),
+            "checkpoint_ready_rate": checkpoint_rate,
+            "runtime_failure_rate": summary.get("runtime_failure_rate"),
+        },
+    }
+    resolved = dict(summary)
+    resolved["run_validity"] = validity
+    resolved["benchmark_score"] = (
+        resolved.get("raw_benchmark_score") if validity["valid"] else None
+    )
+    return resolved
 
 
 def _write_smoke_result(run_dir: Path, result: dict) -> None:
@@ -643,6 +688,7 @@ def main(argv: list[str] | None = None) -> None:
             memory=bundle.memory,
             memory_plugin=bundle.memory_plugin,
         )
+        evaluation_governance = resolve_evaluation_governance(bundle.benchmark, scenario)
         storage.write_json_record(
             run_dir,
             "records/benchmark_scenario.json",
@@ -667,6 +713,7 @@ def main(argv: list[str] | None = None) -> None:
             run_dir,
             "records/evaluation_profile.json",
             {
+                "governance": evaluation_governance,
                 "default": scenario.evaluation.model_dump(mode="json"),
                 "checkpoints": [
                     {
@@ -770,10 +817,14 @@ def main(argv: list[str] | None = None) -> None:
         judge_results,
         workflow_output["step_results"],
     )
-    if not judge_results or evaluation_summary["benchmark_score"] is None:
+    evaluation_summary = _apply_native_run_validity(
+        evaluation_summary, dict(run_contract.get("evaluation_validity") or {})
+    )
+    run_validity = evaluation_summary["run_validity"]
+    if not judge_results or evaluation_summary["raw_benchmark_score"] is None:
         final_status = "failed"
-    elif evaluation_summary["case_ungraded"] > 0:
-        final_status = "partial"
+    elif not run_validity["valid"]:
+        final_status = "invalid"
     else:
         final_status = (
             "passed" if evaluation_summary["case_failed"] == 0 else "partial"
@@ -828,6 +879,8 @@ def main(argv: list[str] | None = None) -> None:
         }
         for name, value in (
             ("benchmark_score", evaluation_summary["benchmark_score"]),
+            ("raw_benchmark_score", evaluation_summary["raw_benchmark_score"]),
+            ("evaluation_coverage", evaluation_summary["evaluation_coverage"]),
             ("checkpoint_ready_rate", evaluation_summary["checkpoint_ready_rate"]),
             ("runtime_failure_rate", evaluation_summary["runtime_failure_rate"]),
             ("readiness_latency_ms", evaluation_summary["readiness_latency_ms"]),
@@ -862,9 +915,12 @@ def main(argv: list[str] | None = None) -> None:
         case_failed=evaluation_summary["case_failed"],
         case_ungraded=evaluation_summary["case_ungraded"],
         benchmark_score=evaluation_summary["benchmark_score"],
+        raw_benchmark_score=evaluation_summary["raw_benchmark_score"],
+        evaluation_coverage=evaluation_summary["evaluation_coverage"],
         checkpoint_ready_rate=evaluation_summary["checkpoint_ready_rate"],
         runtime_failure_rate=evaluation_summary["runtime_failure_rate"],
         readiness_latency_ms=evaluation_summary["readiness_latency_ms"],
+        run_validity=run_validity,
         resource_summary={
             "cpu": cpu_snapshot,
             "evaluation": evaluation_summary,

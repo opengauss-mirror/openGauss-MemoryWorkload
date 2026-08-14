@@ -57,3 +57,8 @@ capabilities:
     scoped_recall: true
     isolation_level: episode
   evidence_output: true
+  outputs:
+    ingest: [operation.session_id, output.session_id]
+    flush: [operation.task_id]
+    status: [state, operation]
+    recall: [output.evidence_text]

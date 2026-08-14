@@ -60,6 +60,43 @@ def test_multi_checkpoint_direct_plan_preserves_stage_boundaries():
     assert {step["inputs"]["scope_id"] for step in scoped_steps} == {"run-golden:sample-1"}
 
 
+def test_checkpoint_barrier_finishes_all_commits_before_any_wait():
+    payload = _scenario().model_dump(mode="json")
+    payload["samples"][0]["timeline"].insert(
+        1,
+        {
+            "event_id": "session-1b",
+            "type": "conversation",
+            "payload": {"content": "The user also likes hiking."},
+        },
+    )
+    plan = compose_run_plan(
+        BenchmarkScenario.model_validate(payload),
+        _binding("backend_direct"),
+        {
+            "memory": {
+                "async_ingest": True,
+                "commit": {"required_after_ingest": True},
+                "readiness": {"supported": True},
+            }
+        },
+    )
+    first_stage = [
+        step for step in plan["steps"] if step["case_id"] == "sample-1-stage-1-setup"
+    ]
+    action_order = [
+        step["inputs"].get("action", "wait")
+        for step in first_stage
+        if step["operator_kind"] in {"memory", "poll"}
+    ]
+    assert action_order == ["ingest", "ingest", "flush", "flush", "wait", "wait"]
+    assert all(
+        step["inputs"].get("checkpoint_id") == "checkpoint-1"
+        for step in first_stage
+        if step["operator_kind"] == "memory"
+    )
+
+
 def test_synchronous_runtime_omits_commit_and_wait_ready():
     plan = compose_run_plan(
         _scenario(),

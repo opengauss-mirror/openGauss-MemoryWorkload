@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from memory_bench_platform.evaluation_profiles import resolve_evaluation_profile
+from memory_bench_platform.evaluation_profiles import (
+    EvaluationProfileHandler,
+    register_evaluation_profile,
+    resolve_evaluation_profile,
+    resolve_evaluation_governance,
+)
+from memory_bench_platform.benchmark_scenario import BenchmarkScenario
+from memory_bench_platform.integration import get_benchmark_manifest
 from memory_bench_platform.judges import run_builtin_judge
 from memory_bench_platform.protocol import JudgeInput
 
@@ -70,3 +77,49 @@ def test_external_profile_cannot_run_through_builtin_judge():
 def test_unknown_profile_is_rejected():
     with pytest.raises(ValueError, match="unsupported evaluation profile"):
         resolve_evaluation_profile("custom@99")
+
+
+def test_profile_registry_accepts_versioned_custom_handler():
+    register_evaluation_profile(
+        EvaluationProfileHandler(
+            profile="demo_semantic@1", judge_mode="external"
+        )
+    )
+    assert resolve_evaluation_profile("demo_semantic@1").judge_mode == "external"
+
+
+def test_official_benchmark_profile_rejects_silent_scenario_override():
+    manifest = get_benchmark_manifest("locomo")
+    scenario = BenchmarkScenario.model_validate(
+        {
+            "benchmark_id": "locomo",
+            "evaluation": {"target": "qa_answer", "profile": "exact_match@1"},
+            "samples": [
+                {
+                    "sample_id": "sample-1",
+                    "timeline": [
+                        {
+                            "event_id": "checkpoint-1",
+                            "type": "checkpoint",
+                            "evaluation": {
+                                "target": "qa_answer",
+                                "profile": "exact_match@1",
+                                "questions": [],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match="official benchmark profile"):
+        resolve_evaluation_governance(manifest, scenario)
+
+    scenario.metadata["evaluation_override"] = {
+        "enabled": True,
+        "reason": "ablation",
+    }
+    governance = resolve_evaluation_governance(manifest, scenario)
+    assert governance["official"] is False
+    assert governance["override_reason"] == "ablation"
+    assert governance["judge_prompt_profile"] == "locomo_qa@1"

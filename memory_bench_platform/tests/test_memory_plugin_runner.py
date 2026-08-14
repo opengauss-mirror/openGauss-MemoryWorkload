@@ -188,7 +188,7 @@ def test_plugin_flush_delegates_extraction_to_openclaw_compact(monkeypatch, tmp_
         "session_key": "run:ingest:session-1",
         "gateway_session_key": "agent:locomo-eval:explicit:session-1",
         "agent_id": "locomo-eval",
-        "state": "completed",
+        "state": "running",
     }
     assert commands[0][0][:3] == ("gateway", "call", "sessions.compact")
     assert '{"key": "agent:locomo-eval:explicit:session-1"}' in commands[0][0]
@@ -208,6 +208,36 @@ def test_plugin_wait_ready_accepts_adapter_completed_operation(monkeypatch, tmp_
     assert result["status"] == "ok"
     assert result["output"]["method"] == "adapter_completed"
     assert result["output"]["poll_count"] == 0
+
+
+def test_plugin_wait_ready_polls_compact_task_marked_running(monkeypatch, tmp_path: Path):
+    runner = _load_runner()
+    monkeypatch.setattr(runner, "_base_url", lambda: "http://ov.test")
+    monkeypatch.setattr(runner, "_task_headers", lambda _agent_id="": {"X-API-Key": "secret"})
+    monkeypatch.setattr(
+        runner,
+        "_task_status",
+        lambda *_args, **_kwargs: {"status": "completed", "result": {"memories": 1}},
+    )
+    monkeypatch.setattr(runner.time, "sleep", lambda *_args, **_kwargs: None)
+
+    result = runner.run(
+        _request(
+            tmp_path,
+            "wait_ready",
+            {
+                "operation": {
+                    "state": "running",
+                    "task_id": "task-1",
+                    "agent_id": "locomo-eval",
+                },
+                "grace_seconds": 0,
+            },
+        )
+    )
+
+    assert result["output"]["method"] == "exact_task_poll"
+    assert result["output"]["poll_count"] == 1
 
 
 def test_plugin_wait_settle_polls_exact_task(monkeypatch, tmp_path: Path):

@@ -102,9 +102,14 @@ def _ok(
     state: str = "completed",
     artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    operation = output.get("operation", {})
+    if not isinstance(operation, dict):
+        operation = {}
     return {
+        "protocol_version": "memory-plugin/1",
         "status": "ok",
         "state": state,
+        "operation": operation,
         "output": output,
         "metrics": [],
         "artifacts": artifacts or [],
@@ -324,12 +329,14 @@ def _flush(request: dict[str, Any]) -> dict[str, Any]:
         "session_key": session_key,
         "gateway_session_key": gateway_session_key,
         "agent_id": agent_id,
-        "state": "completed",
+        # sessions.compact returning only means the trigger was accepted.  When
+        # OpenViking exposes a task id, readiness must still poll that task.
+        "state": "running" if task_id else "completed",
     }
     return _ok(
         {
             "operation": operation,
-            "completed": True,
+            "completed": not bool(task_id),
             "compacted": True,
             "task_id": task_id,
             "session_id": session_id,
@@ -532,12 +539,19 @@ def main() -> None:
         result = run(request)
     except Exception as exc:
         result = {
+            "protocol_version": "memory-plugin/1",
             "status": "failed",
             "state": "failed",
             "output": {},
             "metrics": [],
             "artifacts": [],
-            "error": {"type": type(exc).__name__, "message": str(exc)},
+            "error": {
+                "type": type(exc).__name__,
+                "code": type(exc).__name__.lower(),
+                "category": "runtime",
+                "retryable": isinstance(exc, (TimeoutError, ConnectionError)),
+                "message": str(exc),
+            },
         }
     json.dump(result, sys.stdout, ensure_ascii=False)
 

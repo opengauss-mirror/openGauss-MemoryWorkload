@@ -169,7 +169,7 @@ def _summary_from_external_result(run_id: str, imported: dict[str, Any]) -> dict
     if total_questions <= 0:
         status = "failed"
     elif isinstance(run_validity, dict) and not bool(run_validity.get("valid", True)):
-        status = "partial"
+        status = "invalid"
     elif ungraded_count > 0:
         status = "partial"
     else:

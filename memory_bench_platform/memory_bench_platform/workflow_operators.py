@@ -77,7 +77,23 @@ def _execute_agent(
         else [],
         metadata=step.inputs.get("metadata", {}),
     )
-    return agent_runner(agent_id, rendered)
+    result = agent_runner(agent_id, rendered)
+    if not isinstance(result, dict):
+        raise ValueError("agent runner returned a non-object response")
+    if str(result.get("status") or "") not in {"ok", "failed"}:
+        raise ValueError("agent runner response requires status=ok|failed")
+    turns = result.get("turns", [])
+    answer = str(result.get("agent_answer") or result.get("text_output") or "").strip()
+    if not answer and isinstance(turns, list):
+        for turn in reversed(turns):
+            if isinstance(turn, dict) and turn.get("text"):
+                answer = str(turn["text"]).strip()
+                break
+    if result["status"] == "ok" and not answer:
+        raise ValueError("successful agent runner response requires a final answer text")
+    normalized = dict(result)
+    normalized["agent_answer"] = answer
+    return normalized
 
 
 def _execute_wait(step: StepRecord, sleep: Callable[[float], None]) -> dict[str, Any]:
@@ -158,6 +174,8 @@ def _execute_memory(
         inputs=inputs,
         runtime_context=runtime_context,
         idempotency_key=f"{runtime_context.run_id}:{step.case_id}:{step.step_id}",
+        checkpoint_id=str(step.inputs.get("checkpoint_id") or "") or None,
+        scope_id=str(step.inputs.get("scope_id") or "") or None,
     )
     response = memory_runner(memory_id, request)
     payload = response.model_dump(mode="json")
@@ -187,11 +205,14 @@ def _execute_memory_plugin(
         inputs=inputs,
         runtime_context=runtime_context,
         idempotency_key=f"{runtime_context.run_id}:{step.case_id}:{step.step_id}",
+        checkpoint_id=str(step.inputs.get("checkpoint_id") or "") or None,
+        scope_id=str(step.inputs.get("scope_id") or "") or None,
     )
     response = memory_plugin_runner(memory_plugin_id, request)
     payload = response.model_dump(mode="json")
     unified_output = dict(payload.get("output", {}))
     unified_output["state"] = payload["state"]
+    unified_output["operation"] = payload.get("operation", {}) or unified_output.get("operation", {})
     payload["output"] = unified_output
     if payload["status"] != "ok":
         error = payload.get("error", {})

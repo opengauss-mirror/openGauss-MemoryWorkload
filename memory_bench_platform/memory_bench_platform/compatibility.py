@@ -35,6 +35,20 @@ def _nested_bool(payload: dict[str, Any], section: str, name: str) -> bool:
     return bool(nested.get(name)) if isinstance(nested, dict) else False
 
 
+def _declared_output_fields(capabilities: dict[str, Any], action: str) -> set[str]:
+    outputs = capabilities.get("outputs", {})
+    declared = outputs.get(action, []) if isinstance(outputs, dict) else []
+    return {str(item) for item in declared if item}
+
+
+def _require_output_fields(
+    missing: list[str], capabilities: dict[str, Any], action: str, fields: set[str], prefix: str
+) -> None:
+    declared = _declared_output_fields(capabilities, action)
+    for field in sorted(fields - declared):
+        missing.append(f"{prefix}.outputs.{action}.{field}")
+
+
 def resolve_compatibility(
     scenario: BenchmarkScenario,
     binding: RunBinding,
@@ -77,7 +91,7 @@ def resolve_compatibility(
         for action in required_memory_actions:
             if action not in available_actions:
                 missing.append(f"memory.actions.{action}")
-        if "retrieval" in targets and "recall" not in available_actions:
+        if targets & {"qa_answer", "retrieval"} and "recall" not in available_actions:
             missing.append("memory.actions.recall")
         if memory is None or not memory.entry.runner:
             missing.append("memory.runner")
@@ -100,6 +114,25 @@ def resolve_compatibility(
             missing.append("memory.actions.inspect_memory")
         if "agent_action" in targets:
             missing.append("runtime.evaluation_targets.agent_action")
+        protocol_version = str((memory.integration if memory else {}).get("protocol_version") or "")
+        if protocol_version != "memory/1":
+            missing.append("memory.integration.protocol_version.memory/1")
+        if "ingest" in required_memory_actions:
+            _require_output_fields(
+                missing, memory_capabilities, "ingest", {"operation.session_id"}, "memory"
+            )
+        if commit_required:
+            _require_output_fields(
+                missing, memory_capabilities, "flush", {"operation.task_id"}, "memory"
+            )
+        if async_ingest:
+            _require_output_fields(
+                missing, memory_capabilities, "status", {"state"}, "memory"
+            )
+        if targets & {"qa_answer", "retrieval"}:
+            _require_output_fields(
+                missing, memory_capabilities, "recall", {"output.evidence_text"}, "memory"
+            )
     else:
         if memory_plugin is None:
             missing.append("memory_plugin.binding")
@@ -108,18 +141,28 @@ def resolve_compatibility(
                 missing.append("memory_plugin.agent_binding")
             if memory is None or memory_plugin.memory != memory.id:
                 missing.append("memory_plugin.memory_binding")
-            for action in ("validate", "prepare", "set_phase", "commit", "wait_ready", "finalize"):
+            for action in ("validate", "prepare", "set_phase", "finalize"):
                 if action not in plugin_actions:
                     missing.append(f"memory_plugin.lifecycle.actions.{action}")
             for phase in ("ingest", "qa"):
                 if phase not in plugin_phases:
                     missing.append(f"memory_plugin.lifecycle.phases.{phase}")
-            if not _nested_bool(plugin_capabilities, "commit", "supported"):
-                missing.append("memory_plugin.commit.supported")
-            if not _nested_bool(plugin_capabilities, "readiness", "supported"):
-                missing.append("memory_plugin.readiness.supported")
-            if not _nested_bool(plugin_capabilities, "readiness", "scoped_by_operation"):
-                missing.append("memory_plugin.readiness.scoped_by_operation")
+            plugin_commit_required = _nested_bool(
+                plugin_capabilities, "commit", "required_after_ingest"
+            )
+            plugin_readiness_supported = _nested_bool(
+                plugin_capabilities, "readiness", "supported"
+            )
+            if plugin_commit_required:
+                if not _nested_bool(plugin_capabilities, "commit", "supported"):
+                    missing.append("memory_plugin.commit.supported")
+                if "commit" not in plugin_actions:
+                    missing.append("memory_plugin.lifecycle.actions.commit")
+            if plugin_readiness_supported:
+                if "wait_ready" not in plugin_actions:
+                    missing.append("memory_plugin.lifecycle.actions.wait_ready")
+                if not _nested_bool(plugin_capabilities, "readiness", "scoped_by_operation"):
+                    missing.append("memory_plugin.readiness.scoped_by_operation")
             if not plugin_capabilities.get("namespace_isolation"):
                 missing.append("memory_plugin.namespace_isolation")
             if "qa_answer" in targets and not plugin_capabilities.get("qa_read_only"):
@@ -128,6 +171,24 @@ def resolve_compatibility(
                 missing.append("memory_plugin.auto_capture")
             if "recall" in required_memory_actions and not plugin_capabilities.get("auto_recall"):
                 missing.append("memory_plugin.auto_recall")
+            if str(memory_plugin.integration.get("protocol_version") or "") != "memory-plugin/1":
+                missing.append("memory_plugin.integration.protocol_version.memory-plugin/1")
+            if plugin_commit_required:
+                _require_output_fields(
+                    missing,
+                    plugin_capabilities,
+                    "commit",
+                    {"operation.task_id"},
+                    "memory_plugin",
+                )
+            if plugin_readiness_supported:
+                _require_output_fields(
+                    missing,
+                    plugin_capabilities,
+                    "wait_ready",
+                    {"state"},
+                    "memory_plugin",
+                )
         unsupported_plugin_targets = targets - {"qa_answer"}
         for target in sorted(unsupported_plugin_targets):
             missing.append(f"memory_plugin.evaluation_targets.{target}")

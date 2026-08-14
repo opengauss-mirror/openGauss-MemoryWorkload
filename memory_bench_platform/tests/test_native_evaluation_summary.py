@@ -1,4 +1,4 @@
-from memory_bench_platform.cli import _summarize_native_evaluation
+from memory_bench_platform.cli import _apply_native_run_validity, _summarize_native_evaluation
 from memory_bench_platform.protocol import CaseRecord, JudgeResult, StepRecord, StepResultRecord
 
 
@@ -65,5 +65,27 @@ def test_summary_excludes_ungraded_judge_failures_from_benchmark_score():
     assert summary["case_failed"] == 0
     assert summary["case_ungraded"] == 1
     assert summary["benchmark_score"] == 1.0
+    assert summary["raw_benchmark_score"] == 1.0
+    assert summary["evaluation_coverage"] == 0.5
     assert summary["checkpoint_ready_rate"] == 1.0
     assert summary["readiness_latency_ms"] == 125.0
+
+    invalid = _apply_native_run_validity(summary)
+    assert invalid["run_validity"]["valid"] is False
+    assert invalid["run_validity"]["reasons"] == [
+        "evaluation_coverage_below_minimum"
+    ]
+    assert invalid["benchmark_score"] is None
+    assert invalid["raw_benchmark_score"] == 1.0
+
+
+def test_validity_thresholds_can_explicitly_allow_partial_coverage():
+    summary = {
+        "raw_benchmark_score": 1.0,
+        "evaluation_coverage": 0.5,
+        "checkpoint_ready_rate": 1.0,
+        "runtime_failure_rate": 0.0,
+    }
+    resolved = _apply_native_run_validity(summary, {"minimum_coverage": 0.5})
+    assert resolved["run_validity"]["valid"] is True
+    assert resolved["benchmark_score"] == 1.0

@@ -79,7 +79,7 @@ def test_composer_builds_backend_direct_workflow(tmp_path: Path):
         "conv-1-q1",
     ]
     assert [step["operator_kind"] for step in payload["steps"]] == [
-        "memory", "memory", "memory", "poll", "memory", "poll", "memory", "agent"
+        "memory", "memory", "memory", "memory", "poll", "poll", "memory", "agent"
     ]
     assert [
         step["inputs"].get("action")
@@ -110,8 +110,8 @@ def test_composer_builds_agent_plugin_workflow_with_generic_actions(tmp_path: Pa
         "prepare",
         "set_phase",
         "commit",
-        "wait_ready",
         "commit",
+        "wait_ready",
         "wait_ready",
         "set_phase",
     ]

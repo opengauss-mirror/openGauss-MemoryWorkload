@@ -330,6 +330,19 @@ flowchart LR
 
 Memory/Plugin Runtime 应尽量返回 `operation_id`、`checkpoint_token` 或等价的可追踪凭证。`wait_ready` 应针对本阶段凭证确认完成，不使用无法归属到具体写入批次的固定 sleep。
 
+一个 checkpoint 可以包含多个 ingest operation。统一执行粒度为：
+
+```text
+本阶段全部 ingest
+  → 对需要提交的 operation 全部 commit/flush
+  → 对需要等待的 operation 全部 wait_ready
+  → 所有 operation ready 后进入 Evaluation
+```
+
+Adapter 可以提供真正的批量 commit，也可以保留每个 Session 一个 operation；后一种情况下 Composer 负责按上述三段式顺序编排，并把所有 operation 归属于同一个 `checkpoint_id`。禁止恢复为“ingest 一个、commit 并等待一个、再 ingest 下一个”的交错顺序，因为它会改变同一阶段内的抽取边界和性能口径。
+
+`memory/1` 和 `memory-plugin/1` 首版不要求 Runtime 伪造单一 checkpoint token。平台以共享的 `checkpoint_id` 聚合本阶段 `operations[]`，当所有 operation 均进入 `completed` 时，该 checkpoint 才视为 ready。若 Runtime 原生提供批次 token，可放在 `operation.checkpoint_token` 中，但其语义必须是“本批次全部写入可查询”，不能只是请求已接受。
+
 如果到达超时仍未确认可查询，当前 checkpoint 标记为 `runtime_not_ready`，不把错误答案计入 Benchmark 准确率；报告单独统计准备失败率和等待耗时。
 
 第一阶段至少支持以下 Evaluation Target：
@@ -371,6 +384,11 @@ capabilities:
     supported: true
     scoped_by_operation: true
   evidence_output: true
+  outputs:
+    ingest: [operation.session_id]
+    flush: [operation.task_id]
+    status: [state]
+    recall: [output.evidence_text]
 ```
 
 Memory Plugin Manifest 建议增加：
@@ -389,6 +407,9 @@ capabilities:
     supported: true
     scoped_by_operation: true
   qa_read_only: true
+  outputs:
+    commit: [operation.task_id]
+    wait_ready: [state]
 
 lifecycle:
   phases: [ingest, qa]
@@ -400,6 +421,37 @@ lifecycle:
 - OpenViking 插件可以将 `commit` 映射到 compact/commit，将 `wait_ready` 映射到按 task ID 轮询。
 - 同步 Memory 可以声明 `required_after_ingest=false`、`async_ingest=false`，Composer 直接省略这两个步骤。
 - 旧 Runner 内部仍可暂时接受 `flush`、`wait_settle`，由 Runtime Adapter 做协议映射；Benchmark Scenario 不出现这些实现名称。
+
+### 8.1 版本化 Action Envelope
+
+Memory 请求统一包含：
+
+```json
+{
+  "protocol_version": "memory/1",
+  "task_id": "step-id",
+  "action": "ingest|flush|status|recall|inspect_memory",
+  "inputs": {},
+  "runtime_context": {},
+  "idempotency_key": "run:case:step",
+  "checkpoint_id": "checkpoint-1",
+  "scope_id": "run:episode"
+}
+```
+
+Memory Plugin 使用同构 envelope，`protocol_version` 为 `memory-plugin/1`。响应统一包含 `protocol_version`、`status`、`state`、`operation`、`output`、`metrics`、`artifacts` 和 `error`。`state` 仅使用 `accepted|running|completed|failed`；失败响应的 `error` 至少包含 `type`、`code`、`category`、`retryable` 和 `message`。平台可以为旧 Adapter 补齐默认分类，但新 Adapter 必须原生返回完整结构。
+
+原子操作的最低输出契约为：
+
+| Action | 必须字段 |
+|---|---|
+| `ingest` | `operation.session_id` |
+| `flush/commit` | `operation.task_id` |
+| `status/wait_ready` | `state` |
+| `recall` | `output.evidence_text` |
+| Agent `run_task` | `status`、最终回答文本（规范化后为 `agent_answer`） |
+
+Compatibility 根据 Manifest 的 `capabilities.outputs` 做运行前检查，Runner 对实际响应做运行时校验。Manifest 声明与真实响应任一不满足，都不得进入后续步骤。
 
 第一阶段继续复用现有 Runner：
 
@@ -422,7 +474,7 @@ runtime:
   memory_integration: agent_plugin
 
 evaluation:
-  profile: llm_judge@1
+  # Run Binding 不覆盖 Benchmark 的官方评分配置。
 
 isolation:
   namespace: run-id
@@ -564,8 +616,9 @@ evaluation:
 - `exact_match@1`
 - `classification@1`
 - `llm_judge@1`
-- `retrieval_ranking@1`
-- `custom@1`
+- `retrieval@1`（基于 `evidence_text` 的证据包含判断）
+
+自定义评分不得使用一个语义不明的通用 `custom@1`。平台扩展必须通过 Evaluation Handler Registry 注册唯一、版本化的 Profile 名称；Benchmark 官方 scorer 也可以继续作为独立入口，但必须返回相同 Metric Envelope。未知 Profile 在 Composer 阶段直接失败。
 
 评分统一返回 Metric Envelope：
 
@@ -586,6 +639,22 @@ evaluation:
 ```
 
 正式评分不得静默降级。例如 LLM Judge 配置缺失或调用失败时，应将评分标记为无效，不能自动切换为字符串包含判断。
+
+这里区分两类配置：
+
+- **Evaluation Profile**：位于 `benchmark.evaluation.profile` 或 Scenario checkpoint 中，例如 `llm_judge@1`、`exact_match@1`，决定使用哪类评分 Handler。
+- **Judge Prompt Profile**：位于 `benchmark.judging.profile`，例如 `locomo_qa@1`、`longmemeval_qa@1`，决定外部 LLM Judge 使用的官方提示词语义。
+
+Benchmark Manifest 固定官方 Evaluation Profile、Target、Judge Prompt Profile 和有效性阈值。Scenario 默认必须与官方配置一致。若实验需要覆盖，Scenario 必须声明：
+
+```yaml
+metadata:
+  evaluation_override:
+    enabled: true
+    reason: "研究不同评分策略的消融实验"
+```
+
+覆盖后的结果标记为 `unofficial`，并在 `records/evaluation_profile.json` 同时记录官方值、实际值和覆盖原因。Run Binding 不提供静默覆盖官方评分的入口。
 
 ## 13. 验证与 Golden Test
 
@@ -653,12 +722,25 @@ Benchmark 数据映射
 
 报告至少分开统计：
 
-- `benchmark_score`：仅对实际完成评测的题目计算。
+- `raw_benchmark_score`：仅对实际完成评测的题目计算，用于诊断。
+- `benchmark_score`：仅当整个 run 满足有效性规则时发布的正式分数。
+- `evaluation_coverage`：实际完成评分题数 / 应评分题数。
 - `checkpoint_ready_rate`：进入评测前成功达到可查询状态的 checkpoint 比例。
 - `runtime_failure_rate`：写入、commit、等待或调用失败比例。
 - `readiness_latency`：从阶段写入结束到确认可查询的耗时。
 
 不得用“未落盘导致未作答”的结果拉低或抬高 Benchmark 准确率；总报告同时展示覆盖题数，避免只报告成功子集造成误导。
+
+Benchmark Manifest 必须声明或接受以下默认严格阈值：
+
+```yaml
+evaluation:
+  minimum_coverage: 1.0
+  minimum_checkpoint_ready_rate: 1.0
+  maximum_runtime_failure_rate: 0.0
+```
+
+低于阈值时 run 状态为 `invalid`，`benchmark_score` 为 null，但保留 `raw_benchmark_score` 和完整诊断。题目本身存在正确与错误、且运行有效时，状态可以是 `partial`；`partial` 不能用于表示覆盖率或 Runtime 可靠性不足。
 
 ## 15. 代码改动范围
 

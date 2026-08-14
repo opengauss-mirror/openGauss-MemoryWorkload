@@ -59,3 +59,6 @@ evaluation:
   target: qa_answer
   profile: llm_judge@1
   primary_metric: accuracy
+  minimum_coverage: 1.0
+  minimum_checkpoint_ready_rate: 1.0
+  maximum_runtime_failure_rate: 0.0

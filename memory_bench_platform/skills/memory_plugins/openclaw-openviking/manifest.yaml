@@ -31,6 +31,9 @@ capabilities:
   readiness:
     supported: true
     scoped_by_operation: true
+  outputs:
+    commit: [operation.task_id]
+    wait_ready: [state]
 phases:
   ingest:
     capture: true
