@@ -5,6 +5,7 @@ from typing import Any
 
 from .benchmark_scenario import BenchmarkScenario, RunBinding, ScenarioQuestion, TimelineEvent
 from .evaluation_profiles import resolve_evaluation_profile
+from .evaluation_targets import resolve_evaluation_target
 
 
 def _slug(value: str) -> str:
@@ -329,6 +330,12 @@ def _compose_backend_direct(
 
             evaluation = event.evaluation
             assert evaluation is not None
+            target_contract = resolve_evaluation_target(evaluation.target)
+            if not target_contract.supports(binding.memory_integration):
+                raise ValueError(
+                    "backend_direct composer does not support evaluation target "
+                    f"{evaluation.target!r}"
+                )
             checkpoint_cases: list[str] = []
             for question_index, question in enumerate(evaluation.questions, start=1):
                 evaluation_profile = evaluation.profile or scenario.evaluation.profile
@@ -414,10 +421,6 @@ def _compose_backend_direct(
                                 },
                             },
                         )
-                    )
-                elif evaluation.target != "retrieval":
-                    raise ValueError(
-                        f"backend_direct composer does not yet support target {evaluation.target!r}"
                     )
             previous_checkpoint_cases = checkpoint_cases or [setup_case_id]
     return cases, steps
@@ -610,9 +613,11 @@ def _compose_agent_plugin(
 
             evaluation = event.evaluation
             assert evaluation is not None
-            if evaluation.target != "qa_answer":
+            target_contract = resolve_evaluation_target(evaluation.target)
+            if not target_contract.supports(binding.memory_integration):
                 raise ValueError(
-                    f"agent_plugin composer does not yet support target {evaluation.target!r}"
+                    "agent_plugin composer does not support evaluation target "
+                    f"{evaluation.target!r}"
                 )
             checkpoint_cases: list[str] = []
             for question_index, question in enumerate(evaluation.questions, start=1):

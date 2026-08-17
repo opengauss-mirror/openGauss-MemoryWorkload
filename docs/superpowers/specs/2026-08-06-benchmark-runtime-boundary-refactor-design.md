@@ -353,6 +353,12 @@ Adapter 可以提供真正的批量 commit，也可以保留每个 Session 一�
 - `memory_update`：评价记忆更新与冲突处理。
 - `agent_action`：评价 Agent 行动或任务完成结果。
 
+Scenario 词汇允许声明上述 Target，不代表当前 Composer 已经实现对应执行链路。
+平台以统一的 Evaluation Target Contract 同时驱动 Compatibility 和 Composer；只有
+`backend_direct: qa_answer/retrieval` 与 `agent_plugin: qa_answer` 在第一阶段可执行。
+`memory_extraction`、`memory_update` 和 `agent_action` 在对应 Composer、输出提取器与
+Scorer 完成前必须由 Compatibility 明确拒绝，禁止出现“预检 compatible、编排失败”。
+
 ## 8. Runtime Capabilities 协议
 
 Agent Manifest 建议增加：
@@ -557,6 +563,11 @@ Composer 按 `timeline` 顺序生成步骤依赖图，而不是为所有 Benchma
   plugin.finalize
 ```
 
+`plugin.finalize` 是正式 Runtime 生命周期操作，即使主 Workflow 失败也必须执行。
+其结果进入 `StepResult`、Trace 和 Runtime failure 统计。若 finalize 返回失败或抛出
+异常，平台保留已完成题目的 `raw_benchmark_score`，但 Run 标记为 `invalid` 且
+`benchmark_score` 为 null，避免配置未恢复的运行被发布为正式结果或污染后续 Run。
+
 Composer 只使用标准协议 action，不包含 `openclaw` 或 `openviking` ID 判断。
 
 其中 `backend_direct` 的 `ingest` 只负责写入，不能隐式包含抽取和落盘；`flush` 才表达“让本阶段记忆达到可查询状态”。`agent_plugin` 的抽取触发必须留在 Agent-Memory Adapter 内，例如 OpenClaw + OpenViking 将 `plugin.commit` 映射为 OpenClaw 原生 `sessions.compact`，Runtime 不直接调用 OpenViking Commit API。
@@ -741,6 +752,23 @@ evaluation:
 ```
 
 低于阈值时 run 状态为 `invalid`，`benchmark_score` 为 null，但保留 `raw_benchmark_score` 和完整诊断。题目本身存在正确与错误、且运行有效时，状态可以是 `partial`；`partial` 不能用于表示覆盖率或 Runtime 可靠性不足。
+
+### 14.1 Run 终结与失败归档
+
+Run 创建并写入 `running` 后，Scenario Builder、Evaluation Governance、Compatibility、
+Composer、Run Plan 校验和 Runtime 执行均进入统一失败闭环。任一阶段异常时必须：
+
+```text
+写 records/run_error.json
+  → 写 traceback 日志
+  → 设置 run.status=failed/invalid
+  → 设置 ended_at
+  → 写最小 summary 和空 case_results
+  → CLI 返回非零状态
+```
+
+数据或实现异常使用 `failed`；已知的 Evaluation Governance 或 Compatibility 不满足
+使用 `invalid`。不得留下已经退出但 `run.json` 仍为 `running` 的运行记录。
 
 ## 15. 代码改动范围
 

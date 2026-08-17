@@ -159,3 +159,31 @@ def test_backend_direct_qa_requires_recall_even_when_scenario_omits_action():
 
     assert result.compatible is False
     assert "memory.actions.recall" in result.missing_capabilities
+
+
+def test_backend_direct_rejects_inspection_target_until_composer_supports_it():
+    bundle = resolve_run_skill_bundle("locomo", "openclaw", "openviking", "backend_direct")
+    scenario = _scenario()
+    checkpoint = scenario.samples[0].timeline[-1]
+    assert checkpoint.evaluation is not None
+    checkpoint.evaluation.target = "memory_extraction"
+    memory = bundle.memory.model_copy(deep=True)
+    memory.capabilities["actions"].append("inspect_memory")
+    memory.runtime["actions"].append("inspect_memory")
+
+    result = resolve_compatibility(
+        scenario,
+        RunBinding(
+            benchmark_id="demo",
+            agent_id="openclaw",
+            memory_id="openviking",
+            memory_integration="backend_direct",
+            run_id="run-1",
+        ),
+        agent=bundle.agent,
+        memory=memory,
+        memory_plugin=None,
+    )
+
+    assert result.compatible is False
+    assert "runtime.evaluation_targets.memory_extraction" in result.missing_capabilities

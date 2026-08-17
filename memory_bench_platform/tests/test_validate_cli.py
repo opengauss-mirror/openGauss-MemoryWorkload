@@ -1,10 +1,14 @@
 import json
+from pathlib import Path
 
 from memory_bench_platform.cli import main
 
 
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "locomo_minimal.json"
+
+
 def test_validate_cli_returns_locomo_benchmark_status(capsys):
-    main(["validate", "--benchmark", "locomo"])
+    main(["validate", "--benchmark", "locomo", "--data-path", str(FIXTURE)])
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert payload["benchmark"]["status"] == "ok"
@@ -19,7 +23,17 @@ def test_validate_cli_returns_generic_cli_agent_status(capsys):
 
 
 def test_validate_cli_emits_run_contract_when_benchmark_and_agent_are_provided(capsys):
-    main(["validate", "--benchmark", "locomo", "--agent", "openclaw"])
+    main(
+        [
+            "validate",
+            "--benchmark",
+            "locomo",
+            "--agent",
+            "openclaw",
+            "--data-path",
+            str(FIXTURE),
+        ]
+    )
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert payload["run_contract"]["selection"]["benchmark_id"] == "locomo"

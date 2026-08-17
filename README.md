@@ -505,12 +505,15 @@ version_policy:
 常用轻量检查：
 
 ```bash
-cd /mnt/d/code/Agent/test/memory_bench_platform
+cd /path/to/openGauss-MemoryWorkload/memory_bench_platform
 PYTHONPATH=. python3 -m memory_bench_platform.cli list-skills
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --benchmark locomo
+PYTHONPATH=. python3 -m memory_bench_platform.cli validate \
+  --benchmark locomo \
+  --data-path /path/to/locomo.json
 PYTHONPATH=. python3 -m memory_bench_platform.cli validate --agent openclaw
 PYTHONPATH=. python3 -m memory_bench_platform.cli validate --smoke locomo-openclaw-openviking-minimal
 PYTHONPATH=. pytest -q
 ```
 
-如果从仓库根目录运行测试，注意 `PYTHONPATH` 和工作目录会影响 Skill 路径解析。平台测试建议优先从 `/mnt/d/code/Agent/test/memory_bench_platform` 执行。
+测试文件通过项目路径定位 Skill、工具脚本和 Fixture，不依赖特定机器上的绝对路径。
+LoCoMo 数据不随测试包隐式提供，验证和正式运行时应显式传入 `--data-path`。

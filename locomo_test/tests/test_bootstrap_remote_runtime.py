@@ -61,7 +61,7 @@ def test_bootstrap_runtime_writes_openviking_identity_config(tmp_path):
     assert plugin_cfg["apiKey"] == "root-key"
     assert plugin_cfg["accountId"] == "acct-mini-run"
     assert plugin_cfg["userId"] == "eval-1"
-    assert plugin_cfg["agent_prefix"] == "acct-mini-run"
+    assert "agent_prefix" not in plugin_cfg
     assert plugin_cfg["autoRecall"] is False
     assert plugin_cfg["autoCapture"] is True
     assert plugin_cfg["bypassSessionPatterns"] == ["qa-*"]

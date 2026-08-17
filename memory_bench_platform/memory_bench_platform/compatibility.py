@@ -5,6 +5,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .benchmark_scenario import BenchmarkScenario, RunBinding
+from .evaluation_targets import (
+    required_memory_actions_for_targets,
+    unsupported_evaluation_targets,
+)
 from .manifests import AgentManifest, MemoryManifest, MemoryPluginManifest
 
 
@@ -88,11 +92,18 @@ def resolve_compatibility(
     plugin_phases = _declared_actions({"actions": plugin_lifecycle.get("phases", [])})
 
     if binding.memory_integration == "backend_direct":
+        for target in sorted(
+            unsupported_evaluation_targets(targets, binding.memory_integration)
+        ):
+            missing.append(f"runtime.evaluation_targets.{target}")
         for action in required_memory_actions:
             if action not in available_actions:
                 missing.append(f"memory.actions.{action}")
-        if targets & {"qa_answer", "retrieval"} and "recall" not in available_actions:
-            missing.append("memory.actions.recall")
+        for action in sorted(
+            required_memory_actions_for_targets(targets, binding.memory_integration)
+        ):
+            if action not in available_actions:
+                missing.append(f"memory.actions.{action}")
         if memory is None or not memory.entry.runner:
             missing.append("memory.runner")
         if not _nested_bool(memory_capabilities, "scope", "supported"):
@@ -110,10 +121,6 @@ def resolve_compatibility(
                 missing.append("memory.readiness.supported")
             if not _nested_bool(memory_capabilities, "readiness", "scoped_by_operation"):
                 missing.append("memory.readiness.scoped_by_operation")
-        if targets & {"memory_extraction", "memory_update"} and "inspect_memory" not in available_actions:
-            missing.append("memory.actions.inspect_memory")
-        if "agent_action" in targets:
-            missing.append("runtime.evaluation_targets.agent_action")
         protocol_version = str((memory.integration if memory else {}).get("protocol_version") or "")
         if protocol_version != "memory/1":
             missing.append("memory.integration.protocol_version.memory/1")
@@ -189,7 +196,9 @@ def resolve_compatibility(
                     {"state"},
                     "memory_plugin",
                 )
-        unsupported_plugin_targets = targets - {"qa_answer"}
+        unsupported_plugin_targets = unsupported_evaluation_targets(
+            targets, binding.memory_integration
+        )
         for target in sorted(unsupported_plugin_targets):
             missing.append(f"memory_plugin.evaluation_targets.{target}")
 

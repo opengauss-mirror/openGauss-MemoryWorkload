@@ -2,7 +2,10 @@ from pathlib import Path
 
 
 def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
-    script = Path("/mnt/d/code/Agent/test/tools/test_entrypoints/run_locomo_test_remote.sh")
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "tools/test_entrypoints/run_locomo_test_remote.sh"
+    )
     text = script.read_text(encoding="utf-8")
 
     assert 'OUTPUT_DIR="${OUTPUT_DIR:-}"' in text

@@ -2,7 +2,10 @@ from pathlib import Path
 
 
 def test_official_locomo_small_uses_shared_remote_lock_and_process_guard():
-    script = Path("/mnt/d/code/Agent/test/tools/test_entrypoints/run_official_locomo_small.sh")
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "tools/test_entrypoints/run_official_locomo_small.sh"
+    )
     text = script.read_text(encoding="utf-8")
 
     assert 'LOCK_FILE="\\$LOCK_DIR/locomo_eval.lock"' in text

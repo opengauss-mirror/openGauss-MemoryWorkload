@@ -4,6 +4,9 @@ import json
 from memory_bench_platform.cli import main
 
 
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "locomo_minimal.json"
+
+
 def test_stub_run_creates_run_json_and_summary(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -29,6 +32,8 @@ def test_stub_run_creates_run_json_and_summary(tmp_path: Path, monkeypatch):
             "locomo",
             "--agent",
             "openclaw",
+            "--data-path",
+            str(FIXTURE),
         ]
     )
     runs = list((tmp_path / "runs").glob("*"))

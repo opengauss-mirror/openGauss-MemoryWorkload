@@ -1,22 +1,28 @@
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PLATFORM_ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_readme_mentions_mvp_matrix():
-    text = Path("README.md").read_text(encoding="utf-8")
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "LoCoMo" in text
     assert "LongMemEval" in text
     assert "OpenClaw" in text
     assert "Generic CLI Agent" in text
-    assert "Result Analysis" in text
-    assert "latest official release tag" in text
-    assert "explicitly requests an allowed override" in text
-    assert "concrete runtime version" in text
-    assert "records/version_selection.json" in text
+    assert "结果分析" in text
+    assert "latest_official_release_tag" in text
+    assert "allowed_overrides" in text
+    assert "实际运行时观测到的软件版本" in text
+    assert "version_selection.json" in text
     assert "locomo_test_remote" in text
 
 
 def test_architecture_doc_mentions_version_policy():
-    text = Path("../docs/memory-benchmark-platform-architecture.md").read_text(encoding="utf-8")
+    text = (REPO_ROOT / "docs/memory-benchmark-platform-architecture.md").read_text(
+        encoding="utf-8"
+    )
     assert "latest_official_release_tag" in text
     assert "version_policy" in text
     assert "resolution_order" in text
@@ -30,9 +36,9 @@ def test_architecture_doc_mentions_version_policy():
 
 def test_ovtest_skill_docs_mention_latest_release_tag_policy():
     for path in [
-        Path("skills/benchmarks/ovtest-memory/SKILL.md"),
-        Path("skills/benchmarks/ovtest-health/SKILL.md"),
-        Path("skills/benchmarks/ovtest-admin-memory/SKILL.md"),
+        PLATFORM_ROOT / "skills/benchmarks/ovtest-memory/SKILL.md",
+        PLATFORM_ROOT / "skills/benchmarks/ovtest-health/SKILL.md",
+        PLATFORM_ROOT / "skills/benchmarks/ovtest-admin-memory/SKILL.md",
     ]:
         text = path.read_text(encoding="utf-8")
         assert "latest_official_release_tag" in text
@@ -42,11 +48,11 @@ def test_ovtest_skill_docs_mention_latest_release_tag_policy():
 
 def test_agent_and_benchmark_skill_docs_require_upstream_for_latest_tag_policy():
     for path in [
-        Path("skills/agents/openclaw/SKILL.md"),
-        Path("skills/agents/hermes/SKILL.md"),
-        Path("skills/agents/generic-cli/SKILL.md"),
-        Path("skills/benchmarks/locomo/SKILL.md"),
-        Path("skills/benchmarks/longmemeval/SKILL.md"),
+        PLATFORM_ROOT / "skills/agents/openclaw/SKILL.md",
+        PLATFORM_ROOT / "skills/agents/hermes/SKILL.md",
+        PLATFORM_ROOT / "skills/agents/generic-cli/SKILL.md",
+        PLATFORM_ROOT / "skills/benchmarks/locomo/SKILL.md",
+        PLATFORM_ROOT / "skills/benchmarks/longmemeval/SKILL.md",
     ]:
         text = path.read_text(encoding="utf-8")
         assert "latest_official_release_tag" in text
@@ -56,6 +62,8 @@ def test_agent_and_benchmark_skill_docs_require_upstream_for_latest_tag_policy()
 
 
 def test_locomo_skill_doc_mentions_locomo_test_as_platform_derived_entrypoint():
-    text = Path("skills/benchmarks/locomo/SKILL.md").read_text(encoding="utf-8")
+    text = (PLATFORM_ROOT / "skills/benchmarks/locomo/SKILL.md").read_text(
+        encoding="utf-8"
+    )
     assert "locomo_test_remote" in text
     assert "memory_bench_platform" in text

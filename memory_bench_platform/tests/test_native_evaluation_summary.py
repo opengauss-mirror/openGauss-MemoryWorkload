@@ -89,3 +89,22 @@ def test_validity_thresholds_can_explicitly_allow_partial_coverage():
     resolved = _apply_native_run_validity(summary, {"minimum_coverage": 0.5})
     assert resolved["run_validity"]["valid"] is True
     assert resolved["benchmark_score"] == 1.0
+
+
+def test_finalize_failure_invalidates_an_otherwise_valid_score():
+    summary = {
+        "raw_benchmark_score": 1.0,
+        "evaluation_coverage": 1.0,
+        "checkpoint_ready_rate": 1.0,
+        "runtime_failure_rate": 0.1,
+    }
+
+    resolved = _apply_native_run_validity(
+        summary,
+        additional_reasons=["memory_plugin_finalize_failed"],
+    )
+
+    assert resolved["run_validity"]["valid"] is False
+    assert resolved["benchmark_score"] is None
+    assert "runtime_failure_rate_above_maximum" in resolved["run_validity"]["reasons"]
+    assert "memory_plugin_finalize_failed" in resolved["run_validity"]["reasons"]

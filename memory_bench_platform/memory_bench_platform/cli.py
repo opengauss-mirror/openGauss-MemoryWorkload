@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime
 import os
 from pathlib import Path
+import traceback
 
 from .backends import validate_openviking_source
 from .external_report_import import import_external_result
@@ -34,9 +35,12 @@ from .protocol import (
     CaseRecord,
     ExecutionSpec,
     MemoryPluginTaskInput,
+    MetricRecord,
     ReportSummary,
     RunRecord,
     StepRecord,
+    StepResultRecord,
+    TraceEventRecord,
     WorkflowRuntimeContext,
 )
 from .result_analysis import analyze_run
@@ -292,7 +296,11 @@ def _summarize_native_evaluation(
     }
 
 
-def _apply_native_run_validity(summary: dict, config: dict | None = None) -> dict:
+def _apply_native_run_validity(
+    summary: dict,
+    config: dict | None = None,
+    additional_reasons: list[str] | None = None,
+) -> dict:
     config = config or {}
     minimum_coverage = float(config.get("minimum_coverage", 1.0))
     minimum_checkpoint_ready_rate = float(
@@ -309,6 +317,9 @@ def _apply_native_run_validity(summary: dict, config: dict | None = None) -> dic
         reasons.append("checkpoint_ready_rate_below_minimum")
     if float(summary.get("runtime_failure_rate", 0.0)) > maximum_runtime_failure_rate:
         reasons.append("runtime_failure_rate_above_maximum")
+    for reason in additional_reasons or []:
+        if reason not in reasons:
+            reasons.append(reason)
     validity = {
         "valid": not reasons,
         "reasons": reasons,
@@ -329,6 +340,316 @@ def _apply_native_run_validity(summary: dict, config: dict | None = None) -> dic
         resolved.get("raw_benchmark_score") if validity["valid"] else None
     )
     return resolved
+
+
+def _archive_run_failure(
+    *,
+    storage: RunStorage,
+    run_dir: Path,
+    run_record: RunRecord,
+    phase: str,
+    status: str,
+    error: BaseException,
+    traceback_text: str,
+    details: dict | None = None,
+) -> None:
+    error_record = {
+        "phase": phase,
+        "type": type(error).__name__,
+        "message": str(error),
+        "retryable": False,
+        "timestamp": datetime.now().isoformat(),
+        "traceback_ref": "logs/run_error.traceback.log",
+        "details": details or {},
+    }
+    storage.write_json_record(run_dir, "records/run_error.json", error_record)
+    (run_dir / "logs" / "run_error.traceback.log").write_text(
+        traceback_text,
+        encoding="utf-8",
+    )
+    run_record.status = "invalid" if status == "invalid" else "failed"
+    run_record.ended_at = datetime.now()
+    storage.write_run_record(run_dir, run_record)
+    summary = ReportSummary(
+        run_id=run_record.run_id,
+        status=run_record.status,
+        case_total=0,
+        case_passed=0,
+        case_failed=0,
+        benchmark_score=None,
+        raw_benchmark_score=None,
+        evaluation_coverage=0.0,
+        run_validity={
+            "valid": False,
+            "reasons": [f"{phase}_failed"],
+            "observed": {},
+        },
+        resource_summary={"run_error": error_record},
+        category_summary={},
+    )
+    write_summary(run_dir, summary.model_dump(mode="json"))
+    write_case_results(run_dir, [])
+
+
+def _run_plugin_finalize(
+    runtime_context: WorkflowRuntimeContext,
+) -> tuple[
+    dict | None,
+    CaseRecord | None,
+    StepRecord | None,
+    StepResultRecord | None,
+    list[TraceEventRecord],
+    MetricRecord | None,
+]:
+    memory_plugin_id = runtime_context.memory_plugin_id
+    if not memory_plugin_id:
+        return None, None, None, None, [], None
+
+    case_id = "runtime-lifecycle"
+    step_id = "run-memory-plugin-finalize"
+    lifecycle_case = CaseRecord(
+        case_id=case_id,
+        run_id=runtime_context.run_id,
+        title="Finalize memory plugin runtime",
+        goal="Restore plugin configuration and close the runtime lifecycle.",
+        capability="runtime/finalize",
+        labels=["phase:lifecycle"],
+        judge_mode="none",
+    )
+    lifecycle_step = StepRecord(
+        step_id=step_id,
+        case_id=case_id,
+        name="memory_plugin_finalize",
+        operator_kind="memory_plugin",
+        timeout_seconds=90,
+        gate_policy="hard",
+        inputs={"action": "finalize"},
+    )
+    started_at = datetime.now()
+    traces = [
+        TraceEventRecord(
+            trace_id=f"{step_id}-started",
+            case_id=case_id,
+            step_id=step_id,
+            event_type="step_started",
+            timestamp=started_at,
+        )
+    ]
+    try:
+        payload = run_memory_plugin_task(
+            memory_plugin_id,
+            MemoryPluginTaskInput(
+                task_id=step_id,
+                action="finalize",
+                inputs={},
+                runtime_context=runtime_context,
+                idempotency_key=f"{runtime_context.run_id}:memory-plugin-finalize",
+            ),
+        ).model_dump(mode="json")
+    except Exception as exc:
+        payload = {
+            "protocol_version": "memory-plugin/1",
+            "status": "failed",
+            "state": "failed",
+            "operation": {},
+            "output": {},
+            "metrics": [],
+            "artifacts": [],
+            "error": {
+                "type": type(exc).__name__,
+                "code": type(exc).__name__.lower(),
+                "category": "runtime",
+                "retryable": False,
+                "message": str(exc),
+            },
+        }
+    ended_at = datetime.now()
+    succeeded = payload.get("status") == "ok" and payload.get("state") == "completed"
+    error = payload.get("error", {}) if isinstance(payload.get("error"), dict) else {}
+    detail = (
+        "memory plugin finalize completed"
+        if succeeded
+        else str(error.get("message") or "memory plugin finalize failed")
+    )
+    result = StepResultRecord(
+        step_result_id=f"{step_id}-attempt-1",
+        step_id=step_id,
+        attempt=1,
+        status="passed" if succeeded else "failed",
+        exit_code=0 if succeeded else 1,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_ms=int((ended_at - started_at).total_seconds() * 1000),
+        stdout_ref="records/memory_plugin_finalize.json",
+        structured_output={
+            "output": payload.get("output", {}),
+            "raw": payload,
+        },
+        gate_passed=succeeded,
+        gate_detail=detail,
+    )
+    traces.extend(
+        [
+            TraceEventRecord(
+                trace_id=f"{step_id}-finished",
+                case_id=case_id,
+                step_id=step_id,
+                event_type="step_finished",
+                timestamp=ended_at,
+                payload={"status": result.status},
+            ),
+            TraceEventRecord(
+                trace_id=f"{step_id}-gate",
+                case_id=case_id,
+                step_id=step_id,
+                event_type="gate_passed" if succeeded else "gate_failed",
+                timestamp=ended_at,
+                payload={"detail": detail},
+            ),
+        ]
+    )
+    metric = MetricRecord(
+        metric_id=f"{step_id}-duration",
+        run_id=runtime_context.run_id,
+        case_id=case_id,
+        step_id=step_id,
+        scope="step",
+        name="duration_ms",
+        value=result.duration_ms or 0,
+        unit="ms",
+    )
+    return payload, lifecycle_case, lifecycle_step, result, traces, metric
+
+
+def _prepare_native_cases(
+    *,
+    args: argparse.Namespace,
+    entrypoint,
+    run_record: RunRecord,
+    run_dir: Path,
+    storage: RunStorage,
+) -> dict:
+    phase = "case_builder"
+    failure_details: dict = {}
+    try:
+        if entrypoint.entrypoint_kind == "scenario_builder":
+            phase = "scenario_builder"
+            scenario = build_benchmark_scenario(args.benchmark, args.data_path)
+            bundle = resolve_run_skill_bundle(
+                args.benchmark,
+                args.agent,
+                args.memory_backend,
+                args.memory_integration,
+            )
+            binding = RunBinding(
+                benchmark_id=args.benchmark,
+                agent_id=args.agent,
+                agent_runtime_id=str(bundle.agent.runtime.get("agent_id") or "").strip()
+                or None,
+                agent_local=(
+                    bool(bundle.agent.runtime.get("local", False))
+                    or os.environ.get("MEMORY_BENCH_AGENT_LOCAL", "").strip().lower()
+                    in {"1", "true", "yes", "on"}
+                ),
+                memory_id=bundle.memory_id,
+                memory_integration=args.memory_integration,
+                memory_plugin_id=bundle.memory_plugin_id,
+                run_id=run_record.run_id,
+            )
+            phase = "compatibility"
+            compatibility = resolve_compatibility(
+                scenario,
+                binding,
+                agent=bundle.agent,
+                memory=bundle.memory,
+                memory_plugin=bundle.memory_plugin,
+            )
+            phase = "evaluation_governance"
+            evaluation_governance = resolve_evaluation_governance(
+                bundle.benchmark, scenario
+            )
+            storage.write_json_record(
+                run_dir,
+                "records/benchmark_scenario.json",
+                scenario.model_dump(mode="json"),
+            )
+            storage.write_json_record(
+                run_dir,
+                "records/run_binding.json",
+                binding.model_dump(mode="json"),
+            )
+            storage.write_json_record(
+                run_dir,
+                "records/compatibility_result.json",
+                compatibility.model_dump(mode="json"),
+            )
+            storage.write_json_record(
+                run_dir,
+                "records/runtime_capabilities.json",
+                compatibility.resolved_capabilities,
+            )
+            storage.write_json_record(
+                run_dir,
+                "records/evaluation_profile.json",
+                {
+                    "governance": evaluation_governance,
+                    "default": scenario.evaluation.model_dump(mode="json"),
+                    "checkpoints": [
+                        {
+                            "sample_id": sample.sample_id,
+                            "checkpoint_id": event.event_id,
+                            "evaluation": event.evaluation.model_dump(mode="json"),
+                        }
+                        for sample in scenario.samples
+                        for event in sample.timeline
+                        if event.evaluation is not None
+                    ],
+                },
+            )
+            if not compatibility.compatible:
+                phase = "compatibility"
+                failure_details = compatibility.model_dump(mode="json")
+                missing = ", ".join(compatibility.missing_capabilities)
+                raise ValueError(
+                    f"runtime is incompatible with benchmark scenario: {missing}"
+                )
+            phase = "composer"
+            cases_payload = compose_run_plan(
+                scenario,
+                binding,
+                compatibility.resolved_capabilities,
+            )
+            storage.write_json_record(
+                run_dir,
+                "records/composed_run_plan.json",
+                cases_payload,
+            )
+            return cases_payload
+
+        phase = "case_builder"
+        return build_cases_from_source(
+            args.benchmark,
+            args.data_path,
+            args.memory_integration,
+            run_record.run_id,
+        )
+    except Exception as exc:
+        status = (
+            "invalid"
+            if phase in {"compatibility", "evaluation_governance"}
+            else "failed"
+        )
+        _archive_run_failure(
+            storage=storage,
+            run_dir=run_dir,
+            run_record=run_record,
+            phase=phase,
+            status=status,
+            error=exc,
+            traceback_text=traceback.format_exc(),
+            details=failure_details,
+        )
+        raise
 
 
 def _write_smoke_result(run_dir: Path, result: dict) -> None:
@@ -659,101 +980,35 @@ def main(argv: list[str] | None = None) -> None:
         print(str(run_dir))
         return
 
-    if entrypoint.entrypoint_kind == "scenario_builder":
-        scenario = build_benchmark_scenario(args.benchmark, args.data_path)
-        bundle = resolve_run_skill_bundle(
-            args.benchmark,
-            args.agent,
-            args.memory_backend,
-            args.memory_integration,
-        )
-        binding = RunBinding(
-            benchmark_id=args.benchmark,
-            agent_id=args.agent,
-            agent_runtime_id=str(bundle.agent.runtime.get("agent_id") or "").strip() or None,
-            agent_local=(
-                bool(bundle.agent.runtime.get("local", False))
-                or os.environ.get("MEMORY_BENCH_AGENT_LOCAL", "").strip().lower()
-                in {"1", "true", "yes", "on"}
-            ),
-            memory_id=bundle.memory_id,
-            memory_integration=args.memory_integration,
-            memory_plugin_id=bundle.memory_plugin_id,
-            run_id=run_record.run_id,
-        )
-        compatibility = resolve_compatibility(
-            scenario,
-            binding,
-            agent=bundle.agent,
-            memory=bundle.memory,
-            memory_plugin=bundle.memory_plugin,
-        )
-        evaluation_governance = resolve_evaluation_governance(bundle.benchmark, scenario)
-        storage.write_json_record(
-            run_dir,
-            "records/benchmark_scenario.json",
-            scenario.model_dump(mode="json"),
-        )
-        storage.write_json_record(
-            run_dir,
-            "records/run_binding.json",
-            binding.model_dump(mode="json"),
-        )
-        storage.write_json_record(
-            run_dir,
-            "records/compatibility_result.json",
-            compatibility.model_dump(mode="json"),
-        )
-        storage.write_json_record(
-            run_dir,
-            "records/runtime_capabilities.json",
-            compatibility.resolved_capabilities,
-        )
-        storage.write_json_record(
-            run_dir,
-            "records/evaluation_profile.json",
-            {
-                "governance": evaluation_governance,
-                "default": scenario.evaluation.model_dump(mode="json"),
-                "checkpoints": [
-                    {
-                        "sample_id": sample.sample_id,
-                        "checkpoint_id": event.event_id,
-                        "evaluation": event.evaluation.model_dump(mode="json"),
-                    }
-                    for sample in scenario.samples
-                    for event in sample.timeline
-                    if event.evaluation is not None
-                ],
-            },
-        )
-        if not compatibility.compatible:
-            missing = ", ".join(compatibility.missing_capabilities)
-            raise ValueError(f"runtime is incompatible with benchmark scenario: {missing}")
-        cases_payload = compose_run_plan(
-            scenario,
-            binding,
-            compatibility.resolved_capabilities,
-        )
-        storage.write_json_record(
-            run_dir,
-            "records/composed_run_plan.json",
-            cases_payload,
-        )
-    else:
-        cases_payload = build_cases_from_source(
-            args.benchmark,
-            args.data_path,
-            args.memory_integration,
-            run_record.run_id,
-        )
+    cases_payload = _prepare_native_cases(
+        args=args,
+        entrypoint=entrypoint,
+        run_record=run_record,
+        run_dir=run_dir,
+        storage=storage,
+    )
     declared_source_kind = str(cases_payload.get("source_kind", "") or "")
     if declared_source_kind:
         run_record.source_kind = declared_source_kind
         storage.write_run_record(run_dir, run_record)
-    cases = [CaseRecord(run_id=run_record.run_id, **item) for item in cases_payload.get("cases", [])]
-    steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
-    execution_spec = ExecutionSpec(**cases_payload.get("execution_spec", {}))
+    try:
+        cases = [
+            CaseRecord(run_id=run_record.run_id, **item)
+            for item in cases_payload.get("cases", [])
+        ]
+        steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
+        execution_spec = ExecutionSpec(**cases_payload.get("execution_spec", {}))
+    except Exception as exc:
+        _archive_run_failure(
+            storage=storage,
+            run_dir=run_dir,
+            run_record=run_record,
+            phase="run_plan_validation",
+            status="failed",
+            error=exc,
+            traceback_text=traceback.format_exc(),
+        )
+        raise
     resolved_memory_id = str(run_contract["selection"].get("memory_id") or "").strip() or None
     runtime_context = WorkflowRuntimeContext(
         run_id=run_record.run_id,
@@ -770,7 +1025,15 @@ def main(argv: list[str] | None = None) -> None:
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
     monitor.start_background_sampling()
+    workflow_output = None
+    execution_error: BaseException | None = None
+    execution_traceback = ""
     plugin_finalize_payload = None
+    lifecycle_case = None
+    lifecycle_step = None
+    lifecycle_result = None
+    lifecycle_traces: list[TraceEventRecord] = []
+    lifecycle_metric = None
     try:
         workflow_output = execute_cases(
             run_id=run_record.run_id,
@@ -782,33 +1045,52 @@ def main(argv: list[str] | None = None) -> None:
             execution_spec=execution_spec,
             run_dir=run_dir,
         )
+    except Exception as exc:
+        execution_error = exc
+        execution_traceback = traceback.format_exc()
     finally:
-        memory_plugin_id = runtime_context.memory_plugin_id
-        if memory_plugin_id:
-            try:
-                plugin_finalize_payload = run_memory_plugin_task(
-                    memory_plugin_id,
-                    MemoryPluginTaskInput(
-                        task_id="run-memory-plugin-finalize",
-                        action="finalize",
-                        inputs={},
-                        runtime_context=runtime_context,
-                        idempotency_key=f"{run_record.run_id}:memory-plugin-finalize",
-                    ),
-                ).model_dump(mode="json")
-            except Exception as exc:
-                plugin_finalize_payload = {
-                    "status": "failed",
-                    "state": "failed",
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
+        try:
+            (
+                plugin_finalize_payload,
+                lifecycle_case,
+                lifecycle_step,
+                lifecycle_result,
+                lifecycle_traces,
+                lifecycle_metric,
+            ) = _run_plugin_finalize(runtime_context)
+        finally:
+            monitor.stop_background_sampling()
+        if plugin_finalize_payload is not None:
             storage.write_json_record(
                 run_dir,
                 "records/memory_plugin_finalize.json",
                 plugin_finalize_payload,
             )
-        monitor.stop_background_sampling()
     cpu_snapshot = monitor.capture_once()
+
+    if execution_error is not None:
+        _archive_run_failure(
+            storage=storage,
+            run_dir=run_dir,
+            run_record=run_record,
+            phase="runtime_execution",
+            status="failed",
+            error=execution_error,
+            traceback_text=execution_traceback,
+            details={"memory_plugin_finalize": plugin_finalize_payload or {}},
+        )
+        raise execution_error.with_traceback(execution_error.__traceback__)
+
+    assert workflow_output is not None
+    if lifecycle_case is not None:
+        cases.append(lifecycle_case)
+    if lifecycle_step is not None:
+        steps.append(lifecycle_step)
+    if lifecycle_result is not None:
+        workflow_output["step_results"].append(lifecycle_result)
+    workflow_output["traces"].extend(lifecycle_traces)
+    if lifecycle_metric is not None:
+        workflow_output["metrics"].append(lifecycle_metric)
 
     judge_results = workflow_output["judge_results"]
     evaluation_summary = _summarize_native_evaluation(
@@ -817,8 +1099,11 @@ def main(argv: list[str] | None = None) -> None:
         judge_results,
         workflow_output["step_results"],
     )
+    finalize_failed = lifecycle_result is not None and lifecycle_result.status == "failed"
     evaluation_summary = _apply_native_run_validity(
-        evaluation_summary, dict(run_contract.get("evaluation_validity") or {})
+        evaluation_summary,
+        dict(run_contract.get("evaluation_validity") or {}),
+        ["memory_plugin_finalize_failed"] if finalize_failed else [],
     )
     run_validity = evaluation_summary["run_validity"]
     if not judge_results or evaluation_summary["raw_benchmark_score"] is None:
@@ -924,6 +1209,7 @@ def main(argv: list[str] | None = None) -> None:
         resource_summary={
             "cpu": cpu_snapshot,
             "evaluation": evaluation_summary,
+            "memory_plugin_finalize": plugin_finalize_payload,
         },
         category_summary={},
     )
