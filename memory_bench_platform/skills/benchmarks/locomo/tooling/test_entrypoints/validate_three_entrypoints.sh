@@ -6,7 +6,7 @@ OUT_DIR="${OUT_DIR:-${ROOT}/outputs/test-entrypoint-validation-$(date +%Y%m%d-%H
 mkdir -p "${OUT_DIR}"
 
 echo "[1/3] official wrapper"
-bash "${ROOT}/tools/test_entrypoints/run_official_locomo_small.sh"
+bash "${SCRIPT_DIR}/run_official_locomo_small.sh"
 
 echo "[2/3] memory_bench_platform external runner"
 (

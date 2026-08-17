@@ -752,15 +752,28 @@ def main(argv: list[str] | None = None) -> None:
             started_at=datetime.now(),
         )
         run_dir = storage.init_run(run_record)
-        result = execute_smoke_skill(args.smoke, run_dir)
-        _write_smoke_result(run_dir, result)
-        summary = _build_smoke_summary(run_id, args.smoke, result)
-        status = summary["status"]
-        write_summary(run_dir, summary)
-        write_case_results(run_dir, result["validation"].get("stage_results", []))
-        run_record.status = status
-        run_record.ended_at = datetime.now()
-        storage.write_run_record(run_dir, run_record)
+        try:
+            result = execute_smoke_skill(args.smoke, run_dir)
+            _write_smoke_result(run_dir, result)
+            summary = _build_smoke_summary(run_id, args.smoke, result)
+            status = summary["status"]
+            write_summary(run_dir, summary)
+            write_case_results(run_dir, result["validation"].get("stage_results", []))
+            run_record.status = status
+            run_record.ended_at = datetime.now()
+            storage.write_run_record(run_dir, run_record)
+        except Exception as exc:
+            if run_record.status == "running":
+                _archive_run_failure(
+                    storage=storage,
+                    run_dir=run_dir,
+                    run_record=run_record,
+                    phase="smoke_execution",
+                    status="failed",
+                    error=exc,
+                    traceback_text=traceback.format_exc(),
+                )
+            raise
         print(str(run_dir))
         return
 
@@ -835,9 +848,22 @@ def main(argv: list[str] | None = None) -> None:
     storage.write_json_record(run_dir, "records/run_contract.json", run_contract)
 
     if getattr(args, "smoke_gate", None):
-        smoke_result = execute_smoke_skill(args.smoke_gate, run_dir)
-        _write_smoke_result(run_dir, smoke_result)
-        storage.write_json_record(run_dir, "records/smoke_gate.json", smoke_result)
+        try:
+            smoke_result = execute_smoke_skill(args.smoke_gate, run_dir)
+            _write_smoke_result(run_dir, smoke_result)
+            storage.write_json_record(run_dir, "records/smoke_gate.json", smoke_result)
+        except Exception as exc:
+            _archive_run_failure(
+                storage=storage,
+                run_dir=run_dir,
+                run_record=run_record,
+                phase="smoke_gate",
+                status="failed",
+                error=exc,
+                traceback_text=traceback.format_exc(),
+                details={"smoke_id": args.smoke_gate},
+            )
+            raise
         smoke_status = str(smoke_result["validation"].get("status", "")).lower()
         if smoke_status != "passed":
             summary_record = ReportSummary(
@@ -865,31 +891,53 @@ def main(argv: list[str] | None = None) -> None:
 
     if entrypoint.entrypoint_kind == "external_runner":
         output_dir = run_dir / "external_artifacts" / entrypoint.entrypoint_id
-        monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
-        monitor.setup_writers()
-        env = os.environ.copy()
-        env.update(
-            {
-                "RUN_ID": plan.run_id,
-                "OUTPUT_DIR": str(output_dir),
-                "DATA_PATH": args.data_path or "",
-                "BENCHMARK_ID": args.benchmark,
-                "AGENT_ID": args.agent,
-            }
-        )
-        env.update(build_external_runner_env(run_record.version_selection))
-        monitor.start_background_sampling()
         try:
-            runner_result = execute_external_runner(entrypoint, env=env, cwd=Path.cwd().parent)
-        finally:
-            monitor.stop_background_sampling()
-        cpu_snapshot = monitor.capture_once()
-        (run_dir / "logs" / "external_runner.stdout.log").write_text(runner_result["stdout"], encoding="utf-8")
-        (run_dir / "logs" / "external_runner.stderr.log").write_text(runner_result["stderr"], encoding="utf-8")
+            monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
+            monitor.setup_writers()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "RUN_ID": plan.run_id,
+                    "OUTPUT_DIR": str(output_dir),
+                    "DATA_PATH": args.data_path or "",
+                    "BENCHMARK_ID": args.benchmark,
+                    "AGENT_ID": args.agent,
+                }
+            )
+            env.update(build_external_runner_env(run_record.version_selection))
+            monitor.start_background_sampling()
+            try:
+                runner_result = execute_external_runner(
+                    entrypoint,
+                    env=env,
+                    cwd=Path.cwd().parent,
+                )
+            finally:
+                monitor.stop_background_sampling()
+            cpu_snapshot = monitor.capture_once()
+            (run_dir / "logs" / "external_runner.stdout.log").write_text(
+                runner_result["stdout"], encoding="utf-8"
+            )
+            (run_dir / "logs" / "external_runner.stderr.log").write_text(
+                runner_result["stderr"], encoding="utf-8"
+            )
+        except Exception as exc:
+            if run_record.status == "running":
+                _archive_run_failure(
+                    storage=storage,
+                    run_dir=run_dir,
+                    run_record=run_record,
+                    phase="external_runner_execution",
+                    status="failed",
+                    error=exc,
+                    traceback_text=traceback.format_exc(),
+                    details={"entrypoint_id": entrypoint.entrypoint_id},
+                )
+            raise
         if output_dir.exists():
             try:
                 imported = import_external_result(output_dir)
-            except FileNotFoundError as exc:
+            except Exception as exc:
                 storage.write_json_record(
                     run_dir,
                     "records/external_entrypoint.json",

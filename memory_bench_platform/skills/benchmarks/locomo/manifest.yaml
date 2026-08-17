@@ -30,6 +30,7 @@ entry:
   scorer: scripts/score_predictions.py
 dataset:
   default_split: small
+  requires_data_path: true
   local_source: ../../../../locomo_test/data/locomo_small.json
 execution:
   mode: multi_turn
@@ -38,13 +39,13 @@ execution:
   ingest_unit: session
   entrypoints:
     official_small:
-      external_runner: ../../../../tools/test_entrypoints/run_official_locomo_small.sh
+      external_runner: tooling/test_entrypoints/run_official_locomo_small.sh
     official_sample0:
-      external_runner: ../../../../tools/test_entrypoints/run_official_locomo_sample.sh
+      external_runner: tooling/test_entrypoints/run_official_locomo_sample.sh
     locomo_test_remote:
-      external_runner: ../../../../tools/test_entrypoints/run_locomo_test_remote.sh
+      external_runner: tooling/test_entrypoints/run_locomo_test_remote.sh
     openclaw_import:
-      external_runner: ../../../../tools/test_entrypoints/run_locomo_openclaw_import.sh
+      external_runner: tooling/test_entrypoints/run_locomo_openclaw_import.sh
 judging:
   mode: external
   type: llm

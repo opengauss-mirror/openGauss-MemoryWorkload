@@ -15,6 +15,7 @@ cd /path/to/MemoryWorkloadTest
 ```bash
 python3 -m pip install -e .
 python3 -m locomo_test.cli --help
+cd locomo_test
 ```
 
 `locomo_test` 会调用 `memory_bench_platform` 的桥接模块，因此仓库根目录是官方安装入口。
@@ -27,6 +28,9 @@ python3 -m locomo_test.cli --help
 - `ogmem:520` 镜像可用。
 - `openclaw-ogmemory:poc1_416` 镜像可拉取。
 - Judge LLM 的 `api_key`、`base_url`、`model`。
+
+后续命令都在仓库的 `locomo_test/` 目录执行。文中的 `/data1/...` 是部署示例，
+需要替换为当前机器上的真实目录。
 
 ## 2. 启动 ogmem 和 openclaw
 
@@ -108,6 +112,9 @@ qa = true
 judge = true
 stats = true
 ```
+
+LoCoMo 数据集不会随仓库分发。请将 small 数据保存为 `data/locomo_small.json`，
+或者在 `[general]` 中通过 `data_file = "/path/to/locomo.json"` 显式指定。
 
 ## 4. 可选：清理旧数据
 

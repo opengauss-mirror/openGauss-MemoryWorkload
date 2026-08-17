@@ -179,27 +179,26 @@ Benchmark Skill entrypoint
 
 ## 使用方式
 
-建议从 `memory_bench_platform` 目录运行，并设置 `PYTHONPATH=.`：
+完成根目录安装后，可以在任意目录直接使用 `memory-bench`：
 
 ```bash
-cd /mnt/d/code/Agent/test/memory_bench_platform
-PYTHONPATH=. python3 -m memory_bench_platform.cli list-skills
+memory-bench list-skills
 ```
 
 ### 校验 Skill
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --benchmark locomo
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --benchmark longmemeval
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --agent openclaw
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --agent generic-cli
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --smoke locomo-openclaw-openviking-minimal
+memory-bench validate --benchmark locomo --data-path /path/to/locomo.json
+memory-bench validate --benchmark longmemeval --data-path /path/to/longmemeval.json
+memory-bench validate --agent openclaw
+memory-bench validate --agent generic-cli
+memory-bench validate --smoke locomo-openclaw-openviking-minimal
 ```
 
 ### 生成运行计划
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli plan-run \
+memory-bench plan-run \
   --benchmark locomo \
   --agent openclaw \
   --memory-backend openviking
@@ -208,14 +207,14 @@ PYTHONPATH=. python3 -m memory_bench_platform.cli plan-run \
 ### 运行 smoke gate
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli run-smoke \
+memory-bench run-smoke \
   --smoke locomo-openclaw-openviking-minimal
 ```
 
 也可以在正式 benchmark 前挂 smoke gate：
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli run \
+memory-bench run \
   --benchmark locomo \
   --agent openclaw \
   --entrypoint locomo_test_remote \
@@ -227,7 +226,7 @@ PYTHONPATH=. python3 -m memory_bench_platform.cli run \
 OpenViking ingest 路径：
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli run \
+memory-bench run \
   --benchmark locomo \
   --agent openclaw \
   --memory-backend openviking \
@@ -247,7 +246,7 @@ export OPENVIKING_USER_ID=<user-id>
 export OPENVIKING_AGENT_ID=<agent-id>
 export OPENVIKING_BIN=ov
 
-PYTHONPATH=. python3 -m memory_bench_platform.cli run \
+memory-bench run \
   --benchmark ovtest-memory \
   --agent generic-cli \
   --memory-backend openviking
@@ -258,7 +257,7 @@ PYTHONPATH=. python3 -m memory_bench_platform.cli run \
 OpenClaw 完整执行 LoCoMo 路径：
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli run \
+memory-bench run \
   --benchmark locomo \
   --agent openclaw \
   --memory-backend openviking \
@@ -279,16 +278,18 @@ Judge 配置由 Benchmark manifest 声明并进入 Run Contract。每道 QA 完�
 ### 运行 LongMemEval
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli run \
+memory-bench run \
   --benchmark longmemeval \
-  --agent generic-cli
+  --agent openclaw \
+  --memory-backend openviking \
+  --data-path /path/to/longmemeval.json
 ```
 
 ### 分析已有 run
 
 ```bash
-PYTHONPATH=. python3 -m memory_bench_platform.cli analyze-run \
-  --run-dir /mnt/d/code/Agent/test/memory_bench_platform/runs/<run-id>
+memory-bench analyze-run \
+  --run-dir /path/to/run-directory
 ```
 
 ## 结果目录和报告
@@ -506,12 +507,12 @@ version_policy:
 
 ```bash
 cd /path/to/openGauss-MemoryWorkload/memory_bench_platform
-PYTHONPATH=. python3 -m memory_bench_platform.cli list-skills
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate \
+memory-bench list-skills
+memory-bench validate \
   --benchmark locomo \
   --data-path /path/to/locomo.json
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --agent openclaw
-PYTHONPATH=. python3 -m memory_bench_platform.cli validate --smoke locomo-openclaw-openviking-minimal
+memory-bench validate --agent openclaw
+memory-bench validate --smoke locomo-openclaw-openviking-minimal
 PYTHONPATH=. pytest -q
 ```
 

@@ -129,7 +129,7 @@
 再运行：
 
 ```bash
-python3 tools/test_entrypoints/diagnose_openviking_split.py \
+python3 -m skills.benchmarks.locomo.tooling.test_entrypoints.diagnose_openviking_split \
   --api-key <root-api-key> \
   --account-id <acct-run-id> \
   --agent-id <acct-run-id>_main \

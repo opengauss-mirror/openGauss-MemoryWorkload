@@ -4,13 +4,13 @@ from pathlib import Path
 def test_locomo_test_remote_entrypoint_keeps_health_check_enabled():
     script = (
         Path(__file__).resolve().parents[2]
-        / "tools/test_entrypoints/run_locomo_test_remote.sh"
+        / "memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_locomo_test_remote.sh"
     )
     text = script.read_text(encoding="utf-8")
 
     assert 'OUTPUT_DIR="${OUTPUT_DIR:-}"' in text
     assert 'LOCAL_OUTPUT_DIR="${OUTPUT_DIR}"' in text
-    assert 'tar czf "${TMP_TAR}" -C "${WORKSPACE_ROOT}" locomo_test memory_bench_platform' in text
+    assert 'build_remote_runtime_bundle.py" --output "${TMP_TAR}"' in text
     assert 'PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform"' in text
     assert 'PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.bootstrap_remote_runtime \\' in text
     assert 'PYTHONPATH="/tmp/locomo_test:/tmp/memory_bench_platform" python3 -m locomo_test.cli run "configs/${LOCOMO_TEST_CONFIG%.toml}-runtime.toml"' in text

@@ -15,32 +15,48 @@ def test_resolve_benchmark_entrypoint_reads_manifest_external_runner():
     entrypoint = resolve_benchmark_entrypoint("locomo", "official_small")
     assert entrypoint.entrypoint_kind == "external_runner"
     assert entrypoint.command[0] == "bash"
-    assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_official_locomo_small.sh")
+    assert entrypoint.command[-1].endswith(
+        "skills/benchmarks/locomo/tooling/test_entrypoints/run_official_locomo_small.sh"
+    )
 
 
 def test_resolve_benchmark_entrypoint_reads_sample0_wrapper():
     entrypoint = resolve_benchmark_entrypoint("locomo", "official_sample0")
     assert entrypoint.entrypoint_kind == "external_runner"
     assert entrypoint.command[0] == "bash"
-    assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_official_locomo_sample.sh")
+    assert entrypoint.command[-1].endswith(
+        "skills/benchmarks/locomo/tooling/test_entrypoints/run_official_locomo_sample.sh"
+    )
 
 
 def test_resolve_benchmark_entrypoint_reads_locomo_test_remote_wrapper():
     entrypoint = resolve_benchmark_entrypoint("locomo", "locomo_test_remote")
     assert entrypoint.entrypoint_kind == "external_runner"
     assert entrypoint.command[0] == "bash"
-    assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_locomo_test_remote.sh")
+    assert entrypoint.command[-1].endswith(
+        "skills/benchmarks/locomo/tooling/test_entrypoints/run_locomo_test_remote.sh"
+    )
 
 
 def test_resolve_benchmark_entrypoint_reads_openclaw_import_wrapper():
     entrypoint = resolve_benchmark_entrypoint("locomo", "openclaw_import")
     assert entrypoint.entrypoint_kind == "external_runner"
     assert entrypoint.command[0] == "bash"
-    assert entrypoint.command[-1].endswith("tools/test_entrypoints/run_locomo_openclaw_import.sh")
+    assert entrypoint.command[-1].endswith(
+        "skills/benchmarks/locomo/tooling/test_entrypoints/run_locomo_openclaw_import.sh"
+    )
 
 
 def test_openclaw_import_entrypoint_defaults_to_full_openclaw_execution():
-    script = Path(__file__).resolve().parents[2] / "tools" / "test_entrypoints" / "run_locomo_openclaw_import.sh"
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "skills"
+        / "benchmarks"
+        / "locomo"
+        / "tooling"
+        / "test_entrypoints"
+        / "run_locomo_openclaw_import.sh"
+    )
     text = script.read_text(encoding="utf-8")
     assert 'MODE="${LOCOMO_OPENCLAW_IMPORT_MODE:-execute}"' in text
     assert 'LOCOMO_TEST_CONFIG="${LOCOMO_TEST_CONFIG:-openclaw-small-stable.toml}"' in text

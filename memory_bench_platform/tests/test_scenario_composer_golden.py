@@ -7,6 +7,16 @@ from memory_bench_platform.benchmark_scenario import BenchmarkScenario, RunBindi
 from memory_bench_platform.composer import compose_run_plan
 
 
+def test_scenario_rejects_empty_sample_set():
+    with pytest.raises(ValueError, match="at least 1 item"):
+        BenchmarkScenario.model_validate(
+            {
+                "benchmark_id": "empty",
+                "samples": [],
+            }
+        )
+
+
 def _scenario() -> BenchmarkScenario:
     payload = json.loads(
         Path("tests/golden/multi_checkpoint_scenario.json").read_text(encoding="utf-8")

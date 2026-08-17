@@ -20,7 +20,9 @@ def _session_content(session: list[dict[str, Any]], date: str, session_id: str) 
 
 
 def build_scenario(data_path: Path | None = None) -> dict[str, Any]:
-    raw = [] if data_path is None else json.loads(data_path.read_text(encoding="utf-8"))
+    if data_path is None:
+        raise ValueError("LongMemEval data path is required")
+    raw = json.loads(data_path.read_text(encoding="utf-8"))
     samples: list[dict[str, Any]] = []
     for index, item in enumerate(raw, start=1):
         question_id = str(item.get("question_id") or f"question-{index}")

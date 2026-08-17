@@ -31,7 +31,7 @@
 ### 2026-06-24 远端 split 诊断复核
 
 - 使用：
-  - `tools/test_entrypoints/diagnose_openviking_split.py`
+  - `memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/diagnose_openviking_split.py`
 - 诊断对象：
   - `account_id=acct-locomo_min_authfix3_20260623_213058`
   - `target_uri=viking://user/eval-1/memories`

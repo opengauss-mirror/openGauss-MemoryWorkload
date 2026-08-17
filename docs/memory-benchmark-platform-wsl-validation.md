@@ -400,9 +400,9 @@ python3 -m memory_bench_platform.cli run \
 - 原生 `ovtest-health` workflow case 的远端闭环
 - 原生 `ovtest-admin-memory` workflow case 的远端完整执行与归档
 - CPU / memory 资源摘要已进入 summary 与 metrics
-- `tools/test_entrypoints/run_official_locomo_small.sh`
+- `memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_official_locomo_small.sh`
   - 独占远端运行、拉回 `phaseA csv`、本地补 judge、生成 `meta.json`
-- `tools/test_entrypoints/run_locomo_test_remote.sh`
+- `memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_locomo_test_remote.sh`
   - 独占远端运行 `locomo_test` 主入口，并拉回完整 `meta.json` / `qa_results.csv`
 - `memory_bench_platform` external runner 恢复模式
   - 可导入既有 `official_small` 产物并生成平台 `summary.json` / `case_results.json`

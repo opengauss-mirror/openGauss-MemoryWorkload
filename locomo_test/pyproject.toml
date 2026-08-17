@@ -18,5 +18,12 @@ dependencies = [
 [project.scripts]
 locomo-test = "locomo_test.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["locomo_test*"]
+[tool.setuptools]
+packages = ["locomo_test", "locomo_test.configs"]
+
+[tool.setuptools.package-dir]
+locomo_test = "locomo_test"
+"locomo_test.configs" = "configs"
+
+[tool.setuptools.package-data]
+"locomo_test.configs" = ["*.toml", "*.toml.example"]

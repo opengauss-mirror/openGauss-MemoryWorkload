@@ -2,7 +2,15 @@ import importlib.util
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "test_entrypoints" / "repair_phasea_csv.py"
+MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "benchmarks"
+    / "locomo"
+    / "tooling"
+    / "test_entrypoints"
+    / "repair_phasea_csv.py"
+)
 SPEC = importlib.util.spec_from_file_location("repair_phasea_csv", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader

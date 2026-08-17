@@ -3,7 +3,13 @@ from pathlib import Path
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[2] / "tools" / "test_entrypoints" / "prepare_remote_locomo_runtime.py"
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "benchmarks"
+    / "locomo"
+    / "tooling"
+    / "test_entrypoints"
+    / "prepare_remote_locomo_runtime.py"
 )
 SPEC = importlib.util.spec_from_file_location("prepare_remote_locomo_runtime", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)

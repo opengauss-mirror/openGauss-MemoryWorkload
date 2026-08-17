@@ -35,7 +35,6 @@ GW_LOG="${GW_LOG:-/tmp/${RUN_ID}_openclaw_gateway.log}"
 PLUGIN_USER_KEY_FILE="/tmp/${RUN_ID}_plugin_user_key.txt"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 pick_remote_free_port() {
 ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} python3 - <<'PY'
@@ -58,7 +57,7 @@ fi
 TMP_TAR="$(mktemp)"
 trap 'rm -f "${TMP_TAR}"' EXIT
 
-tar czf "${TMP_TAR}" -C "${WORKSPACE_ROOT}" locomo_test memory_bench_platform
+python3 "${SCRIPT_DIR}/build_remote_runtime_bundle.py" --output "${TMP_TAR}"
 cat "${TMP_TAR}" | ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -lc 'rm -rf ${REMOTE_ROOT} && mkdir -p /tmp && tar xzf - -C /tmp'"
 
 ssh -p "${SSH_PORT}" "${SSH_HOST}" "docker exec -i ${REMOTE_CONTAINER} bash -s" <<INNER

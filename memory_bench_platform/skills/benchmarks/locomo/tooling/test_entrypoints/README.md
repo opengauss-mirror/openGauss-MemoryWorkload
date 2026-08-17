@@ -1,4 +1,4 @@
-# tools/test_entrypoints
+# LoCoMo packaged test entrypoints
 
 统一存放 LoCoMo / OpenClaw / OpenViking 测试入口的共享辅助脚本。
 

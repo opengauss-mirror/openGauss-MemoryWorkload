@@ -4,7 +4,7 @@ from pathlib import Path
 def test_official_locomo_small_uses_shared_remote_lock_and_process_guard():
     script = (
         Path(__file__).resolve().parents[2]
-        / "tools/test_entrypoints/run_official_locomo_small.sh"
+        / "memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_official_locomo_small.sh"
     )
     text = script.read_text(encoding="utf-8")
 
@@ -26,7 +26,7 @@ def test_official_locomo_small_uses_shared_remote_lock_and_process_guard():
     assert 'EXPECTED_OPENVIKING_VERSION="${MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION:-}"' in text
     assert 'EXPECTED_OPENCLAW_VERSION="${MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION:-}"' in text
     assert 'OPENVIKING_INTROSPECT_PYTHON_BIN="${OPENVIKING_INTROSPECT_PYTHON_BIN:-}"' in text
-    assert 'PLATFORM_RUNS_ROOT="${PLATFORM_RUNS_ROOT:-${WORKSPACE_ROOT}/memory_bench_platform/runs}"' in text
+    assert 'PLATFORM_RUNS_ROOT="${PLATFORM_RUNS_ROOT:-${PWD}/runs}"' in text
     assert 'PLATFORM_IMPORT_ENABLED="${PLATFORM_IMPORT_ENABLED:-true}"' in text
     assert 'remote_container_port_is_free()' in text
     assert 'resolve_remote_free_port()' in text

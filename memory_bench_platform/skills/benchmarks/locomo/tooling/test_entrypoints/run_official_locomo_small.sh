@@ -21,8 +21,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-/tmp/${RUN_ID}}"
 LOCAL_OUTPUT_DIR="${OUTPUT_DIR}"
 REMOTE_OUTPUT_DIR="/tmp/${RUN_ID}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PLATFORM_RUNS_ROOT="${PLATFORM_RUNS_ROOT:-${WORKSPACE_ROOT}/memory_bench_platform/runs}"
+PLATFORM_RUNS_ROOT="${PLATFORM_RUNS_ROOT:-${PWD}/runs}"
 PLATFORM_IMPORT_ENABLED="${PLATFORM_IMPORT_ENABLED:-true}"
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-${RUN_ID}}"
 OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-${RUN_ID}}"
@@ -85,7 +84,7 @@ fi
 
 if [ "${PLATFORM_IMPORT_ENABLED}" = "true" ] && [ -f "${LOCAL_OUTPUT_DIR}/qa_results.csv" ]; then
   PLATFORM_RUN_DIR="$(
-    python3 "${WORKSPACE_ROOT}/tools/test_entrypoints/import_official_locomo_run.py" \
+    python3 "${SCRIPT_DIR}/import_official_locomo_run.py" \
       --run-id "${RUN_ID}" \
       --entrypoint-id "official_${MODE}_sample${SAMPLE}" \
       --benchmark-id "locomo" \
@@ -94,10 +93,7 @@ if [ "${PLATFORM_IMPORT_ENABLED}" = "true" ] && [ -f "${LOCAL_OUTPUT_DIR}/qa_res
       --platform-runs-root "${PLATFORM_RUNS_ROOT}"
   )"
 
-  (
-    cd "${WORKSPACE_ROOT}/memory_bench_platform"
-    PYTHONPATH=. python3 -m memory_bench_platform.cli analyze-run --run-dir "${PLATFORM_RUN_DIR}"
-  )
+  python3 -m memory_bench_platform.cli analyze-run --run-dir "${PLATFORM_RUN_DIR}"
 
   mkdir -p "${LOCAL_OUTPUT_DIR}/reports"
   for report_name in summary.json case_results.json external_result_summary.json analysis.json analysis.md timing_report.json timing_report.html; do
@@ -1048,7 +1044,7 @@ if [ -z "\${META_FILE}" ] && [ -n "\${CSV_FILE}" ]; then
   META_FILE="\${CSV_FILE%.csv}_meta.json"
 fi
 if [ -n "\${META_FILE}" ] && [ -f "\${MASTER_LOG}" ] && [ -n "\${CSV_FILE}" ]; then
-  python3 "${WORKSPACE_ROOT}/tools/test_entrypoints/ov_phasea_enrich.py" \
+  python3 "${SCRIPT_DIR}/ov_phasea_enrich.py" \
     "\${META_FILE}" \
     "\${CSV_FILE}" \
     "\${MASTER_LOG}" \
@@ -1102,8 +1098,7 @@ if [ "${SKIP_JUDGE}" != "true" ]; then
     exit 1
   fi
 
-  PYTHONPATH="${WORKSPACE_ROOT}/locomo_test" \
-    python3 -m locomo_test.cli judge \
+  python3 -m locomo_test.cli judge \
     --input "${PHASE_CSV}" \
     --token "${SEED_KEY}" \
     --base-url "${BASE_URL}" \

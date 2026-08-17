@@ -3,7 +3,15 @@ import importlib.util
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "test_entrypoints" / "ov_phasea_enrich.py"
+MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "benchmarks"
+    / "locomo"
+    / "tooling"
+    / "test_entrypoints"
+    / "ov_phasea_enrich.py"
+)
 SPEC = importlib.util.spec_from_file_location("ov_phasea_enrich", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader

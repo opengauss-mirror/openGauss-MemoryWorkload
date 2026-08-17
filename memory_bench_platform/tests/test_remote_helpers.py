@@ -6,9 +6,12 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from tools.test_entrypoints.collect_run_artifacts import collect_artifacts
-from tools.test_entrypoints.probe_remote_env import parse_openclaw_config, parse_openviking_config
-from tools.test_entrypoints.reset_remote_locomo_env import build_reset_plan
+from skills.benchmarks.locomo.tooling.test_entrypoints.collect_run_artifacts import collect_artifacts
+from skills.benchmarks.locomo.tooling.test_entrypoints.probe_remote_env import (
+    parse_openclaw_config,
+    parse_openviking_config,
+)
+from skills.benchmarks.locomo.tooling.test_entrypoints.reset_remote_locomo_env import build_reset_plan
 
 
 def test_parse_openclaw_config_reads_gateway_token_and_state_dir():

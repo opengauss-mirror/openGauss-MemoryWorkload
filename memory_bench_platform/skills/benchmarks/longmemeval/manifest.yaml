@@ -31,6 +31,7 @@ entry:
   scorer: scripts/score_predictions.py
 dataset:
   default_split: dev
+  requires_data_path: true
 execution:
   mode: multi_turn
   requires_stateful_agent: true

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import pytest
 
 from memory_bench_platform.cli import main
 
@@ -42,7 +43,5 @@ def test_validate_cli_emits_run_contract_when_benchmark_and_agent_are_provided(c
 
 
 def test_validate_cli_reports_missing_source_for_longmemeval(capsys):
-    main(["validate", "--benchmark", "longmemeval"])
-    out = capsys.readouterr().out
-    payload = json.loads(out)
-    assert payload["benchmark"]["status"] == "missing_source"
+    with pytest.raises(ValueError, match="--data-path is required"):
+        main(["validate", "--benchmark", "longmemeval"])

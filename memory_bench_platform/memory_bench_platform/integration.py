@@ -149,6 +149,8 @@ def execute_smoke_skill(skill_id: str, run_dir: Path) -> dict[str, Any]:
 
 def validate_benchmark(skill_id: str, source_path: str | None = None) -> dict:
     manifest = get_benchmark_manifest(skill_id)
+    if manifest.dataset.get("requires_data_path") and not source_path:
+        raise ValueError(f"--data-path is required for benchmark {skill_id}")
     manifest_path = _manifest_path("benchmarks", skill_id)
     script = (
         manifest.entry.validator
@@ -322,6 +324,8 @@ def build_benchmark_tasks(
 
 def build_benchmark_scenario(skill_id: str, source_path: str | None = None) -> BenchmarkScenario:
     manifest = get_benchmark_manifest(skill_id)
+    if manifest.dataset.get("requires_data_path") and not source_path:
+        raise ValueError(f"--data-path is required for benchmark {skill_id}")
     manifest_path = _manifest_path("benchmarks", skill_id)
     builder = manifest.entry.scenario_builder
     if not builder:

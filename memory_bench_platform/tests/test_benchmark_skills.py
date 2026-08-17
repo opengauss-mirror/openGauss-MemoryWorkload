@@ -18,7 +18,7 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     assert manifest["version_policy"]["targets"][0]["version_source"] == "upstream_release_tag"
     assert manifest["version_policy"]["targets"][0]["upstream"] == "https://github.com/snap-research/locomo"
     assert manifest["execution"]["entrypoints"]["locomo_test_remote"]["external_runner"].endswith(
-        "tools/test_entrypoints/run_locomo_test_remote.sh"
+        "tooling/test_entrypoints/run_locomo_test_remote.sh"
     )
 
 
@@ -42,10 +42,12 @@ def test_longmemeval_builder_uses_case_source_shape():
 
 
 def test_longmemeval_scenario_builder_uses_runtime_independent_shape():
-    payload = build_scenario()
+    payload = build_scenario(
+        Path("skills/benchmarks/longmemeval/tests/golden/source_sample.json")
+    )
     assert payload["source_kind"] == "benchmark_scenario"
     assert payload["benchmark_id"] == "longmemeval"
-    assert payload["samples"] == []
+    assert len(payload["samples"]) == 1
 
 
 def test_longmemeval_validator_reports_missing_source_when_no_path():

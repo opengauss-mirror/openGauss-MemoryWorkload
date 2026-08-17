@@ -30,8 +30,25 @@ packages = [
   "memory_bench_platform.adapters",
   "memory_bench_platform.adapters.locomo",
   "locomo_test",
+  "locomo_test.configs",
+  "skills",
+  "schemas",
+  "templates",
 ]
 
 [tool.setuptools.package-dir]
 memory_bench_platform = "memory_bench_platform/memory_bench_platform"
 locomo_test = "locomo_test/locomo_test"
+"locomo_test.configs" = "locomo_test/configs"
+skills = "memory_bench_platform/skills"
+schemas = "memory_bench_platform/schemas"
+templates = "memory_bench_platform/templates"
+
+[tool.setuptools.package-data]
+skills = ["**/*"]
+schemas = ["**/*"]
+templates = ["**/*"]
+"locomo_test.configs" = ["*.toml", "*.toml.example"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/*", "**/*.pyc"]

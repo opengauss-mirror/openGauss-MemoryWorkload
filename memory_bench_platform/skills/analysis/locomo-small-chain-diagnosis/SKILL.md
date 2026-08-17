@@ -49,7 +49,7 @@
 ## 使用方式
 
 ```bash
-python3 tools/test_entrypoints/diagnose_official_small.py \
+python3 -m skills.benchmarks.locomo.tooling.test_entrypoints.diagnose_official_small \
   /path/to/memory_bench_platform/runs/<run_id>
 ```
 

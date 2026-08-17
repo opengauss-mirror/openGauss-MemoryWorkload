@@ -16,7 +16,7 @@
 
 ### 2.1 official wrapper
 
-- 入口：`tools/test_entrypoints/run_official_locomo_small.sh`
+- 入口：`memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_official_locomo_small.sh`
 - 产物目录：`/tmp/official_on_sample0_20260614_155220`
 - 结果：`7/35 = 20.00%`
 - 关键产物：
@@ -26,7 +26,7 @@
 
 ### 2.2 locomo_test remote wrapper
 
-- 入口：`tools/test_entrypoints/run_locomo_test_remote.sh`
+- 入口：`memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_locomo_test_remote.sh`
 - 产物目录：`/tmp/locomo_test_output/locomo_test_remote_20260614_161053`
 - 结果：`9/35 = 25.71%`
 - 关键产物：

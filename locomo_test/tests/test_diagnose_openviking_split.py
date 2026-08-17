@@ -5,7 +5,7 @@ import importlib.util
 def _load_module():
     path = (
         Path(__file__).resolve().parents[2]
-        / "tools/test_entrypoints/diagnose_openviking_split.py"
+        / "memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/diagnose_openviking_split.py"
     )
     spec = importlib.util.spec_from_file_location("diagnose_openviking_split", path)
     module = importlib.util.module_from_spec(spec)

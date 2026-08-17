@@ -17,7 +17,9 @@ def validate(path: Path) -> dict:
 
 
 if __name__ == "__main__":
-    workspace_root = Path(__file__).resolve().parents[5]
-    default_path = workspace_root / "locomo_test" / "data" / "locomo_small.json"
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else default_path
+    if len(sys.argv) <= 1:
+        raise SystemExit("LoCoMo data path is required; pass --data-path to memory-bench")
+    target = Path(sys.argv[1])
+    if not target.is_file():
+        raise SystemExit(f"LoCoMo data file not found: {target}")
     print(json.dumps(validate(target), ensure_ascii=False))

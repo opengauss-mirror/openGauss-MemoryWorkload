@@ -126,10 +126,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("data_path", nargs="?")
     args = parser.parse_args()
-    workspace_root = Path(__file__).resolve().parents[5]
-    default_path = (
-        Path(args.data_path)
-        if args.data_path
-        else workspace_root / "locomo_test" / "data" / "locomo_small.json"
-    )
-    print(json.dumps(build_scenario(default_path), ensure_ascii=False))
+    if not args.data_path:
+        raise SystemExit("LoCoMo data path is required; pass --data-path to memory-bench")
+    data_path = Path(args.data_path)
+    if not data_path.is_file():
+        raise SystemExit(f"LoCoMo data file not found: {data_path}")
+    print(json.dumps(build_scenario(data_path), ensure_ascii=False))

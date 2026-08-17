@@ -6,7 +6,13 @@ from memory_bench_platform.result_analysis import analyze_run
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[2] / "tools" / "test_entrypoints" / "import_official_locomo_run.py"
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "benchmarks"
+    / "locomo"
+    / "tooling"
+    / "test_entrypoints"
+    / "import_official_locomo_run.py"
 )
 SPEC = importlib.util.spec_from_file_location("import_official_locomo_run", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)

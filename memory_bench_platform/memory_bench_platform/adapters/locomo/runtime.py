@@ -6,6 +6,8 @@ import re
 import shutil
 from pathlib import Path
 
+import skills
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -161,8 +163,10 @@ def _filter_plugin_config_by_manifest(config: dict, manifest_path: Path) -> dict
 
 def _load_locomo_eval_agents_md() -> str:
     override_path = (
-        Path(__file__).resolve().parents[2]
-        / "tools"
+        Path(skills.__file__).resolve().parent
+        / "benchmarks"
+        / "locomo"
+        / "tooling"
         / "test_entrypoints"
         / "remote_overrides"
         / "locomo_eval_AGENTS.md"

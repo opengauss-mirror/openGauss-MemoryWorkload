@@ -151,7 +151,7 @@
 
 - 文件：
   - `/mnt/d/code/Agent/test/locomo_test/locomo_test/eval.py`
-  - `/mnt/d/code/Agent/test/tools/test_entrypoints/run_locomo_test_remote.sh`
+  - `memory_bench_platform/skills/benchmarks/locomo/tooling/test_entrypoints/run_locomo_test_remote.sh`
 - 问题：
   - 当前已建立 adapter 接口，`eval.py` 主流程不再直接调用 OpenViking task/commit/recall 查询函数；
   - 但历史测试和兼容入口仍 patch `eval.py` 中的 OpenViking wrapper。

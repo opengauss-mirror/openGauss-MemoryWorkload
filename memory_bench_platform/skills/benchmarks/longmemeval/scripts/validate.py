@@ -27,7 +27,11 @@ def validate(path: Path | None) -> dict:
 
 
 def main() -> None:
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    if len(sys.argv) <= 1:
+        raise SystemExit("LongMemEval data path is required; pass --data-path to memory-bench")
+    target = Path(sys.argv[1])
+    if not target.is_file():
+        raise SystemExit(f"LongMemEval data file not found: {target}")
     print(json.dumps(validate(target), ensure_ascii=False))
 
 

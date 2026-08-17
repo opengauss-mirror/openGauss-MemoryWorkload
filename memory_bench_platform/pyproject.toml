@@ -13,6 +13,9 @@ dependencies = [
 dev = [
   "pytest>=8.2",
 ]
+locomo = [
+  "locomo-test-kit>=0.1.0",
+]
 
 [project.scripts]
 memory-bench = "memory_bench_platform.cli:main"
@@ -20,3 +23,27 @@ memory-bench = "memory_bench_platform.cli:main"
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+  "memory_bench_platform",
+  "memory_bench_platform.adapters",
+  "memory_bench_platform.adapters.locomo",
+  "skills",
+  "schemas",
+  "templates",
+]
+
+[tool.setuptools.package-dir]
+memory_bench_platform = "memory_bench_platform"
+skills = "skills"
+schemas = "schemas"
+templates = "templates"
+
+[tool.setuptools.package-data]
+skills = ["**/*"]
+schemas = ["**/*"]
+templates = ["**/*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/*", "**/*.pyc"]

@@ -62,7 +62,7 @@ class BenchmarkScenario(BaseModel):
     benchmark_id: str
     requirements: dict[str, Any] = Field(default_factory=dict)
     evaluation: ScenarioEvaluation = Field(default_factory=ScenarioEvaluation)
-    samples: list[ScenarioSample] = Field(default_factory=list)
+    samples: list[ScenarioSample] = Field(min_length=1)
     execution_spec: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

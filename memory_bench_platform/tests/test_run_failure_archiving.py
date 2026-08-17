@@ -8,6 +8,7 @@ import pytest
 from memory_bench_platform.benchmark_scenario import BenchmarkScenario
 from memory_bench_platform.cli import main
 from memory_bench_platform.protocol import (
+    EntryPointRecord,
     JudgeResult,
     MemoryPluginTaskOutput,
     StepResultRecord,
@@ -116,6 +117,145 @@ def _run_args(run_id: str, *, integration: str = "backend_direct") -> list[str]:
 
 def _run_dir(tmp_path: Path, run_id: str) -> Path:
     return tmp_path / "runs" / run_id
+
+
+def test_smoke_execution_failure_is_archived_and_run_is_terminated(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "memory_bench_platform.cli.execute_smoke_skill",
+        lambda smoke_id, run_dir: (_ for _ in ()).throw(RuntimeError("smoke crashed")),
+    )
+
+    with pytest.raises(RuntimeError, match="smoke crashed"):
+        main(
+            [
+                "run-smoke",
+                "--smoke",
+                "locomo-openclaw-openviking-minimal",
+                "--run-id",
+                "smoke-failure",
+            ]
+        )
+
+    run_dir = _run_dir(tmp_path, "smoke-failure")
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    error = json.loads((run_dir / "records/run_error.json").read_text(encoding="utf-8"))
+    assert run["status"] == "failed"
+    assert run["ended_at"] is not None
+    assert error["phase"] == "smoke_execution"
+
+
+def test_smoke_result_write_failure_is_archived(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "memory_bench_platform.cli.execute_smoke_skill",
+        lambda smoke_id, run_dir: {
+            "probe": {},
+            "validation": {"status": "passed", "stage_results": []},
+            "report": {"html": ""},
+        },
+    )
+    monkeypatch.setattr(
+        "memory_bench_platform.cli._write_smoke_result",
+        lambda run_dir, result: (_ for _ in ()).throw(OSError("write failed")),
+    )
+
+    with pytest.raises(OSError, match="write failed"):
+        main(
+            [
+                "run-smoke",
+                "--smoke",
+                "locomo-openclaw-openviking-minimal",
+                "--run-id",
+                "smoke-write-failure",
+            ]
+        )
+
+    run_dir = _run_dir(tmp_path, "smoke-write-failure")
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    error = json.loads((run_dir / "records/run_error.json").read_text(encoding="utf-8"))
+    assert run["status"] == "failed"
+    assert run["ended_at"] is not None
+    assert error["phase"] == "smoke_execution"
+
+
+def test_external_runner_start_failure_is_archived(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _patch_common(monkeypatch, _scenario())
+    monkeypatch.setattr(
+        "memory_bench_platform.cli.resolve_benchmark_entrypoint",
+        lambda benchmark, entrypoint: EntryPointRecord(
+            entrypoint_id="external",
+            entrypoint_kind="external_runner",
+            command=["missing-runner"],
+        ),
+    )
+    monkeypatch.setattr(
+        "memory_bench_platform.cli.execute_external_runner",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError("missing-runner")),
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing-runner"):
+        main(_run_args("external-runner-failure"))
+
+    run_dir = _run_dir(tmp_path, "external-runner-failure")
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    error = json.loads((run_dir / "records/run_error.json").read_text(encoding="utf-8"))
+    assert run["status"] == "failed"
+    assert run["ended_at"] is not None
+    assert error["phase"] == "external_runner_execution"
+
+
+def test_external_monitor_setup_failure_is_archived(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _patch_common(monkeypatch, _scenario())
+    monkeypatch.setattr(
+        "memory_bench_platform.cli.resolve_benchmark_entrypoint",
+        lambda benchmark, entrypoint: EntryPointRecord(
+            entrypoint_id="external",
+            entrypoint_kind="external_runner",
+            command=["runner"],
+        ),
+    )
+
+    class BrokenMonitor(_Monitor):
+        def setup_writers(self):
+            raise OSError("monitor setup failed")
+
+    monkeypatch.setattr("memory_bench_platform.cli.ResourceMonitor", BrokenMonitor)
+
+    with pytest.raises(OSError, match="monitor setup failed"):
+        main(_run_args("external-monitor-failure"))
+
+    run_dir = _run_dir(tmp_path, "external-monitor-failure")
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    error = json.loads((run_dir / "records/run_error.json").read_text(encoding="utf-8"))
+    assert run["status"] == "failed"
+    assert run["ended_at"] is not None
+    assert error["phase"] == "external_runner_execution"
+
+
+def test_smoke_gate_exception_is_archived_before_benchmark_execution(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _patch_common(monkeypatch, _scenario())
+    monkeypatch.setattr(
+        "memory_bench_platform.cli.execute_smoke_skill",
+        lambda smoke_id, run_dir: (_ for _ in ()).throw(RuntimeError("gate crashed")),
+    )
+
+    with pytest.raises(RuntimeError, match="gate crashed"):
+        main(
+            _run_args("smoke-gate-failure")
+            + ["--smoke-gate", "locomo-openclaw-openviking-minimal"]
+        )
+
+    run_dir = _run_dir(tmp_path, "smoke-gate-failure")
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    error = json.loads((run_dir / "records/run_error.json").read_text(encoding="utf-8"))
+    assert run["status"] == "failed"
+    assert run["ended_at"] is not None
+    assert error["phase"] == "smoke_gate"
+    assert error["details"]["smoke_id"] == "locomo-openclaw-openviking-minimal"
 
 
 def test_scenario_builder_failure_is_archived_and_run_is_terminated(tmp_path, monkeypatch):
