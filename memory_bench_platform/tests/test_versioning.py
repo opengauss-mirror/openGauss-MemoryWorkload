@@ -1,0 +1,204 @@
+from memory_bench_platform.versioning import (
+    _tag_sort_key,
+    build_external_runner_env,
+    build_version_selection,
+    resolve_latest_release_tag,
+)
+
+
+class _Target:
+    def __init__(self, payload):
+        self.name = payload["name"]
+        self.version_source = payload["version_source"]
+        self.upstream = payload.get("upstream")
+        self._payload = payload
+
+    def model_dump(self, mode="json"):
+        return dict(self._payload)
+
+
+class _Policy:
+    def __init__(self, targets):
+        self.default_selection = "latest_official_release_tag"
+        self.targets = [_Target(item) for item in targets]
+
+
+class _Manifest:
+    def __init__(self, targets):
+        self.version_policy = _Policy(targets)
+
+
+def test_tag_sort_key_ignores_non_release_tags():
+    assert _tag_sort_key("v0.3.24") == (0, 3, 24)
+    assert _tag_sort_key("1.2.3") == (1, 2, 3)
+    assert _tag_sort_key("v0.3.24-rc1") is None
+    assert _tag_sort_key("main") is None
+
+
+def test_resolve_latest_release_tag_picks_highest_semver(monkeypatch):
+    class _Proc:
+        returncode = 0
+        stdout = "\n".join(
+            [
+                "sha1\trefs/tags/v0.3.9",
+                "sha2\trefs/tags/v0.3.24",
+                "sha3\trefs/tags/v0.3.24-rc1",
+                "sha4\trefs/tags/v0.3.18",
+            ]
+        )
+        stderr = ""
+
+    monkeypatch.setattr("memory_bench_platform.versioning.subprocess.run", lambda *args, **kwargs: _Proc())
+    resolved = resolve_latest_release_tag("https://github.com/volcengine/OpenViking")
+    assert resolved["status"] == "resolved"
+    assert resolved["resolved_version"] == "v0.3.24"
+
+
+def test_build_version_selection_records_resolved_default(monkeypatch):
+    monkeypatch.setattr(
+        "memory_bench_platform.versioning.resolve_latest_release_tag",
+        lambda upstream, **kwargs: {
+            "status": "resolved",
+            "upstream": upstream,
+            "resolved_version": "v9.9.9",
+            "source": "test",
+        },
+    )
+    manifest = _Manifest(
+        [
+            {
+                "name": "openclaw",
+                "scope": "system_under_test",
+                "version_source": "upstream_release_tag",
+                "upstream": "https://github.com/openclaw/openclaw",
+            },
+            {
+                "name": "generic-cli",
+                "scope": "runtime_dependency",
+                "version_source": "runtime_observed_only",
+                "upstream": None,
+            },
+        ]
+    )
+    payload = build_version_selection(manifest)
+    assert payload["selection_mode"] == "latest_official_release_tag"
+    assert payload["targets"][0]["resolved_default"]["resolved_version"] == "v9.9.9"
+    assert payload["targets"][0]["selected_version"] == "v9.9.9"
+    assert payload["targets"][0]["selected_by"] == "latest_official_release_tag"
+    assert payload["targets"][1]["resolved_default"]["status"] == "runtime_observed_only"
+
+
+def test_build_external_runner_env_exports_expected_target_versions():
+    payload = {
+        "benchmark": {
+            "selection_mode": "latest_official_release_tag",
+            "targets": [
+                {
+                    "name": "locomo-benchmark",
+                    "scope": "benchmark_tooling",
+                    "upstream": "https://github.com/snap-research/locomo",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v1.0.0",
+                    },
+                }
+            ],
+        },
+        "agent": {
+            "selection_mode": "latest_official_release_tag",
+            "targets": [
+                {
+                    "name": "openclaw",
+                    "scope": "system_under_test",
+                    "upstream": "https://github.com/openclaw/openclaw",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v2026.4.8",
+                    },
+                },
+                {
+                    "name": "openviking",
+                    "scope": "memory_backend",
+                    "upstream": "https://github.com/volcengine/OpenViking",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v0.3.24",
+                    },
+                },
+                {
+                    "name": "generic-cli",
+                    "scope": "runtime_dependency",
+                    "upstream": None,
+                    "resolved_default": {
+                        "status": "runtime_observed_only",
+                    },
+                },
+            ],
+        },
+    }
+
+    env = build_external_runner_env(payload)
+
+    assert env["MEMORY_BENCH_EXPECTED_LOCOMO_BENCHMARK_VERSION"] == "v1.0.0"
+    assert env["MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION"] == "v2026.4.8"
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_UPSTREAM"] == "https://github.com/volcengine/OpenViking"
+    assert "MEMORY_BENCH_EXPECTED_GENERIC_CLI_VERSION" not in env
+
+
+def test_build_version_selection_applies_user_override(monkeypatch):
+    monkeypatch.setattr(
+        "memory_bench_platform.versioning.resolve_latest_release_tag",
+        lambda upstream, **kwargs: {
+            "status": "resolved",
+            "upstream": upstream,
+            "resolved_version": "v9.9.9",
+            "source": "test",
+        },
+    )
+    manifest = _Manifest(
+        [
+            {
+                "name": "openviking",
+                "scope": "memory_backend",
+                "version_source": "upstream_release_tag",
+                "upstream": "https://github.com/volcengine/OpenViking",
+            }
+        ]
+    )
+
+    payload = build_version_selection(
+        manifest,
+        overrides={"openviking": "v0.3.24"},
+    )
+
+    assert payload["selection_mode"] == "user_specified_official_version"
+    assert payload["overridden"] is True
+    assert payload["targets"][0]["resolved_default"]["resolved_version"] == "v9.9.9"
+    assert payload["targets"][0]["selected_version"] == "v0.3.24"
+    assert payload["targets"][0]["selected_by"] == "user_specified_official_version"
+
+
+def test_build_external_runner_env_prefers_selected_version_over_resolved_default():
+    payload = {
+        "agent": {
+            "selection_mode": "user_specified_official_version",
+            "overridden": True,
+            "targets": [
+                {
+                    "name": "openviking",
+                    "upstream": "https://github.com/volcengine/OpenViking",
+                    "resolved_default": {
+                        "status": "resolved",
+                        "resolved_version": "v0.4.4",
+                    },
+                    "selected_version": "v0.3.24",
+                    "selected_by": "user_specified_official_version",
+                }
+            ],
+        }
+    }
+
+    env = build_external_runner_env(payload)
+
+    assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"

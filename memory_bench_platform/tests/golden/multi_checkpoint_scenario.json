@@ -1,0 +1,45 @@
+{
+  "source_kind": "benchmark_scenario",
+  "benchmark_id": "golden-progressive-memory",
+  "requirements": {
+    "agent": {"multi_turn": true, "stateful_session": true},
+    "memory": {"actions": ["ingest", "recall"]}
+  },
+  "samples": [
+    {
+      "sample_id": "sample-1",
+      "timeline": [
+        {
+          "event_id": "session-1",
+          "type": "conversation",
+          "payload": {"content": "The user prefers tea."}
+        },
+        {
+          "event_id": "checkpoint-1",
+          "type": "checkpoint",
+          "evaluation": {
+            "target": "qa_answer",
+            "questions": [
+              {"question_id": "q1", "question": "What does the user prefer?", "reference": "tea"}
+            ]
+          }
+        },
+        {
+          "event_id": "session-2",
+          "type": "conversation",
+          "payload": {"content": "The user now prefers coffee."}
+        },
+        {
+          "event_id": "checkpoint-2",
+          "type": "checkpoint",
+          "evaluation": {
+            "target": "qa_answer",
+            "questions": [
+              {"question_id": "q2", "question": "What does the user prefer now?", "reference": "coffee"}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

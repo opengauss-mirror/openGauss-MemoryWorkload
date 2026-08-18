@@ -1,0 +1,19 @@
+kind: analysis
+id: result-analyzer
+version: 0.1.0
+entry:
+  module: memory_bench_platform.result_analysis
+supports:
+  benchmarks:
+    - locomo
+    - longmemeval
+    - ovtest-memory
+    - ovtest-health
+    - ovtest-admin-memory
+  sources:
+    - benchmark_case_source
+    - external_benchmark_runner
+    - native_workflow
+outputs:
+  - reports/analysis.json
+  - reports/analysis.md

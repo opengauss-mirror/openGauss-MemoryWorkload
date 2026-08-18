@@ -1,0 +1,2078 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import glob
+import re
+import subprocess
+import textwrap
+from pathlib import Path
+
+
+def _run(cmd: list[str], *, input_text: str | None = None) -> None:
+    subprocess.run(cmd, check=True, text=input_text is not None, input=input_text)
+
+
+def _encode_file(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _remove_redundant_reindex_injection(phase_text: str) -> str:
+    """Keep only one reindex_memory_root shim and one wait_for_search_visibility signature."""
+
+    first = phase_text.find("\ndef reindex_memory_root(")
+    marker = "\ndef wait_for_search_visibility("
+    wait_idx = phase_text.find(marker)
+    if first != -1 and wait_idx != -1 and first < wait_idx:
+        return phase_text[:first] + "\n" + phase_text[wait_idx:]
+    pattern = re.compile(
+        r"\ndef reindex_memory_root\([^\n]*\n(?:    .*?\n)+?\n(?=def wait_for_search_visibility\()",
+        re.MULTILINE,
+    )
+    return pattern.sub("\n", phase_text)
+
+
+def _remove_redundant_plugin_config_cleanup(phase_text: str) -> str:
+    repeated = re.compile(
+        r"(\n    changed\.update\(\n        \{\n            key: None\n            for key in legacy_keys\n            if key in current\n        \}\n    \)\n){2,}",
+        re.MULTILINE,
+    )
+    single = (
+        "\n    changed.update(\n"
+        "        {\n"
+        "            key: None\n"
+        "            for key in legacy_keys\n"
+        "            if key in current\n"
+        "        }\n"
+        "    )\n"
+    )
+    return repeated.sub(single, phase_text)
+
+
+def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
+    repeated = re.compile(r'(\n        "post_ingest_reindex": reindex_result,){2,}', re.MULTILINE)
+    return repeated.sub('\n        "post_ingest_reindex": reindex_result,', phase_text)
+
+
+def _normalize_remote_python_source(source_text: str) -> str:
+    lines = source_text.splitlines()
+    normalized: list[str] = []
+    in_triple_single = False
+    in_triple_double = False
+
+    for line in lines:
+        current = line
+        if not in_triple_single and not in_triple_double and current.startswith("        "):
+            current = current[8:]
+        normalized.append(current)
+
+        single_markers = current.count("'''")
+        double_markers = current.count('"""')
+        if not in_triple_double and single_markers % 2 == 1:
+            in_triple_single = not in_triple_single
+        if not in_triple_single and double_markers % 2 == 1:
+            in_triple_double = not in_triple_double
+
+    return "\n".join(normalized)
+
+
+def _enable_benchmark_plugin_diagnostics(shell_text: str) -> str:
+    if 'cfg["emitStandardDiagnostics"] = True\n' in shell_text:
+        return shell_text
+    anchor = 'cfg["accountId"] = account_id\n'
+    replacement = (
+        'cfg["accountId"] = account_id\n'
+        'cfg["emitStandardDiagnostics"] = True\n'
+        'cfg["logFindRequests"] = True\n'
+    )
+    return shell_text.replace(anchor, replacement)
+
+
+def _enable_dedicated_gateway_port(shell_text: str) -> str:
+    if 'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"' not in shell_text:
+        shell_text = shell_text.replace(
+            'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\n',
+            'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\n'
+            'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\n',
+        )
+
+    if "set_openclaw_gateway_port()" not in shell_text:
+        shell_text = shell_text.replace(
+            "sync_openclaw_auth_profiles() {\n",
+            """set_openclaw_gateway_port() {
+  python3 - "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" <<'__OVTEST_GATEWAY_PORT_PY__'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+gateway_port = int(sys.argv[2])
+data = json.loads(config_path.read_text(encoding="utf-8"))
+gateway = data.setdefault("gateway", {})
+gateway["port"] = gateway_port
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{{gateway_port}}",
+    f"http://127.0.0.1:{{gateway_port}}",
+]
+config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+print(json.dumps({{"gateway_port": gateway_port}}, ensure_ascii=False))
+PY
+}
+
+sync_openclaw_auth_profiles() {
+""",
+        )
+
+    shell_text = shell_text.replace(
+        '    if curl -fsS http://127.0.0.1:18789/health >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\n',
+        '    if curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\n',
+    )
+    shell_text = shell_text.replace(
+        'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")\n',
+        'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")\n',
+    )
+    shell_text = re.sub(
+        r'config_path\.write_text\(json\.dumps\(data, ensure_ascii=False, indent=2\) \+ "\s*"\s*, encoding="utf-8"\)',
+        'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    base_url_flag = '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n'
+    if base_url_flag not in shell_text:
+        shell_text = shell_text.replace(
+            '    --output-dir "${OUTPUT_DIR}"\n',
+            '    --output-dir "${OUTPUT_DIR}"\n' + base_url_flag,
+        )
+    if "  set_openclaw_gateway_port\n  sync_openclaw_auth_profiles\n" not in shell_text:
+        shell_text = shell_text.replace(
+            "  sync_openclaw_auth_profiles\n",
+            "  set_openclaw_gateway_port\n"
+            "  sync_openclaw_auth_profiles\n",
+        )
+    return shell_text
+
+
+def _enable_isolated_runtime(shell_text: str) -> str:
+    if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"' not in shell_text:
+        shell_text = shell_text.replace(
+            'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\n',
+            'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\n'
+            'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"\n'
+            'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"\n'
+            'OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-/tmp/openclaw-home-$RUN_ID}"\n'
+            'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\n'
+            'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-$RUN_ID}"\n'
+            'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"\n'
+            'OPENVIKING_AGFS_PORT="${OPENVIKING_AGFS_PORT:-21833}"\n',
+        )
+
+    shell_text = shell_text.replace(
+        'OV_CONF_PATH="${OV_CONF_PATH:-/root/.openviking/ov.conf}"\n'
+        'OV_DATA_DIR="${OV_DATA_DIR:-/root/.openviking/data}"\n'
+        'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-/root/.openclaw/agents/locomo-eval}"\n'
+        'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-/root/.openclaw/agents/main/agent}"\n'
+        'OPENCLAW_ENV="${OPENCLAW_ENV:-/root/.openclaw/openviking.env}"\n'
+        'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\n',
+        'BASE_OV_CONF_PATH="${BASE_OV_CONF_PATH:-/root/.openviking/ov.conf}"\n'
+        'OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"\n'
+        'OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"\n'
+        'BASE_OPENCLAW_STATE_DIR="${BASE_OPENCLAW_STATE_DIR:-/root/.openclaw}"\n'
+        'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/locomo-eval}"\n'
+        'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"\n'
+        'OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"\n'
+        'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\n'
+        'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\n'
+        'export OPENVIKING_CONFIG_FILE="${OV_CONF_PATH}"\n'
+        'export OPENCLAW_STATE_DIR\n'
+        'export OPENCLAW_CONFIG_PATH\n',
+    )
+    if 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\n',
+            'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\n'
+            'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\n',
+        )
+
+    if "bootstrap_isolated_runtime()" not in shell_text:
+        shell_text = shell_text.replace(
+            'mkdir -p "${OUTPUT_DIR}"\n\nbackup_and_reset() {\n',
+            """mkdir -p "${OUTPUT_DIR}"
+
+bootstrap_isolated_runtime() {
+  rm -rf "${OPENCLAW_HOME_DIR}"
+  mkdir -p "${OPENCLAW_HOME_DIR}" "${OPENCLAW_STATE_DIR}" "${OPENCLAW_AGENT_DIR}" "${OPENCLAW_MAIN_AGENT_DIR}" "${OV_DATA_DIR}"
+  ln -s "${OPENCLAW_STATE_DIR}" "${OPENCLAW_HOME_DIR}/.openclaw"
+
+  python3 - "${BASE_OPENCLAW_STATE_DIR}" "${OPENCLAW_STATE_DIR}" "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" "${LOCOMO_EVAL_MODEL}" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+base_state_dir = Path(sys.argv[1])
+state_dir = Path(sys.argv[2])
+config_path = Path(sys.argv[3])
+gateway_port = int(sys.argv[4])
+locomo_model = sys.argv[5].strip()
+
+state_dir.mkdir(parents=True, exist_ok=True)
+config_path.parent.mkdir(parents=True, exist_ok=True)
+
+base_config = json.loads((base_state_dir / "openclaw.json").read_text(encoding="utf-8"))
+base_config.pop("stateDir", None)
+gateway = base_config.setdefault("gateway", {})
+gateway["port"] = gateway_port
+if locomo_model:
+    base_config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = locomo_model
+    for agent in base_config.get("agents", {}).get("list", []):
+        if isinstance(agent, dict) and agent.get("id") == "locomo-eval":
+            agent["model"] = locomo_model
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{gateway_port}",
+    f"http://127.0.0.1:{gateway_port}",
+]
+config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+
+for rel in [
+    ("agents/main/agent/auth-profiles.json", "agents/main/agent/auth-profiles.json"),
+    ("agents/main/agent/auth-state.json", "agents/main/agent/auth-state.json"),
+    ("openviking.env", "openviking.env"),
+]:
+    src = base_state_dir / rel[0]
+    dst = state_dir / rel[1]
+    if src.exists():
+      dst.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(src, dst)
+
+extensions_src = base_state_dir / "extensions" / "openviking"
+extensions_dst = state_dir / "extensions" / "openviking"
+if extensions_src.exists():
+    if extensions_dst.exists():
+        shutil.rmtree(extensions_dst)
+    extensions_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(extensions_src, extensions_dst)
+    plugin_manifest = extensions_dst / "openclaw.plugin.json"
+    if plugin_manifest.exists():
+        manifest_data = json.loads(plugin_manifest.read_text(encoding="utf-8"))
+        config_schema = manifest_data.setdefault("configSchema", {})
+        properties = config_schema.setdefault("properties", {})
+        properties.setdefault("agent_prefix", {"type": "string"})
+        plugin_manifest.write_text(
+            json.dumps(manifest_data, ensure_ascii=False, indent=2) + chr(10),
+            encoding="utf-8",
+        )
+PY
+
+  python3 - "${BASE_OV_CONF_PATH}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" "${OPENVIKING_AGFS_PORT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base_conf = Path(sys.argv[1])
+target_conf = Path(sys.argv[2])
+data_dir = Path(sys.argv[3])
+ov_port = int(sys.argv[4])
+agfs_port = int(sys.argv[5])
+
+target_conf.parent.mkdir(parents=True, exist_ok=True)
+data_dir.mkdir(parents=True, exist_ok=True)
+
+cfg = json.loads(base_conf.read_text(encoding="utf-8"))
+cfg.setdefault("server", {})["port"] = ov_port
+cfg.setdefault("storage", {})["workspace"] = str(data_dir)
+cfg.setdefault("storage", {}).setdefault("agfs", {})["port"] = agfs_port
+target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+PY
+}
+
+backup_and_reset() {\n""",
+        )
+
+    shell_text = shell_text.replace(
+        '  pkill -f \'phase_a_off.py\' || true\n'
+        '  pkill -f \'openclaw-gateway\' || true\n'
+        '  pkill -f \'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\' || true\n'
+        '  sleep 2\n'
+        '\n'
+        '  rm -rf "${OV_DATA_DIR:?}/"*\n'
+        '  mkdir -p "${OV_DATA_DIR}"\n',
+        '  if [[ "${OPENCLAW_STATE_DIR}" == "/root/.openclaw" ]]; then\n'
+        '    pkill -f \'phase_a_off.py\' || true\n'
+        '    pkill -f \'openclaw-gateway\' || true\n'
+        '    pkill -f \'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\' || true\n'
+        '    sleep 2\n'
+        '  fi\n'
+        '\n'
+        '  rm -rf "${OV_DATA_DIR:?}/"*\n'
+        '  mkdir -p "${OV_DATA_DIR}"\n',
+    )
+    shell_text = shell_text.replace(
+        "set_wm_mode() {\n"
+        "  python3 - \"${OV_CONF_PATH}\" \"${MODE}\" <<'PY'\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "conf_path = Path(sys.argv[1])\n"
+        "mode = sys.argv[2]\n"
+        "data = json.loads(conf_path.read_text(encoding=\"utf-8\"))\n"
+        "data.setdefault(\"memory\", {})[\"wm_v2_preprocess_enabled\"] = (mode == \"on\")\n"
+        "conf_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n"
+        "print(json.dumps(data[\"memory\"], ensure_ascii=False))\n"
+        "PY\n"
+        "}\n",
+        "set_wm_mode() {\n"
+        "  \"${OPENVIKING_PYTHON_BIN}\" - \"${OV_CONF_PATH}\" \"${MODE}\" <<'PY'\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "try:\n"
+        "    import openviking\n"
+        "    ov_version = getattr(openviking, \"__version__\", \"\")\n"
+        "except Exception:\n"
+        "    ov_version = \"\"\n"
+        "\n"
+        "conf_path = Path(sys.argv[1])\n"
+        "mode = sys.argv[2]\n"
+        "data = json.loads(conf_path.read_text(encoding=\"utf-8\"))\n"
+        "memory = data.setdefault(\"memory\", {})\n"
+        "if ov_version.startswith(\"0.3.24\"):\n"
+        "    memory.pop(\"wm_v2_preprocess_enabled\", None)\n"
+        "    result = {\"wm_v2_preprocess_enabled\": None, \"skipped_for_version\": ov_version}\n"
+        "else:\n"
+        "    memory[\"wm_v2_preprocess_enabled\"] = (mode == \"on\")\n"
+        "    result = dict(memory)\n"
+        "conf_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n"
+        "print(json.dumps(result, ensure_ascii=False))\n"
+        "PY\n"
+        "}\n",
+    )
+
+    if '"${OPENVIKING_PORT}" <<\'PY\'' not in shell_text:
+        shell_text = shell_text.replace(
+            '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" <<\'PY\'\n',
+            '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" "${OPENVIKING_PORT}" <<\'PY\'\n',
+        )
+    if 'openviking_port = int(sys.argv[6])\n' not in shell_text:
+        shell_text = shell_text.replace(
+            'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\n',
+            'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\n'
+            'openviking_port = int(sys.argv[6])\n',
+        )
+    if 'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            'cfg["userId"] = user_id\n',
+            'cfg["mode"] = "remote"\n'
+            'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n'
+            'cfg["userId"] = user_id\n',
+        )
+    elif 'cfg["mode"] = "remote"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n',
+            'cfg["mode"] = "remote"\n'
+            'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n',
+        )
+    shell_text = re.sub(
+        r'(?:^openviking_port = int\(sys\.argv\[6\]\)\n)+',
+        'openviking_port = int(sys.argv[6])\n',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = re.sub(
+        r'(?:^cfg\["baseUrl"\] = f"http://127\.0\.0\.1:\{openviking_port\}"\n)+',
+        'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = shell_text.replace(
+        'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n'
+        'cfg["userId"] = user_id\n',
+        'cfg["mode"] = "remote"\n'
+        'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n'
+        'cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\n'
+        'cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\n'
+        'cfg["userId"] = user_id\n',
+    )
+    if 'cfg["accountId"] = account_id\n' not in shell_text and 'cfg["userId"] = user_id\n' in shell_text:
+        shell_text = shell_text.replace(
+            'cfg["userId"] = user_id\n',
+            'cfg["accountId"] = account_id\n'
+            'cfg["userId"] = user_id\n',
+        )
+    shell_text = shell_text.replace('cfg["agent_prefix"] = account_id\n', "")
+    if 'cfg.pop("agent_prefix", None)\n' not in shell_text:
+        if 'cfg["logFindRequests"] = True\n' in shell_text:
+            shell_text = shell_text.replace(
+                'cfg["logFindRequests"] = True\n',
+                'cfg["logFindRequests"] = True\n'
+                'cfg.pop("agent_prefix", None)\n',
+            )
+        else:
+            shell_text = shell_text.replace(
+                'cfg["accountId"] = account_id\n',
+                'cfg["accountId"] = account_id\n'
+                'cfg.pop("agent_prefix", None)\n',
+            )
+    shell_text = shell_text.replace('cfg.pop("isolateUserScopeByAgent", None)\n', "")
+    shell_text = shell_text.replace('cfg.pop("isolateAgentScopeByUser", None)\n', "")
+
+    shell_text = shell_text.replace('  cd /tmp\n', "")
+    if 'start_services() {\n  cd "${REPO_ROOT}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            'start_services() {\n',
+            'start_services() {\n'
+            '  cd "${REPO_ROOT}"\n',
+        )
+    shell_text = shell_text.replace(
+        '  nohup python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1 >"${OV_LOG}" 2>&1 &\n',
+        '  (cd /tmp && nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &)\n',
+    )
+    shell_text = shell_text.replace(
+        '  nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\n',
+        '  (cd /tmp && nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &)\n',
+    )
+    shell_text = shell_text.replace(
+        '  nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\n',
+        '  (cd /tmp && nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &)\n',
+    )
+    shell_text = shell_text.replace(
+        '    if curl -fsS http://127.0.0.1:1933/health >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\n',
+        '    if curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\n',
+    )
+    shell_text = shell_text.replace(
+        '  # shellcheck disable=SC1090\n'
+        '  source "${OPENCLAW_ENV}"\n'
+        '  nohup openclaw gateway >"${GW_LOG}" 2>&1 &\n',
+        '  # shellcheck disable=SC1090\n'
+        '  source "${OPENCLAW_ENV}"\n'
+        '  nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\n',
+    )
+    if (
+        'nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\n'
+        not in shell_text
+    ):
+        shell_text = shell_text.replace(
+            '  source "${OPENCLAW_ENV}"\n'
+            '  nohup openclaw gateway >"${GW_LOG}" 2>&1 &\n',
+            '  source "${OPENCLAW_ENV}"\n'
+            '  nohup env HOME="${OPENCLAW_HOME_DIR}" OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\n',
+        )
+    if "__OVTEST_PLUGIN_USERKEY__" not in shell_text:
+        shell_text = shell_text.replace(
+            '  source "${OPENCLAW_ENV}"\n',
+            '  curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts" \\\n'
+            '    -H "Content-Type: application/json" \\\n'
+            '    -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\n'
+            '    -d "{\\"account_id\\":\\"${OV_ACCOUNT_ID}\\",\\"admin_user_id\\":\\"${OV_USER_ID}-admin\\",\\"isolate_user_scope_by_agent\\":true,\\"isolate_agent_scope_by_user\\":true}" \\\n'
+            '    >/tmp/"${RUN_ID}"_ensure_account.json 2>/dev/null || true\n'
+            '  PLUGIN_USER_KEY=""\n'
+            '  for _attempt in 1 2 3 4 5; do\n'
+            '    USER_CREATE_RESP=$(curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\n'
+            '      -H "Content-Type: application/json" \\\n'
+            '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\n'
+            '      -d "{\\"user_id\\":\\"${OV_USER_ID}\\",\\"role\\":\\"user\\"}" || true)\n'
+            '    PLUGIN_USER_KEY=$(printf "%s" "${USER_CREATE_RESP}" | python3 -c \'import json,sys; raw=sys.stdin.read().strip(); data=json.loads(raw) if raw else {}; print(((data.get("result") or {}).get("user_key")) or "")\' 2>/dev/null || true)\n'
+            '    if [ -n "${PLUGIN_USER_KEY}" ]; then\n'
+            '      break\n'
+            '    fi\n'
+            '    sleep 1\n'
+            '  done\n'
+            '  if [ -z "${PLUGIN_USER_KEY}" ]; then\n'
+            '    echo "warning: failed to provision OpenViking user key for ${OV_ACCOUNT_ID}/${OV_USER_ID}; keeping root API key with explicit tenant headers" >&2\n'
+            '  fi\n'
+            '  python3 - "${OPENCLAW_CONFIG_PATH}" "${PLUGIN_USER_KEY}" <<\'__OVTEST_PLUGIN_USERKEY__\'\n'
+            'import json\n'
+            'import sys\n'
+            'from pathlib import Path\n'
+            '\n'
+            'config_path = Path(sys.argv[1])\n'
+            'user_key = sys.argv[2]\n'
+            'data = json.loads(config_path.read_text(encoding="utf-8"))\n'
+            'cfg = data.setdefault("plugins", {}).setdefault("entries", {}).setdefault("openviking", {}).setdefault("config", {})\n'
+            'cfg["apiKey"] = str(cfg.get("apiKey") or user_key or "")\n'
+            'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")\n'
+            'print(json.dumps({"plugin_api_key": "preserved", "has_user_key": bool(user_key), "accountId": cfg.get("accountId"), "userId": cfg.get("userId")}, ensure_ascii=False))\n'
+            '__OVTEST_PLUGIN_USERKEY__\n'
+            '  source "${OPENCLAW_ENV}"\n',
+        )
+    shell_text = shell_text.replace(
+        '"admin_user_id":"${OV_USER_ID}"',
+        '"admin_user_id":"${OV_USER_ID}-admin"',
+    )
+    shell_text = shell_text.replace(
+        '\\"admin_user_id\\":\\"${OV_USER_ID}\\"',
+        '\\"admin_user_id\\":\\"${OV_USER_ID}-admin\\"',
+    )
+    shell_text = shell_text.replace('isolate_user_scope_by_agent\\":false', 'isolate_user_scope_by_agent\\":true')
+    shell_text = shell_text.replace('isolate_agent_scope_by_user\\":false', 'isolate_agent_scope_by_user\\":true')
+    shell_text = shell_text.replace('isolate_user_scope_by_agent":false', 'isolate_user_scope_by_agent":true')
+    shell_text = shell_text.replace('isolate_agent_scope_by_user":false', 'isolate_agent_scope_by_user":true')
+    shell_text = shell_text.replace(
+        '    -d "{\\"account_id\\":\\"${OV_ACCOUNT_ID}\\",\\"admin_user_id\\":\\"${OV_USER_ID}\\",\\"isolate_user_scope_by_agent\\":true,\\"isolate_agent_scope_by_user\\":true}" \\\n',
+        '    -d "{\\"account_id\\":\\"${OV_ACCOUNT_ID}\\",\\"admin_user_id\\":\\"${OV_USER_ID}-admin\\",\\"isolate_user_scope_by_agent\\":true,\\"isolate_agent_scope_by_user\\":true}" \\\n',
+    )
+    shell_text = shell_text.replace(
+        '  PLUGIN_USER_KEY=$(\\\n'
+        '    curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\n'
+        '      -H "Content-Type: application/json" \\\n'
+        '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\n'
+        '      -d "{\\"user_id\\":\\"${OV_USER_ID}\\",\\"role\\":\\"user\\"}" \\\n'
+        '    | python3 -c \'import json,sys; data=json.load(sys.stdin); print(((data.get("result") or {}).get("user_key")) or "")\'\\\n'
+        '  )\n',
+        '  PLUGIN_USER_KEY=""\n'
+        '  for _attempt in 1 2 3 4 5; do\n'
+        '    USER_CREATE_RESP=$(curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\n'
+        '      -H "Content-Type: application/json" \\\n'
+        '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\n'
+        '      -d "{\\"user_id\\":\\"${OV_USER_ID}\\",\\"role\\":\\"user\\"}" || true)\n'
+        '    PLUGIN_USER_KEY=$(printf "%s" "${USER_CREATE_RESP}" | python3 -c \'import json,sys; raw=sys.stdin.read().strip(); data=json.loads(raw) if raw else {}; print(((data.get("result") or {}).get("user_key")) or "")\' 2>/dev/null || true)\n'
+        '    if [ -n "${PLUGIN_USER_KEY}" ]; then\n'
+        '      break\n'
+        '    fi\n'
+        '    sleep 1\n'
+        '  done\n',
+    )
+    shell_text = re.sub(
+        r'  PLUGIN_USER_KEY=\(\\\n'
+        r'    curl -sS -X POST "http://127\.0\.0\.1:\$\{OPENVIKING_PORT\}/api/v1/admin/accounts/\$\{OV_ACCOUNT_ID\}/users" \\\n'
+        r'      -H "Content-Type: application/json" \\\n'
+        r'      -H "X-API-Key: \$\{OPENVIKING_ROOT_API_KEY\}" \\\n'
+        r'      -d "\{\\\"user_id\\\":\\\"\$\{OV_USER_ID\}\\\",\\\"role\\\":\\\"user\\\"\}" \\\n'
+        r'    \| python3 -c .*?\n'
+        r'  \)\n',
+        '  PLUGIN_USER_KEY=""\n'
+        '  for _attempt in 1 2 3 4 5; do\n'
+        '    USER_CREATE_RESP=$(curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\n'
+        '      -H "Content-Type: application/json" \\\n'
+        '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\n'
+        '      -d "{\\"user_id\\":\\"${OV_USER_ID}\\",\\"role\\":\\"user\\"}" || true)\n'
+        '    PLUGIN_USER_KEY=$(printf "%s" "${USER_CREATE_RESP}" | python3 -c \'import json,sys; raw=sys.stdin.read().strip(); data=json.loads(raw) if raw else {}; print(((data.get("result") or {}).get("user_key")) or "")\' 2>/dev/null || true)\n'
+        '    if [ -n "${PLUGIN_USER_KEY}" ]; then\n'
+        '      break\n'
+        '    fi\n'
+        '    sleep 1\n'
+        '  done\n',
+        shell_text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+    if '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            '    --output-dir "${OUTPUT_DIR}"\n',
+            '    --output-dir "${OUTPUT_DIR}"\n'
+            '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n'
+        )
+    if '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n',
+            '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n'
+            '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n'
+        )
+    if '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\n' not in shell_text:
+        shell_text = shell_text.replace(
+            '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n',
+            '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n'
+            '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\n',
+        )
+
+    if "  bootstrap_isolated_runtime\n  backup_and_reset\n" not in shell_text:
+        shell_text = shell_text.replace(
+            "{\n  backup_and_reset\n",
+            "{\n  bootstrap_isolated_runtime\n  backup_and_reset\n",
+        )
+
+    shell_text = re.sub(
+        r'(?:^    --base-url "http://127\.0\.0\.1:\$\{OPENCLAW_GATEWAY_PORT\}"\n)+',
+        '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = re.sub(
+        r'(?:^    --openviking-url "http://127\.0\.0\.1:\$\{OPENVIKING_PORT\}"\n)+',
+        '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = re.sub(
+        r'(?:^    --openclaw-state-dir "\$\{OPENCLAW_STATE_DIR\}"\n)+',
+        '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\n',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = re.sub(
+        r'(?:^  set_openclaw_gateway_port\n)+',
+        '  set_openclaw_gateway_port\n',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = re.sub(
+        r'config_path\.write_text\(json\.dumps\(base_config, ensure_ascii=False, indent=2\) \+ "\n"\s*, encoding="utf-8"\)',
+        'config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    shell_text = re.sub(
+        r'target_conf\.write_text\(json\.dumps\(cfg, ensure_ascii=False, indent=2\) \+ "\n"\s*, encoding="utf-8"\)',
+        'target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+        shell_text,
+        flags=re.MULTILINE,
+    )
+    if 'base_config.pop("stateDir", None)\n' not in shell_text:
+        shell_text = shell_text.replace(
+            'base_config = json.loads((base_state_dir / "openclaw.json").read_text(encoding="utf-8"))\n',
+            'base_config = json.loads((base_state_dir / "openclaw.json").read_text(encoding="utf-8"))\n'
+            'base_config.pop("stateDir", None)\n',
+        )
+    shell_text = shell_text.replace(
+        'base_config["stateDir"] = str(state_dir)\n',
+        'base_config.pop("stateDir", None)\n',
+    )
+
+    dedupe_targets = {
+        '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\n',
+        '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\n',
+        '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\n',
+        "  set_openclaw_gateway_port\n",
+        'openviking_port = int(sys.argv[6])\n',
+        'cfg["mode"] = "remote"\n',
+        'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\n',
+    }
+    dedupe_seen: set[str] = set()
+    deduped_lines: list[str] = []
+    for line in shell_text.splitlines(keepends=True):
+        if line in dedupe_targets:
+            if line in dedupe_seen:
+                continue
+            dedupe_seen.add(line)
+        deduped_lines.append(line)
+    shell_text = "".join(deduped_lines)
+
+    return shell_text
+
+
+def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
+    if kind == "session_extract_context_provider":
+        marker = "latest_archive_session_time: str = \"\","
+        if marker in source_text:
+            return source_text
+        return source_text.replace(
+            "        latest_archive_overview: str = \"\",\n"
+            "        isolation_handler: MemoryIsolationHandler = None,\n",
+            "        latest_archive_overview: str = \"\",\n"
+            "        latest_archive_session_time: str = \"\",\n"
+            "        isolation_handler: MemoryIsolationHandler = None,\n",
+        )
+    if kind == "extract_agent_memories":
+        if (
+            "    async def extract_agent_memories(\n"
+            "        self,\n"
+            "        messages: List[Message],\n"
+            "        ctx: Optional[RequestContext] = None,\n"
+            "        strict_extract_errors: bool = False,\n"
+            "        latest_archive_overview: str = \"\",\n"
+            "        latest_archive_session_time: str = \"\",\n"
+            "    ) -> List[Context]:\n"
+        ) in source_text:
+            return source_text
+        return source_text.replace(
+            "    async def extract_agent_memories(\n"
+            "        self,\n"
+            "        messages: List[Message],\n"
+            "        ctx: Optional[RequestContext] = None,\n"
+            "        strict_extract_errors: bool = False,\n"
+            "    ) -> List[Context]:\n",
+            "    async def extract_agent_memories(\n"
+            "        self,\n"
+            "        messages: List[Message],\n"
+            "        ctx: Optional[RequestContext] = None,\n"
+            "        strict_extract_errors: bool = False,\n"
+            "        latest_archive_overview: str = \"\",\n"
+            "        latest_archive_session_time: str = \"\",\n"
+            "    ) -> List[Context]:\n",
+        )
+    raise ValueError(f"unsupported compatibility patch kind: {kind}")
+
+
+def _ensure_openclaw_openviking_plugin_compat(source_text: str) -> str:
+    updated = re.sub(
+        r'export function createSessionAgentResolver\(configAgentId: string\) \{\n'
+        r'\s*const configAgentPrefix = configAgentId\.trim\(\) === "default" \? "" : configAgentId\.trim\(\);\n',
+        'export function createSessionAgentResolver(configAgentId?: string | null) {\n'
+        '  const normalizedConfigAgentId = typeof configAgentId === "string" ? configAgentId.trim() : "";\n'
+        '  const configAgentPrefix = normalizedConfigAgentId === "default" ? "" : normalizedConfigAgentId;\n',
+        source_text,
+    )
+    updated = updated.replace(
+        "        cfg.agent_prefix,\n"
+        "        cfg.timeoutMs,\n",
+        '        cfg.agent_prefix ?? "",\n'
+        "        cfg.timeoutMs,\n",
+    )
+    updated = updated.replace(
+        "    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix);\n",
+        '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\n',
+    )
+    return updated
+
+
+def _ensure_openclaw_openviking_client_diag(source_text: str) -> str:
+    marker = 'this.routingDebugLog?.(`openviking: request error '
+    if marker not in source_text:
+        old = """      if (!response.ok || payload.status === "error") {
+        const code = payload.error?.code ? ` [${payload.error.code}]` : "";
+        const message = payload.error?.message ?? `HTTP ${response.status}`;
+        throw new Error(`OpenViking request failed${code}: ${message}`);
+      }
+"""
+        new = """      if (!response.ok || payload.status === "error") {
+        const code = payload.error?.code ? ` [${payload.error.code}]` : "";
+        const message = payload.error?.message ?? `HTTP ${response.status}`;
+        this.routingDebugLog?.(
+          `openviking: request error ${path} ` +
+            JSON.stringify({
+              X_OpenViking_Agent: effectiveAgentId || null,
+              X_OpenViking_Account: tenantHeaders.accountId ?? null,
+              X_OpenViking_User: tenantHeaders.userId ?? null,
+              hasApiKey: Boolean(tenantHeaders.apiKey),
+              status: response.status,
+              code: payload.error?.code ?? null,
+              message,
+            }),
+        );
+        throw new Error(`OpenViking request failed${code}: ${message}`);
+      }
+"""
+        source_text = source_text.replace(old, new)
+
+    fastpath_marker = '    const configuredUserId = this.userId.trim();\n'
+    if fastpath_marker not in source_text:
+        source_text = source_text.replace(
+            """    const fallback: RuntimeIdentity = { userId: "default", agentId: effectiveAgentId };
+    try {
+      const status = await this.request<{ user?: unknown }>("/api/v1/system/status", {}, agentId);
+""",
+            """    const configuredUserId = this.userId.trim();
+    if (configuredUserId) {
+      const identity: RuntimeIdentity = { userId: configuredUserId, agentId: effectiveAgentId };
+      this.identityCache.set(effectiveAgentId, identity);
+      return identity;
+    }
+    const fallback: RuntimeIdentity = { userId: "default", agentId: effectiveAgentId };
+    try {
+      const status = await this.request<{ user?: unknown }>("/api/v1/system/status", {}, agentId);
+""",
+        )
+    if "return `${accountId}_${explicit}`;" not in source_text:
+        source_text = source_text.replace(
+            """  private resolveEffectiveAgentId(agentId?: string): string {
+    const explicit = agentId?.trim();
+    if (explicit) {
+      return explicit;
+    }
+    const prefix = this.defaultAgentId.trim();
+    return prefix ? `${prefix}_main` : "main";
+  }
+""",
+            """  private resolveEffectiveAgentId(agentId?: string): string {
+    const explicit = agentId?.trim();
+    if (explicit) {
+      const accountId = this.accountId.trim();
+      if (
+        accountId &&
+        this.isolateUserScopeByAgent &&
+        explicit !== accountId &&
+        !explicit.startsWith(`${accountId}_`)
+      ) {
+        return `${accountId}_${explicit}`;
+      }
+      return explicit;
+    }
+    const prefix = this.defaultAgentId.trim();
+    const fallback = prefix ? `${prefix}_main` : "main";
+    const accountId = this.accountId.trim();
+    if (
+      accountId &&
+      this.isolateUserScopeByAgent &&
+      fallback !== accountId &&
+      !fallback.startsWith(`${accountId}_`)
+    ) {
+      return `${accountId}_${fallback}`;
+    }
+    return fallback;
+  }
+""",
+        )
+    return source_text
+
+
+def _ensure_openclaw_auto_recall_query_extract(source_text: str) -> str:
+    marker = 'const questionMarker = "Question:";'
+    if marker in source_text:
+        return source_text
+    old = """export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  const query =
+    sanitized.length > RECALL_QUERY_MAX_CHARS
+      ? sanitized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : sanitized;
+
+  return {
+    query,
+    truncated: sanitized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+"""
+    new = """export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  let normalized = sanitized;
+  const questionMarker = "Question:";
+  const markerIndex = sanitized.lastIndexOf(questionMarker);
+  if (markerIndex >= 0) {
+    const extracted = sanitized.slice(markerIndex + questionMarker.length).trim();
+    if (extracted) {
+      normalized = extracted;
+    }
+  }
+
+  const query =
+    normalized.length > RECALL_QUERY_MAX_CHARS
+      ? normalized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : normalized;
+
+  return {
+    query,
+    truncated: normalized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+"""
+    return source_text.replace(old, new)
+
+
+def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_profiles: dict | None) -> None:
+    provider_name = str(model_name or "").split("/", 1)[0].strip()
+    if not provider_name:
+        return
+    models = config_data.setdefault("models", {})
+    providers = models.setdefault("providers", {})
+    provider_cfg = providers.get(provider_name)
+    existing_api_key = (
+        str(provider_cfg.get("apiKey") or "").strip()
+        if isinstance(provider_cfg, dict)
+        else ""
+    )
+    if existing_api_key:
+        if provider_name != "minimax" or provider_cfg.get("models"):
+            return
+
+    auth_profiles = auth_profiles or {}
+    candidate_keys = [
+        f"{provider_name}:default",
+        f"{provider_name}:cn",
+        f"{provider_name}-cn:default",
+        f"{provider_name}-portal:default",
+    ]
+    selected = None
+    for profile_id in candidate_keys:
+        profile = auth_profiles.get(profile_id)
+        if isinstance(profile, dict) and str(profile.get("key") or profile.get("access") or "").strip():
+            selected = profile
+            break
+    if selected is None and existing_api_key:
+        selected = {"key": existing_api_key}
+    if selected is None:
+        return
+
+    api_key = str(selected.get("key") or selected.get("access") or "").strip()
+    template = {
+        "apiKey": api_key,
+    }
+    if provider_name == "minimax":
+        template.update(
+            {
+                "baseUrl": "https://api.minimaxi.com/v1",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "MiniMax-M3",
+                        "name": "MiniMax M3",
+                        "reasoning": True,
+                        "input": ["text"],
+                        "cost": {
+                            "input": 0,
+                            "output": 0,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                        },
+                        "contextWindow": 196608,
+                        "maxTokens": 8192,
+                    }
+                ],
+            }
+        )
+    merged = {**template, **(provider_cfg or {})}
+    if provider_name == "minimax" and not merged.get("models"):
+        merged["models"] = template["models"]
+    providers[provider_name] = merged
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Patch remote LoCoMo/OpenClaw runtime for benchmark runs.")
+    parser.add_argument("--ssh-host", default="jcp@123.60.114.206")
+    parser.add_argument("--ssh-port", default="10008")
+    parser.add_argument("--remote-container", default="jcp-dev")
+    parser.add_argument(
+        "--benchmark-dir",
+        default="/home/jcp/agent/code/OpenViking/benchmark/locomo/openclaw",
+    )
+    parser.add_argument("--locomo-model", default=None)
+    args = parser.parse_args()
+
+    script_dir = Path(__file__).resolve().parent
+    agents_path = script_dir / "remote_overrides" / "locomo_eval_AGENTS.md"
+    agents_b64 = _encode_file(agents_path)
+
+    remote_python = textwrap.dedent(
+        """
+        import base64
+        import json
+        import glob
+        from pathlib import Path
+        import re
+
+        benchmark_dir = Path(__BENCHMARK_DIR__)
+
+        def _remove_redundant_reindex_injection(phase_text: str) -> str:
+            pattern = re.compile(
+                r"\\ndef reindex_memory_root\\([^\\n]*\\n(?:    .*?\\n)+?\\n(?=def wait_for_search_visibility\\()",
+                re.MULTILINE,
+            )
+            return pattern.sub("\\n", phase_text)
+
+        def _remove_redundant_plugin_config_cleanup(phase_text: str) -> str:
+            repeated = re.compile(
+                r"(\\n    changed\\.update\\(\\n        \\{{\\n            key: None\\n            for key in legacy_keys\\n            if key in current\\n        \\}}\\n    \\)\\n){{2,}}",
+                re.MULTILINE,
+            )
+            single = (
+                "\\n    changed.update(\\n"
+                "        {{\\n"
+                "            key: None\\n"
+                "            for key in legacy_keys\\n"
+                "            if key in current\\n"
+                "        }}\\n"
+                "    )\\n"
+            )
+            return repeated.sub(single, phase_text)
+
+        def _remove_redundant_post_ingest_meta(phase_text: str) -> str:
+            repeated = re.compile(r'(\\n        \"post_ingest_reindex\": reindex_result,){{2,}}', re.MULTILINE)
+            return repeated.sub('\\n        \"post_ingest_reindex\": reindex_result,', phase_text)
+
+        def _enable_benchmark_plugin_diagnostics(shell_text: str) -> str:
+            if 'cfg["emitStandardDiagnostics"] = True\\n' in shell_text:
+                return shell_text
+            anchor = 'cfg["accountId"] = account_id\\n'
+            replacement = (
+                'cfg["accountId"] = account_id\\n'
+                'cfg["emitStandardDiagnostics"] = True\\n'
+                'cfg["logFindRequests"] = True\\n'
+            )
+            return shell_text.replace(anchor, replacement)
+
+        def _enable_dedicated_gateway_port(shell_text: str) -> str:
+            if 'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"' not in shell_text:
+                shell_text = shell_text.replace(
+                    'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\\n',
+                    'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\\n'
+                    'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\\n',
+                )
+
+            if "set_openclaw_gateway_port()" not in shell_text:
+                gateway_port_block = '''set_openclaw_gateway_port() {
+  python3 - "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" <<'__OVTEST_GATEWAY_PORT_PY__'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+gateway_port = int(sys.argv[2])
+data = json.loads(config_path.read_text(encoding="utf-8"))
+gateway = data.setdefault("gateway", {})
+gateway["port"] = gateway_port
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{gateway_port}",
+    f"http://127.0.0.1:{gateway_port}",
+]
+config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+print(json.dumps({"gateway_port": gateway_port}, ensure_ascii=False))
+__OVTEST_GATEWAY_PORT_PY__
+}
+
+sync_openclaw_auth_profiles() {
+'''
+                shell_text = shell_text.replace(
+                    "sync_openclaw_auth_profiles() {\\n",
+                    gateway_port_block,
+                )
+
+            shell_text = shell_text.replace(
+                '    if curl -fsS http://127.0.0.1:18789/health >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\\n',
+                '    if curl -fsS "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/health" >/tmp/"${RUN_ID}"_gw_health.json 2>/dev/null; then\\n',
+            )
+            shell_text = shell_text.replace(
+                'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\\\n", encoding="utf-8")\\n',
+                'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")\\n',
+            )
+            shell_text = re.sub(
+                r'config_path\.write_text\(json\.dumps\(data, ensure_ascii=False, indent=2\) \+ "\s*"\s*, encoding="utf-8"\)',
+                'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            base_url_flag = '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n'
+            if base_url_flag not in shell_text:
+                shell_text = shell_text.replace(
+                    '    --output-dir "${OUTPUT_DIR}"\\n',
+                    '    --output-dir "${OUTPUT_DIR}"\\n' + base_url_flag,
+                )
+            if "  set_openclaw_gateway_port\\n  sync_openclaw_auth_profiles\\n" not in shell_text:
+                shell_text = shell_text.replace(
+                    "  sync_openclaw_auth_profiles\\n",
+                    "  set_openclaw_gateway_port\\n"
+                    "  sync_openclaw_auth_profiles\\n",
+                )
+            return shell_text
+
+        def _enable_isolated_runtime(shell_text: str) -> str:
+            if 'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"' not in shell_text:
+                shell_text = shell_text.replace(
+                    'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\\n',
+                    'RUN_ID="${RUN_ID:-${MODE}_small_$(date +%Y%m%d_%H%M%S)}"\\n'
+                    'LOCOMO_EVAL_MODEL="${LOCOMO_EVAL_MODEL:-}"\\n'
+                    'OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/tmp/openclaw-state-$RUN_ID}"\\n'
+                    'OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-28789}"\\n'
+                    'OPENVIKING_INSTANCE_DIR="${OPENVIKING_INSTANCE_DIR:-/tmp/openviking-$RUN_ID}"\\n'
+                    'OPENVIKING_PORT="${OPENVIKING_PORT:-21933}"\\n'
+                    'OPENVIKING_AGFS_PORT="${OPENVIKING_AGFS_PORT:-21833}"\\n',
+                )
+
+            shell_text = shell_text.replace(
+                'OV_CONF_PATH="${OV_CONF_PATH:-/root/.openviking/ov.conf}"\\n'
+                'OV_DATA_DIR="${OV_DATA_DIR:-/root/.openviking/data}"\\n'
+                'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-/root/.openclaw/agents/locomo-eval}"\\n'
+                'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-/root/.openclaw/agents/main/agent}"\\n'
+                'OPENCLAW_ENV="${OPENCLAW_ENV:-/root/.openclaw/openviking.env}"\\n'
+                'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-/root/.openclaw/openclaw.json}"\\n',
+                'BASE_OV_CONF_PATH="${BASE_OV_CONF_PATH:-/root/.openviking/ov.conf}"\\n'
+                'OV_CONF_PATH="${OV_CONF_PATH:-${OPENVIKING_INSTANCE_DIR}/ov.conf}"\\n'
+                'OV_DATA_DIR="${OV_DATA_DIR:-${OPENVIKING_INSTANCE_DIR}/data}"\\n'
+                'BASE_OPENCLAW_STATE_DIR="${BASE_OPENCLAW_STATE_DIR:-/root/.openclaw}"\\n'
+                'OPENCLAW_AGENT_DIR="${OPENCLAW_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/locomo-eval}"\\n'
+                'OPENCLAW_MAIN_AGENT_DIR="${OPENCLAW_MAIN_AGENT_DIR:-${OPENCLAW_STATE_DIR}/agents/main/agent}"\\n'
+                'OPENCLAW_ENV="${OPENCLAW_ENV:-${OPENCLAW_STATE_DIR}/openviking.env}"\\n'
+                'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\\n'
+                'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\\n'
+                'export OPENVIKING_CONFIG_FILE="${OV_CONF_PATH}"\\n'
+                'export OPENCLAW_STATE_DIR\\n'
+                'export OPENCLAW_CONFIG_PATH\\n',
+            )
+            if 'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\\n',
+                    'OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"\\n'
+                    'OPENVIKING_PYTHON_BIN="${OPENVIKING_PYTHON_BIN:-python3}"\\n',
+                )
+
+            if "bootstrap_isolated_runtime()" not in shell_text:
+                shell_text = shell_text.replace(
+                    'mkdir -p "${OUTPUT_DIR}"\\n\\nbackup_and_reset() {\\n',
+                    '''mkdir -p "${OUTPUT_DIR}"
+
+bootstrap_isolated_runtime() {
+  mkdir -p "${OPENCLAW_STATE_DIR}" "${OPENCLAW_AGENT_DIR}" "${OPENCLAW_MAIN_AGENT_DIR}" "${OV_DATA_DIR}"
+
+  python3 - "${BASE_OPENCLAW_STATE_DIR}" "${OPENCLAW_STATE_DIR}" "${OPENCLAW_CONFIG_PATH}" "${OPENCLAW_GATEWAY_PORT}" "${LOCOMO_EVAL_MODEL}" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+base_state_dir = Path(sys.argv[1])
+state_dir = Path(sys.argv[2])
+config_path = Path(sys.argv[3])
+gateway_port = int(sys.argv[4])
+locomo_model = sys.argv[5].strip()
+
+state_dir.mkdir(parents=True, exist_ok=True)
+config_path.parent.mkdir(parents=True, exist_ok=True)
+
+base_config = json.loads((base_state_dir / "openclaw.json").read_text(encoding="utf-8"))
+base_config.pop("stateDir", None)
+gateway = base_config.setdefault("gateway", {})
+gateway["port"] = gateway_port
+if locomo_model:
+    base_config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = locomo_model
+    for agent in base_config.get("agents", {}).get("list", []):
+        if isinstance(agent, dict) and agent.get("id") == "locomo-eval":
+            agent["model"] = locomo_model
+control_ui = gateway.setdefault("controlUi", {})
+control_ui["allowedOrigins"] = [
+    f"http://localhost:{gateway_port}",
+    f"http://127.0.0.1:{gateway_port}",
+]
+config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+
+for rel in [
+    ("agents/main/agent/auth-profiles.json", "agents/main/agent/auth-profiles.json"),
+    ("agents/main/agent/auth-state.json", "agents/main/agent/auth-state.json"),
+    ("openviking.env", "openviking.env"),
+]:
+    src = base_state_dir / rel[0]
+    dst = state_dir / rel[1]
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+extensions_src = base_state_dir / "extensions" / "openviking"
+extensions_dst = state_dir / "extensions" / "openviking"
+if extensions_src.exists():
+    if extensions_dst.exists():
+        shutil.rmtree(extensions_dst)
+    extensions_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(extensions_src, extensions_dst)
+PY
+
+  python3 - "${BASE_OV_CONF_PATH}" "${OV_CONF_PATH}" "${OV_DATA_DIR}" "${OPENVIKING_PORT}" "${OPENVIKING_AGFS_PORT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base_conf = Path(sys.argv[1])
+target_conf = Path(sys.argv[2])
+data_dir = Path(sys.argv[3])
+ov_port = int(sys.argv[4])
+agfs_port = int(sys.argv[5])
+
+target_conf.parent.mkdir(parents=True, exist_ok=True)
+data_dir.mkdir(parents=True, exist_ok=True)
+
+cfg = json.loads(base_conf.read_text(encoding="utf-8"))
+cfg.setdefault("server", {})["port"] = ov_port
+cfg.setdefault("storage", {})["workspace"] = str(data_dir)
+cfg.setdefault("storage", {}).setdefault("agfs", {})["port"] = agfs_port
+target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+PY
+}
+
+backup_and_reset() {
+''',
+                )
+
+            shell_text = shell_text.replace(
+                '  pkill -f \\'phase_a_off.py\\' || true\\n'
+                '  pkill -f \\'openclaw-gateway\\' || true\\n'
+                '  pkill -f \\'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\\' || true\\n'
+                '  sleep 2\\n'
+                '\\n'
+                '  rm -rf "${OV_DATA_DIR:?}/"*\\n'
+                '  mkdir -p "${OV_DATA_DIR}"\\n',
+                '  if [[ "${OPENCLAW_STATE_DIR}" == "/root/.openclaw" ]]; then\\n'
+                '    pkill -f \\'phase_a_off.py\\' || true\\n'
+                '    pkill -f \\'openclaw-gateway\\' || true\\n'
+                '    pkill -f \\'python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1\\' || true\\n'
+                '    sleep 2\\n'
+                '  fi\\n'
+                '\\n'
+                '  rm -rf "${OV_DATA_DIR:?}/"*\\n'
+                '  mkdir -p "${OV_DATA_DIR}"\\n',
+            )
+
+            if '"${OPENVIKING_PORT}" <<\\'PY\\'' not in shell_text:
+                shell_text = shell_text.replace(
+                    '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" <<\\'PY\\'\\n',
+                    '  python3 - "${OPENCLAW_CONFIG_PATH}" "${OV_USER_ID}" "${OV_ACCOUNT_ID}" "${ISOLATE_USER_SCOPE_BY_AGENT}" "${ISOLATE_AGENT_SCOPE_BY_USER}" "${OPENVIKING_PORT}" <<\\'PY\\'\\n',
+                )
+            if 'openviking_port = int(sys.argv[6])\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\\n',
+                    'isolate_agent_scope_by_user = sys.argv[5].lower() == "true"\\n'
+                    'openviking_port = int(sys.argv[6])\\n',
+                )
+            if 'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    'cfg["userId"] = user_id\\n',
+                    'cfg["mode"] = "remote"\\n'
+                    'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n'
+                    'cfg["userId"] = user_id\\n',
+                )
+            elif 'cfg["mode"] = "remote"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n',
+                    'cfg["mode"] = "remote"\\n'
+                    'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n',
+                )
+            shell_text = re.sub(
+                r'(?:^openviking_port = int\(sys\.argv\[6\]\)\\n)+',
+                'openviking_port = int(sys.argv[6])\\n',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = re.sub(
+                r'(?:^cfg\["baseUrl"\] = f"http://127\.0\.0\.1:\{openviking_port\}"\\n)+',
+                'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = shell_text.replace(
+                'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n'
+                'cfg["userId"] = user_id\\n',
+                'cfg["mode"] = "remote"\\n'
+                'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n'
+                'cfg["isolateUserScopeByAgent"] = isolate_user_scope_by_agent\\n'
+                'cfg["isolateAgentScopeByUser"] = isolate_agent_scope_by_user\\n'
+                'cfg["userId"] = user_id\\n',
+            )
+
+            shell_text = shell_text.replace('  cd /tmp\\n', "")
+            if 'start_services() {\\n  cd "${REPO_ROOT}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    'start_services() {\\n',
+                    'start_services() {\\n'
+                    '  cd "${REPO_ROOT}"\\n',
+                )
+            shell_text = shell_text.replace(
+                '  nohup python3 -m openviking.server.bootstrap --host 127.0.0.1 --port 1933 --workers 1 >"${OV_LOG}" 2>&1 &\\n',
+                '  (cd /tmp && nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &)\\n',
+            )
+            shell_text = shell_text.replace(
+                '  nohup python3 -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\\n',
+                '  (cd /tmp && nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &)\\n',
+            )
+            shell_text = shell_text.replace(
+                '  nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &\\n',
+                '  (cd /tmp && nohup "${OPENVIKING_PYTHON_BIN}" -m openviking.server.bootstrap --config "${OV_CONF_PATH}" --host 127.0.0.1 --port "${OPENVIKING_PORT}" --workers 1 >"${OV_LOG}" 2>&1 &)\\n',
+            )
+            shell_text = shell_text.replace(
+                '    if curl -fsS http://127.0.0.1:1933/health >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\\n',
+                '    if curl -fsS "http://127.0.0.1:${OPENVIKING_PORT}/health" >/tmp/"${RUN_ID}"_ov_health.json 2>/dev/null; then\\n',
+            )
+
+            shell_text = shell_text.replace(
+                '  # shellcheck disable=SC1090\\n'
+                '  source "${OPENCLAW_ENV}"\\n'
+                '  nohup openclaw gateway >"${GW_LOG}" 2>&1 &\\n',
+                '  # shellcheck disable=SC1090\\n'
+                '  source "${OPENCLAW_ENV}"\\n'
+                '  nohup env OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\\n',
+            )
+            if (
+                'nohup env OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\\n'
+                not in shell_text
+            ):
+                shell_text = shell_text.replace(
+                    '  source "${OPENCLAW_ENV}"\\n'
+                    '  nohup openclaw gateway >"${GW_LOG}" 2>&1 &\\n',
+                    '  source "${OPENCLAW_ENV}"\\n'
+                    '  nohup env OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR}" OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH}" openclaw gateway >"${GW_LOG}" 2>&1 &\\n',
+                )
+            if "__OVTEST_PLUGIN_USERKEY__" not in shell_text:
+                shell_text = shell_text.replace(
+                    '  source "${OPENCLAW_ENV}"\\n',
+                    '  curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts" \\\\\\n'
+                    '    -H "Content-Type: application/json" \\\\\\n'
+                    '    -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\\\\n'
+                    '    -d "{\\\\"account_id\\\\":\\\\"${OV_ACCOUNT_ID}\\\\",\\\\"admin_user_id\\\\":\\\\"${OV_USER_ID}-admin\\\\",\\\\"isolate_user_scope_by_agent\\\\":true,\\\\"isolate_agent_scope_by_user\\\\":true}" \\\\\\n'
+                    '    >/tmp/"${RUN_ID}"_ensure_account.json 2>/dev/null || true\\n'
+                    '  PLUGIN_USER_KEY=""\\n'
+                    '  for _attempt in 1 2 3 4 5; do\\n'
+                    '    USER_CREATE_RESP=$(curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\\\\n'
+                    '      -H "Content-Type: application/json" \\\\\\n'
+                    '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\\\\n'
+                    '      -d "{\\\\"user_id\\\\":\\\\"${OV_USER_ID}\\\\",\\\\"role\\\\":\\\\"user\\\\"}" || true)\\n'
+                    '    PLUGIN_USER_KEY=$(printf "%s" "${USER_CREATE_RESP}" | python3 -c \\'import json,sys; raw=sys.stdin.read().strip(); data=json.loads(raw) if raw else {}; print(((data.get("result") or {}).get("user_key")) or "")\\' 2>/dev/null || true)\\n'
+                    '    if [ -n "${PLUGIN_USER_KEY}" ]; then\\n'
+                    '      break\\n'
+                    '    fi\\n'
+                    '    sleep 1\\n'
+                    '  done\\n'
+                    '  if [ -z "${PLUGIN_USER_KEY}" ]; then\\n'
+                    '    echo "warning: failed to provision OpenViking user key for ${OV_ACCOUNT_ID}/${OV_USER_ID}; keeping root API key with explicit tenant headers" >&2\\n'
+                    '  fi\\n'
+                    '  python3 - "${OPENCLAW_CONFIG_PATH}" "${PLUGIN_USER_KEY}" <<\\\'__OVTEST_PLUGIN_USERKEY__\\\'\\n'
+                    'import json\\n'
+                    'import sys\\n'
+                    'from pathlib import Path\\n'
+                    '\\n'
+                    'config_path = Path(sys.argv[1])\\n'
+                    'user_key = sys.argv[2]\\n'
+                    'data = json.loads(config_path.read_text(encoding="utf-8"))\\n'
+                    'cfg = data.setdefault("plugins", {}).setdefault("entries", {}).setdefault("openviking", {}).setdefault("config", {})\\n'
+                    'cfg["apiKey"] = str(cfg.get("apiKey") or user_key or "")\\n'
+                    'config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")\\n'
+                    'print(json.dumps({"plugin_api_key": "preserved", "has_user_key": bool(user_key), "accountId": cfg.get("accountId"), "userId": cfg.get("userId")}, ensure_ascii=False))\\n'
+                    '__OVTEST_PLUGIN_USERKEY__\\n'
+                    '  source "${OPENCLAW_ENV}"\\n',
+                )
+            shell_text = shell_text.replace(
+                '"admin_user_id":"${OV_USER_ID}"',
+                '"admin_user_id":"${OV_USER_ID}-admin"',
+            )
+            shell_text = shell_text.replace(
+                '\\"admin_user_id\\":\\"${OV_USER_ID}\\"',
+                '\\"admin_user_id\\":\\"${OV_USER_ID}-admin\\"',
+            )
+            shell_text = shell_text.replace('isolate_user_scope_by_agent\\\\":false', 'isolate_user_scope_by_agent\\\\":true')
+            shell_text = shell_text.replace('isolate_agent_scope_by_user\\\\":false', 'isolate_agent_scope_by_user\\\\":true')
+            shell_text = shell_text.replace('isolate_user_scope_by_agent":false', 'isolate_user_scope_by_agent":true')
+            shell_text = shell_text.replace('isolate_agent_scope_by_user":false', 'isolate_agent_scope_by_user":true')
+            shell_text = shell_text.replace(
+                '    -d "{\\\\"account_id\\\\":\\\\"${OV_ACCOUNT_ID}\\\\",\\\\"admin_user_id\\\\":\\\\"${OV_USER_ID}\\\\",\\\\"isolate_user_scope_by_agent\\\\":true,\\\\"isolate_agent_scope_by_user\\\\":true}" \\\\\\n',
+                '    -d "{\\\\"account_id\\\\":\\\\"${OV_ACCOUNT_ID}\\\\",\\\\"admin_user_id\\\\":\\\\"${OV_USER_ID}-admin\\\\",\\\\"isolate_user_scope_by_agent\\\\":true,\\\\"isolate_agent_scope_by_user\\\\":true}" \\\\\\n',
+            )
+            shell_text = shell_text.replace(
+                '  PLUGIN_USER_KEY=$(\\\\\\n'
+                '    curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\\\\n'
+                '      -H "Content-Type: application/json" \\\\\\n'
+                '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\\\\n'
+                '      -d "{\\\\"user_id\\\\":\\\\"${OV_USER_ID}\\\\",\\\\"role\\\\":\\\\"user\\\\"}" \\\\\\n'
+                '    | python3 -c \\'import json,sys; data=json.load(sys.stdin); print(((data.get("result") or {}).get("user_key")) or "")\\'\\\\\\n'
+                '  )\\n',
+                '  PLUGIN_USER_KEY=""\\n'
+                '  for _attempt in 1 2 3 4 5; do\\n'
+                '    USER_CREATE_RESP=$(curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\\\\n'
+                '      -H "Content-Type: application/json" \\\\\\n'
+                '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\\\\n'
+                '      -d "{\\\\"user_id\\\\":\\\\"${OV_USER_ID}\\\\",\\\\"role\\\\":\\\\"user\\\\"}" || true)\\n'
+                '    PLUGIN_USER_KEY=$(printf "%s" "${USER_CREATE_RESP}" | python3 -c \\'import json,sys; raw=sys.stdin.read().strip(); data=json.loads(raw) if raw else {}; print(((data.get("result") or {}).get("user_key")) or "")\\' 2>/dev/null || true)\\n'
+                '    if [ -n "${PLUGIN_USER_KEY}" ]; then\\n'
+                '      break\\n'
+                '    fi\\n'
+                '    sleep 1\\n'
+                '  done\\n',
+            )
+            shell_text = re.sub(
+                r'  PLUGIN_USER_KEY=\(\\\\\\n'
+                r'    curl -sS -X POST "http://127\.0\.0\.1:\$\{OPENVIKING_PORT\}/api/v1/admin/accounts/\$\{OV_ACCOUNT_ID\}/users" \\\\\\n'
+                r'      -H "Content-Type: application/json" \\\\\\n'
+                r'      -H "X-API-Key: \$\{OPENVIKING_ROOT_API_KEY\}" \\\\\\n'
+                r'      -d "\{\\\\\"user_id\\\\\":\\\\\"\$\{OV_USER_ID\}\\\\\",\\\\\"role\\\\\":\\\\\"user\\\\\"\}" \\\\\\n'
+                r'    \| python3 -c .*?\\n'
+                r'  \)\\n',
+                '  PLUGIN_USER_KEY=""\\n'
+                '  for _attempt in 1 2 3 4 5; do\\n'
+                '    USER_CREATE_RESP=$(curl -sS -X POST "http://127.0.0.1:${OPENVIKING_PORT}/api/v1/admin/accounts/${OV_ACCOUNT_ID}/users" \\\\\\n'
+                '      -H "Content-Type: application/json" \\\\\\n'
+                '      -H "X-API-Key: ${OPENVIKING_ROOT_API_KEY}" \\\\\\n'
+                '      -d "{\\\\"user_id\\\\":\\\\"${OV_USER_ID}\\\\",\\\\"role\\\\":\\\\"user\\\\"}" || true)\\n'
+                '    PLUGIN_USER_KEY=$(printf "%s" "${USER_CREATE_RESP}" | python3 -c \\'import json,sys; raw=sys.stdin.read().strip(); data=json.loads(raw) if raw else {}; print(((data.get("result") or {}).get("user_key")) or "")\\' 2>/dev/null || true)\\n'
+                '    if [ -n "${PLUGIN_USER_KEY}" ]; then\\n'
+                '      break\\n'
+                '    fi\\n'
+                '    sleep 1\\n'
+                '  done\\n',
+                shell_text,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+
+            if '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    '    --output-dir "${OUTPUT_DIR}"\\n',
+                    '    --output-dir "${OUTPUT_DIR}"\\n'
+                    '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n'
+                )
+            if '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n',
+                    '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n'
+                    '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n'
+                )
+            if '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\\n' not in shell_text:
+                shell_text = shell_text.replace(
+                    '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n',
+                    '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n'
+                    '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\\n',
+                )
+
+            if "  bootstrap_isolated_runtime\\n  backup_and_reset\\n" not in shell_text:
+                shell_text = shell_text.replace(
+                    "{\\n  backup_and_reset\\n",
+                    "{\\n  bootstrap_isolated_runtime\\n  backup_and_reset\\n",
+                )
+
+            shell_text = re.sub(
+                r'(?:^    --base-url "http://127\\.0\\.0\\.1:\\$\\{OPENCLAW_GATEWAY_PORT\\}"\\n)+',
+                '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = re.sub(
+                r'(?:^    --openviking-url "http://127\\.0\\.0\\.1:\\$\\{OPENVIKING_PORT\\}"\\n)+',
+                '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = re.sub(
+                r'(?:^    --openclaw-state-dir "\\$\\{OPENCLAW_STATE_DIR\\}"\\n)+',
+                '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\\n',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = re.sub(
+                r'(?:^  set_openclaw_gateway_port\\n)+',
+                '  set_openclaw_gateway_port\\n',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = re.sub(
+                r'config_path\.write_text\(json\.dumps\(base_config, ensure_ascii=False, indent=2\) \+ "\\n"\s*, encoding="utf-8"\)',
+                'config_path.write_text(json.dumps(base_config, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = re.sub(
+                r'target_conf\.write_text\(json\.dumps\(cfg, ensure_ascii=False, indent=2\) \+ "\\n"\s*, encoding="utf-8"\)',
+                'target_conf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")',
+                shell_text,
+                flags=re.MULTILINE,
+            )
+            shell_text = shell_text.replace(
+                'base_config["stateDir"] = str(state_dir)\\n',
+                'base_config.pop("stateDir", None)\\n',
+            )
+
+            dedupe_targets = {
+                '    --base-url "http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"\\n',
+                '    --openviking-url "http://127.0.0.1:${OPENVIKING_PORT}"\\n',
+                '    --openclaw-state-dir "${OPENCLAW_STATE_DIR}"\\n',
+                "  set_openclaw_gateway_port\\n",
+                'openviking_port = int(sys.argv[6])\\n',
+                'cfg["mode"] = "remote"\\n',
+                'cfg["baseUrl"] = f"http://127.0.0.1:{openviking_port}"\\n',
+            }
+            dedupe_seen = set()
+            deduped_lines = []
+            for line in shell_text.splitlines(keepends=True):
+                if line in dedupe_targets:
+                    if line in dedupe_seen:
+                        continue
+                    dedupe_seen.add(line)
+                deduped_lines.append(line)
+            shell_text = "".join(deduped_lines)
+
+            return shell_text
+
+        def _ensure_openviking_signature_compat(source_text: str, kind: str) -> str:
+            if kind == "session_extract_context_provider":
+                marker = "latest_archive_session_time: str = \\"\\","
+                if marker in source_text:
+                    return source_text
+                return source_text.replace(
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        isolation_handler: MemoryIsolationHandler = None,\\n",
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        latest_archive_session_time: str = \\"\\",\\n"
+                    "        isolation_handler: MemoryIsolationHandler = None,\\n",
+                )
+            if kind == "extract_agent_memories":
+                if (
+                    "    async def extract_agent_memories(\\n"
+                    "        self,\\n"
+                    "        messages: List[Message],\\n"
+                    "        ctx: Optional[RequestContext] = None,\\n"
+                    "        strict_extract_errors: bool = False,\\n"
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        latest_archive_session_time: str = \\"\\",\\n"
+                    "    ) -> List[Context]:\\n"
+                ) in source_text:
+                    return source_text
+                return source_text.replace(
+                    "    async def extract_agent_memories(\\n"
+                    "        self,\\n"
+                    "        messages: List[Message],\\n"
+                    "        ctx: Optional[RequestContext] = None,\\n"
+                    "        strict_extract_errors: bool = False,\\n"
+                    "    ) -> List[Context]:\\n",
+                    "    async def extract_agent_memories(\\n"
+                    "        self,\\n"
+                    "        messages: List[Message],\\n"
+                    "        ctx: Optional[RequestContext] = None,\\n"
+                    "        strict_extract_errors: bool = False,\\n"
+                    "        latest_archive_overview: str = \\"\\",\\n"
+                    "        latest_archive_session_time: str = \\"\\",\\n"
+                    "    ) -> List[Context]:\\n",
+                )
+            raise ValueError(f"unsupported compatibility patch kind: {{kind}}")
+
+        def _ensure_openclaw_openviking_plugin_compat(source_text: str) -> str:
+            updated = re.sub(
+                r'export function createSessionAgentResolver\\(configAgentId: string\\) \\{{\\n'
+                r'\\s*const configAgentPrefix = configAgentId\\.trim\\(\\) === "default" \\? "" : configAgentId\\.trim\\(\\);\\n',
+                'export function createSessionAgentResolver(configAgentId?: string | null) {{\\n'
+                '  const normalizedConfigAgentId = typeof configAgentId === "string" ? configAgentId.trim() : "";\\n'
+                '  const configAgentPrefix = normalizedConfigAgentId === "default" ? "" : normalizedConfigAgentId;\\n',
+                source_text,
+            )
+            updated = updated.replace(
+                "        cfg.agent_prefix,\\n"
+                "        cfg.timeoutMs,\\n",
+                '        cfg.agent_prefix ?? "",\\n'
+                "        cfg.timeoutMs,\\n",
+            )
+            updated = updated.replace(
+                "    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix);\\n",
+                '    const sessionAgentResolver = createSessionAgentResolver(cfg.agent_prefix ?? "");\\n',
+            )
+            return updated
+
+        def _ensure_openclaw_openviking_client_diag(source_text: str) -> str:
+            marker = 'this.routingDebugLog?.(`openviking: request error '
+            if marker not in source_text:
+                old = '''      if (!response.ok || payload.status === "error") {
+        const code = payload.error?.code ? ` [${payload.error.code}]` : "";
+        const message = payload.error?.message ?? `HTTP ${response.status}`;
+        throw new Error(`OpenViking request failed${code}: ${message}`);
+      }
+'''
+                new = '''      if (!response.ok || payload.status === "error") {
+        const code = payload.error?.code ? ` [${payload.error.code}]` : "";
+        const message = payload.error?.message ?? `HTTP ${response.status}`;
+        this.routingDebugLog?.(
+          `openviking: request error ${path} ` +
+            JSON.stringify({
+              X_OpenViking_Agent: effectiveAgentId || null,
+              X_OpenViking_Account: tenantHeaders.accountId ?? null,
+              X_OpenViking_User: tenantHeaders.userId ?? null,
+              hasApiKey: Boolean(tenantHeaders.apiKey),
+              status: response.status,
+              code: payload.error?.code ?? null,
+              message,
+            }),
+        );
+        throw new Error(`OpenViking request failed${code}: ${message}`);
+      }
+'''
+                source_text = source_text.replace(old, new)
+
+            fastpath_marker = '    const configuredUserId = this.userId.trim();\\n'
+            if fastpath_marker not in source_text:
+                source_text = source_text.replace(
+                    '''    const fallback: RuntimeIdentity = { userId: "default", agentId: effectiveAgentId };
+    try {
+      const status = await this.request<{ user?: unknown }>("/api/v1/system/status", {}, agentId);
+''',
+                    '''    const configuredUserId = this.userId.trim();
+    if (configuredUserId) {
+      const identity: RuntimeIdentity = { userId: configuredUserId, agentId: effectiveAgentId };
+      this.identityCache.set(effectiveAgentId, identity);
+      return identity;
+    }
+    const fallback: RuntimeIdentity = { userId: "default", agentId: effectiveAgentId };
+    try {
+      const status = await this.request<{ user?: unknown }>("/api/v1/system/status", {}, agentId);
+''',
+                )
+            return source_text
+
+        def _ensure_openclaw_auto_recall_query_extract(source_text: str) -> str:
+            marker = 'const questionMarker = "Question:";'
+            if marker in source_text:
+                return source_text
+            old = '''export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  const query =
+    sanitized.length > RECALL_QUERY_MAX_CHARS
+      ? sanitized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : sanitized;
+
+  return {
+    query,
+    truncated: sanitized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+'''
+            new = '''export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  let normalized = sanitized;
+  const questionMarker = "Question:";
+  const markerIndex = sanitized.lastIndexOf(questionMarker);
+  if (markerIndex >= 0) {
+    const extracted = sanitized.slice(markerIndex + questionMarker.length).trim();
+    if (extracted) {
+      normalized = extracted;
+    }
+  }
+
+  const query =
+    normalized.length > RECALL_QUERY_MAX_CHARS
+      ? normalized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : normalized;
+
+  return {
+    query,
+    truncated: normalized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
+}
+'''
+            return source_text.replace(old, new)
+
+        def _inject_openclaw_provider_config(config_data: dict, model_name: str, auth_profiles: dict | None) -> None:
+            provider_name = str(model_name or "").split("/", 1)[0].strip()
+            if not provider_name:
+                return
+            models = config_data.setdefault("models", {{}})
+            providers = models.setdefault("providers", {{}})
+            provider_cfg = providers.get(provider_name)
+            existing_api_key = (
+                str(provider_cfg.get("apiKey") or "").strip()
+                if isinstance(provider_cfg, dict)
+                else ""
+            )
+            if existing_api_key:
+                if provider_name != "minimax" or provider_cfg.get("models"):
+                    return
+
+            auth_profiles = auth_profiles or {{}}
+            candidate_keys = [
+                f"{{provider_name}}:default",
+                f"{{provider_name}}:cn",
+                f"{{provider_name}}-cn:default",
+                f"{{provider_name}}-portal:default",
+            ]
+            selected = None
+            for profile_id in candidate_keys:
+                profile = auth_profiles.get(profile_id)
+                if isinstance(profile, dict) and str(profile.get("key") or profile.get("access") or "").strip():
+                    selected = profile
+                    break
+            if selected is None and existing_api_key:
+                selected = {{"key": existing_api_key}}
+            if selected is None:
+                return
+
+            api_key = str(selected.get("key") or selected.get("access") or "").strip()
+            template = {{
+                "apiKey": api_key,
+            }}
+            if provider_name == "minimax":
+                template.update(
+                    {{
+                        "baseUrl": "https://api.minimaxi.com/v1",
+                        "api": "openai-completions",
+                        "models": [
+                            {{
+                                "id": "MiniMax-M3",
+                                "name": "MiniMax M3",
+                                "reasoning": True,
+                                "input": ["text"],
+                                "cost": {{
+                                    "input": 0,
+                                    "output": 0,
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                }},
+                                "contextWindow": 196608,
+                                "maxTokens": 8192,
+                            }}
+                        ],
+                    }}
+                )
+            merged = {{**template, **(provider_cfg or {{}})}}
+            if provider_name == "minimax" and not merged.get("models"):
+                merged["models"] = template["models"]
+            providers[provider_name] = merged
+
+shell_path = benchmark_dir / "run_clean_small_in_container.sh"
+shell_text = shell_path.read_text(encoding="utf-8")
+shell_text = _enable_benchmark_plugin_diagnostics(shell_text)
+shell_text = _enable_dedicated_gateway_port(shell_text)
+shell_text = _enable_isolated_runtime(shell_text)
+        shell_text = shell_text.replace(
+            '    --qa-disable-autocapture\\n',
+            '    ${{QA_DISABLE_AUTOCAPTURE:+--qa-disable-autocapture}}\\n',
+        )
+        shell_path.write_text(shell_text, encoding="utf-8")
+
+        phase_path = benchmark_dir / "phase_a_off.py"
+        phase_text = phase_path.read_text(encoding="utf-8")
+        phase_text = _remove_redundant_reindex_injection(phase_text)
+        phase_text = _remove_redundant_plugin_config_cleanup(phase_text)
+        phase_text = _remove_redundant_post_ingest_meta(phase_text)
+        phase_text = phase_text.replace(
+            'DEFAULT_OV_DATA_ROOT = "/root/.openviking/data/viking"\\n',
+            'DEFAULT_OV_DATA_ROOT = os.environ.get("OPENVIKING_DATA_ROOT", "/root/.openviking/data/viking")\\n',
+        )
+        phase_text = phase_text.replace(
+            '    legacy_keys = (\\n'
+            '        "agent_prefix",\\n'
+            '        "isolateUserScopeByAgent",\\n'
+            '        "isolateAgentScopeByUser",\\n'
+            '    )\\n'
+            '    updates: dict[str, Any] = {{\\n'
+            '        "userId": user,\\n'
+            '    }}\\n'
+            '    if account_id:\\n'
+            '        updates["accountId"] = account_id\\n',
+            '    updates: dict[str, Any] = {\\n'
+            '        "userId": user,\\n'
+            '        "isolateUserScopeByAgent": isolate_user_scope_by_agent,\\n'
+            '        "isolateAgentScopeByUser": isolate_agent_scope_by_user,\\n'
+            '    }\\n'
+            '    if account_id:\\n'
+            '        updates["accountId"] = account_id\\n'
+            '    if agent_prefix:\\n'
+            '        updates["agent_prefix"] = agent_prefix\\n',
+        )
+        phase_text = phase_text.replace(
+            '    changed = {{\\n'
+            '        key: value\\n'
+            '        for key, value in updates.items()\\n'
+            '        if current.get(key) != value\\n'
+            '    }}\\n',
+            '    changed = {{\\n'
+            '        key: value\\n'
+            '        for key, value in updates.items()\\n'
+            '        if current.get(key) != value\\n'
+            '    }}\\n'
+            '    changed.update(\\n'
+            '        {{\\n'
+            '            key: None\\n'
+            '            for key in legacy_keys\\n'
+            '            if key in current\\n'
+            '        }}\\n'
+            '    )\\n',
+        )
+        phase_text = phase_text.replace(
+            '    for plugin_cfg in containers:\\n'
+            '        plugin_cfg.update(updates)\\n',
+            '    for plugin_cfg in containers:\\n'
+            '        for key, value in updates.items():\\n'
+            '            if value is None:\\n'
+            '                plugin_cfg.pop(key, None)\\n'
+            '            else:\\n'
+            '                plugin_cfg[key] = value\\n',
+        )
+        phase_text = phase_text.replace(
+            '    autocapture_snapshot: dict[str, Any] | None = None\\n'
+            '    try:\\n'
+            '        if args.qa_disable_autocapture:\\n'
+            '            autocapture_snapshot = update_openclaw_plugin_config(\\n'
+            '                args.openclaw_state_dir,\\n'
+            '                {{"autoCapture": False}},\\n'
+            '            )\\n'
+            '            restart_local_gateway_for_base_url(args.base_url, args.gw_log)\\n',
+            '    autocapture_snapshot: dict[str, Any] | None = None\\n'
+            '    run_warnings: list[dict[str, Any]] = []\\n'
+            '    try:\\n'
+            '        if args.qa_disable_autocapture:\\n'
+            '            autocapture_snapshot = update_openclaw_plugin_config(\\n'
+            '                args.openclaw_state_dir,\\n'
+            '                {{"autoCapture": False}},\\n'
+            '            )\\n'
+            '            try:\\n'
+            '                restart_local_gateway_for_base_url(args.base_url, args.gw_log)\\n'
+            '            except Exception as exc:\\n'
+            '                warning = {{\\n'
+            '                    "stage": "qa_disable_autocapture_restart",\\n'
+            '                    "error": str(exc),\\n'
+            '                }}\\n'
+            '                run_warnings.append(warning)\\n'
+            '                print(\\n'
+            '                    f"[phaseA][warning] gateway restart after disabling autoCapture failed: {{exc}}",\\n'
+            '                    file=sys.stderr,\\n'
+            '                    flush=True,\\n'
+            '                )\\n',
+        )
+        phase_text = phase_text.replace(
+            '    finally:\\n'
+            '        if args.qa_disable_autocapture and autocapture_snapshot is not None:\\n'
+            '            restore_value = autocapture_snapshot.get("autoCapture", True)\\n'
+            '            update_openclaw_plugin_config(\\n'
+            '                args.openclaw_state_dir,\\n'
+            '                {{"autoCapture": restore_value}},\\n'
+            '            )\\n'
+            '            restart_local_gateway_for_base_url(args.base_url, args.gw_log)\\n',
+            '    finally:\\n'
+            '        if args.qa_disable_autocapture and autocapture_snapshot is not None:\\n'
+            '            restore_value = autocapture_snapshot.get("autoCapture", True)\\n'
+            '            update_openclaw_plugin_config(\\n'
+            '                args.openclaw_state_dir,\\n'
+            '                {{"autoCapture": restore_value}},\\n'
+            '            )\\n'
+            '            try:\\n'
+            '                restart_local_gateway_for_base_url(args.base_url, args.gw_log)\\n'
+            '            except Exception as exc:\\n'
+            '                warning = {{\\n'
+            '                    "stage": "qa_disable_autocapture_restore_restart",\\n'
+            '                    "error": str(exc),\\n'
+            '                }}\\n'
+            '                run_warnings.append(warning)\\n'
+            '                print(\\n'
+            '                    f"[phaseA][warning] gateway restart after restoring autoCapture failed: {{exc}}",\\n'
+            '                    file=sys.stderr,\\n'
+            '                    flush=True,\\n'
+            '                )\\n',
+        )
+        phase_text = phase_text.replace(
+            '        "post_ingest_settle": settle_result,\\n'
+            '        "gw_log_tail": tail_log(args.gw_log),\\n',
+            '        "post_ingest_settle": settle_result,\\n'
+            '        "warnings": run_warnings,\\n'
+            '        "gw_log_tail": tail_log(args.gw_log),\\n',
+        )
+        phase_text = phase_text.replace(
+            'def wait_for_search_visibility(\\n',
+            'def reindex_memory_root(\\n'
+            '    *,\\n'
+            '    base_url: str,\\n'
+            '    api_key: str,\\n'
+            '    account_id: str,\\n'
+            '    user_id: str,\\n'
+            '    agent_id: str | None = None,\\n'
+            '    account_root: Path | None = None,\\n'
+            '    timeout: float = 120.0,\\n'
+            '    retry_interval: float = 2.0,\\n'
+            ') -> dict[str, Any]:\\n'
+            '    target_uri = f"viking://user/{{user_id}}/memories"\\n'
+            '    if account_root is not None:\\n'
+            '        memories_root = resolve_memories_root(account_root=account_root, user_id=user_id, agent_id=agent_id)\\n'
+            '        if memories_root is not None:\\n'
+            '            target_uri = build_probe_target_uri(\\n'
+            '                user_id=user_id,\\n'
+            '                agent_id=agent_id,\\n'
+            '                memories_root=memories_root,\\n'
+            '                account_root=account_root,\\n'
+            '            )\\n'
+            '    headers = {{\\n'
+            '        "Content-Type": "application/json",\\n'
+            '        "X-API-Key": api_key,\\n'
+            '        "X-OpenViking-Account": account_id,\\n'
+            '        "X-OpenViking-User": user_id,\\n'
+            '    }}\\n'
+            '    payload = {{\\n'
+            '        "uri": target_uri,\\n'
+            '        "mode": "vectors_only",\\n'
+            '        "wait": True,\\n'
+            '    }}\\n'
+            '    deadline = time.monotonic() + max(timeout, 1.0)\\n'
+            '    attempts = 0\\n'
+            '    last_error = ""\\n'
+            '    while time.monotonic() < deadline:\\n'
+            '        attempts += 1\\n'
+            '        try:\\n'
+            '            resp = requests.post(\\n'
+            '                base_url.rstrip("/") + "/api/v1/content/reindex",\\n'
+            '                headers=headers,\\n'
+            '                json=payload,\\n'
+            '                timeout=max(30.0, timeout),\\n'
+            '            )\\n'
+            '            data = resp.json() if resp.content else {{}}\\n'
+            '            if resp.ok:\\n'
+            '                return {{\\n'
+            '                    "ok": True,\\n'
+            '                    "attempts": attempts,\\n'
+            '                    "target_uri": target_uri,\\n'
+            '                    "result": data.get("result", data),\\n'
+            '                }}\\n'
+            '            last_error = data.get("error", {{}}).get("message") or resp.text or ("HTTP " + str(resp.status_code))\\n'
+            '            conflict_type = data.get("error", {{}}).get("details", {{}}).get("conflict_type")\\n'
+            '            if resp.status_code == 409 and conflict_type == "path_busy":\\n'
+            '                time.sleep(max(retry_interval, 0.1))\\n'
+            '                continue\\n'
+            '            resp.raise_for_status()\\n'
+            '        except Exception as exc:\\n'
+            '            last_error = str(exc)\\n'
+            '            time.sleep(max(retry_interval, 0.1))\\n'
+            '    return {{\\n'
+            '        "ok": False,\\n'
+            '        "attempts": attempts,\\n'
+            '        "target_uri": target_uri,\\n'
+            '        "last_error": last_error,\\n'
+            '    }}\\n\\n'
+            'def wait_for_search_visibility(\\n',
+        )
+        phase_text = phase_text.replace(
+            '    qa_rows: list[dict[str, Any]] = load_existing_qa_rows(paths.csv_path)\\n'
+            '    completed_qis = {{int(row.get("qi") or 0) for row in qa_rows}}\\n'
+            '    pending_questions = [qa.get("question", "") for qi, qa in qa_items if qi not in completed_qis]\\n'
+            '    settle_result: dict[str, Any] | None = None\\n',
+            '    qa_rows: list[dict[str, Any]] = load_existing_qa_rows(paths.csv_path)\\n'
+            '    completed_qis = set()\\n'
+            '    for row in qa_rows:\\n'
+            '        completed_qis.add(int(row.get("qi") or 0))\\n'
+            '    pending_questions = [qa.get("question", "") for qi, qa in qa_items if qi not in completed_qis]\\n'
+            '    reindex_result: dict[str, Any] | None = None\\n'
+            '    if not args.skip_ingest and args.ov_api_key:\\n'
+            '        print("[phaseA][qa][reindex] rebuilding user memory vectors before QA", file=sys.stderr, flush=True)\\n'
+            '        reindex_result = reindex_memory_root(\\n'
+            '            base_url=args.openviking_url,\\n'
+            '            api_key=args.ov_api_key,\\n'
+            '            account_id=str(args.ov_account_id or ""),\\n'
+            '            user_id=user,\\n'
+            '            agent_id=ov_agent_id,\\n'
+            '            account_root=Path(DEFAULT_OV_DATA_ROOT) / str(args.ov_account_id or ""),\\n'
+            '        )\\n'
+            '        print("[phaseA][qa][reindex] result=" + json.dumps(reindex_result, ensure_ascii=False), file=sys.stderr, flush=True)\\n'
+            '        resume_state.setdefault("meta", {{}})["post_ingest_reindex"] = reindex_result\\n'
+            '        save_resume_state(paths.state_path, resume_state)\\n'
+            '        if not reindex_result.get("ok"):\\n'
+            '            run_warnings = resume_state.setdefault("meta", {{}}).setdefault("warnings", [])\\n'
+            '            run_warnings.append({{"stage": "post_ingest_reindex", "error": reindex_result.get("last_error", "unknown")}})\\n'
+            '    settle_result: dict[str, Any] | None = None\\n',
+        )
+        phase_text = phase_text.replace(
+            '        "post_ingest_settle": settle_result,\\n'
+            '        "warnings": run_warnings,\\n',
+            '        "post_ingest_reindex": reindex_result,\\n'
+            '        "post_ingest_settle": settle_result,\\n'
+            '        "warnings": run_warnings,\\n',
+        )
+        phase_path.write_text(phase_text, encoding="utf-8")
+
+        plugin_targets = [
+            (Path("/root/.openclaw/extensions/openviking/index.ts"), _ensure_openclaw_openviking_plugin_compat),
+            (Path("/root/.openclaw/extensions/openviking/client.ts"), _ensure_openclaw_openviking_client_diag),
+            (Path("/home/jcp/agent/code/OpenViking/examples/openclaw-plugin/client.ts"), _ensure_openclaw_openviking_client_diag),
+        ]
+        for plugin_path, patch_fn in plugin_targets:
+            if plugin_path.exists():
+                plugin_text = plugin_path.read_text(encoding="utf-8")
+                updated_text = patch_fn(plugin_text)
+                plugin_path.write_text(updated_text, encoding="utf-8")
+
+        auto_recall_targets = [
+            Path("/root/.openclaw/extensions/openviking/auto-recall.ts"),
+            Path("/home/jcp/agent/code/OpenViking/examples/openclaw-plugin/auto-recall.ts"),
+        ]
+        auto_recall_results = []
+        for auto_recall_path in auto_recall_targets:
+            if not auto_recall_path.exists():
+                auto_recall_results.append({{"path": str(auto_recall_path), "status": "missing"}})
+                continue
+            original = auto_recall_path.read_text(encoding="utf-8")
+            updated = _ensure_openclaw_auto_recall_query_extract(original)
+            if updated != original:
+                auto_recall_path.write_text(updated, encoding="utf-8")
+                auto_recall_results.append({{"path": str(auto_recall_path), "status": "patched"}})
+            else:
+                auto_recall_results.append({{"path": str(auto_recall_path), "status": "unchanged"}})
+
+        compat_targets = [
+            (
+                Path("/home/jcp/agent/code/OpenViking/openviking/session/memory/session_extract_context_provider.py"),
+                "session_extract_context_provider",
+            ),
+            (
+                Path("/home/jcp/agent/code/OpenViking/openviking/session/compressor_v2.py"),
+                "extract_agent_memories",
+            ),
+        ]
+        for matched in glob.glob("/root/.openviking/venv*/lib/python*/site-packages/openviking/session/memory/session_extract_context_provider.py"):
+            compat_targets.append((Path(matched), "session_extract_context_provider"))
+        for matched in glob.glob("/root/.openviking/venv*/lib64/python*/site-packages/openviking/session/memory/session_extract_context_provider.py"):
+            compat_targets.append((Path(matched), "session_extract_context_provider"))
+        for matched in glob.glob("/root/.openviking/venv*/lib/python*/site-packages/openviking/session/compressor_v2.py"):
+            compat_targets.append((Path(matched), "extract_agent_memories"))
+        for matched in glob.glob("/root/.openviking/venv*/lib64/python*/site-packages/openviking/session/compressor_v2.py"):
+            compat_targets.append((Path(matched), "extract_agent_memories"))
+        compat_results = []
+        for compat_path, compat_kind in compat_targets:
+            if not compat_path.exists():
+                compat_results.append({{"path": str(compat_path), "status": "missing"}})
+                continue
+            original = compat_path.read_text(encoding="utf-8")
+            updated = _ensure_openviking_signature_compat(original, compat_kind)
+            if updated != original:
+                compat_path.write_text(updated, encoding="utf-8")
+                compat_results.append({{"path": str(compat_path), "status": "patched", "kind": compat_kind}})
+            else:
+                compat_results.append({{"path": str(compat_path), "status": "unchanged", "kind": compat_kind}})
+
+        agents_path = Path("/root/.openclaw/workspace/locomo-eval/AGENTS.md")
+        agents_path.parent.mkdir(parents=True, exist_ok=True)
+        if agents_path.exists():
+            backup = agents_path.with_name("AGENTS.md.bak-20260616-benchmark")
+            backup.write_text(agents_path.read_text(encoding="utf-8"), encoding="utf-8")
+        agents_path.write_text(base64.b64decode(__AGENTS_B64__).decode("utf-8"), encoding="utf-8")
+
+        print(json.dumps({{
+            "status": "remote locomo runtime prepared",
+            "locomo_eval_model": __LOCOMO_MODEL__ or "unchanged-global-config",
+            "locomo_eval_workspace": "isolated-per-run-state-dir",
+            "default_model": __LOCOMO_MODEL__ or "inherit-from-isolated-copy",
+            "openclaw_auto_recall": auto_recall_results,
+            "openviking_signature_compat": compat_results,
+        }}, ensure_ascii=False))
+        """
+    ).strip()
+    remote_python = remote_python.replace("__BENCHMARK_DIR__", repr(args.benchmark_dir))
+    remote_python = remote_python.replace("__LOCOMO_MODEL__", repr(args.locomo_model))
+    remote_python = remote_python.replace("__AGENTS_B64__", repr(agents_b64))
+    remote_python = remote_python.replace("{{", "{").replace("}}", "}")
+    remote_python = _normalize_remote_python_source(remote_python)
+
+    remote_cmd = f"docker exec -i {args.remote_container} python3 -"
+    _run(
+        ["ssh", "-p", args.ssh_port, args.ssh_host, remote_cmd],
+        input_text=remote_python,
+    )
+
+
+if __name__ == "__main__":
+    main()

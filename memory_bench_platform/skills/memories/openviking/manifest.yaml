@@ -1,0 +1,64 @@
+kind: memory
+id: openviking
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  targets:
+    - name: openviking
+      scope: memory_backend
+      version_source: upstream_release_tag
+      upstream: https://github.com/volcengine/OpenViking
+      record_runtime_version: true
+  record_runtime_version: true
+entry:
+  runner: scripts/run_operation.py
+runtime:
+  benchmark_unit: session
+  actions:
+    - ingest
+    - flush
+    - status
+    - recall
+ingest:
+  benchmark_unit: session
+recall:
+  mode: direct_recall_plus_search
+completion:
+  accept_signal: accepted
+  complete_signal: completed
+integration:
+  protocol_version: memory/1
+capabilities:
+  actions: [ingest, flush, status, recall]
+  async_ingest: true
+  commit:
+    supported: true
+    required_after_ingest: true
+    notes: flush maps the generic memory lifecycle to OpenViking session commit
+  readiness:
+    supported: true
+    scoped_by_operation: true
+  scope:
+    supported: true
+    scoped_ingest: true
+    scoped_recall: true
+    isolation_level: episode
+  evidence_output: true
+  outputs:
+    ingest: [operation.session_id, output.session_id]
+    flush: [operation.task_id]
+    status: [state, operation]
+    recall: [output.evidence_text]

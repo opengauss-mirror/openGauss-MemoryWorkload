@@ -1,0 +1,8 @@
+[general]
+name = "small-test"
+dataset = "small"
+memory_mode = "openviking"
+parallel = 3
+
+[session]
+policy = "isolated"

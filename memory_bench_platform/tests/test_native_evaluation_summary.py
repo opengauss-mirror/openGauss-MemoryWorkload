@@ -1,0 +1,110 @@
+from memory_bench_platform.cli import _apply_native_run_validity, _summarize_native_evaluation
+from memory_bench_platform.protocol import CaseRecord, JudgeResult, StepRecord, StepResultRecord
+
+
+def test_summary_excludes_ungraded_judge_failures_from_benchmark_score():
+    cases = [
+        CaseRecord(
+            case_id="setup",
+            run_id="run-1",
+            title="setup",
+            goal="setup",
+            capability="memory/ingest",
+            labels=["phase:setup"],
+            judge_mode="none",
+        ),
+        CaseRecord(
+            case_id="q1",
+            run_id="run-1",
+            title="q1",
+            goal="answer",
+            capability="memory/question-answering",
+        ),
+        CaseRecord(
+            case_id="q2",
+            run_id="run-1",
+            title="q2",
+            goal="answer",
+            capability="memory/question-answering",
+        ),
+    ]
+    steps = [
+        StepRecord(
+            step_id="setup-wait-ready",
+            case_id="setup",
+            name="wait_ready",
+            operator_kind="poll",
+        )
+    ]
+    step_results = [
+        StepResultRecord(
+            step_result_id="setup-wait-ready-1",
+            step_id="setup-wait-ready",
+            attempt=1,
+            status="passed",
+            duration_ms=125,
+            gate_passed=True,
+        )
+    ]
+    judges = [
+        JudgeResult(judge_id="q1", run_id="run-1", case_id="q1", passed=True, score=1.0),
+        JudgeResult(
+            judge_id="q2",
+            run_id="run-1",
+            case_id="q2",
+            passed=None,
+            score=None,
+            label="judge-error",
+        ),
+    ]
+
+    summary = _summarize_native_evaluation(cases, steps, judges, step_results)
+
+    assert summary["case_total"] == 2
+    assert summary["case_passed"] == 1
+    assert summary["case_failed"] == 0
+    assert summary["case_ungraded"] == 1
+    assert summary["benchmark_score"] == 1.0
+    assert summary["raw_benchmark_score"] == 1.0
+    assert summary["evaluation_coverage"] == 0.5
+    assert summary["checkpoint_ready_rate"] == 1.0
+    assert summary["readiness_latency_ms"] == 125.0
+
+    invalid = _apply_native_run_validity(summary)
+    assert invalid["run_validity"]["valid"] is False
+    assert invalid["run_validity"]["reasons"] == [
+        "evaluation_coverage_below_minimum"
+    ]
+    assert invalid["benchmark_score"] is None
+    assert invalid["raw_benchmark_score"] == 1.0
+
+
+def test_validity_thresholds_can_explicitly_allow_partial_coverage():
+    summary = {
+        "raw_benchmark_score": 1.0,
+        "evaluation_coverage": 0.5,
+        "checkpoint_ready_rate": 1.0,
+        "runtime_failure_rate": 0.0,
+    }
+    resolved = _apply_native_run_validity(summary, {"minimum_coverage": 0.5})
+    assert resolved["run_validity"]["valid"] is True
+    assert resolved["benchmark_score"] == 1.0
+
+
+def test_finalize_failure_invalidates_an_otherwise_valid_score():
+    summary = {
+        "raw_benchmark_score": 1.0,
+        "evaluation_coverage": 1.0,
+        "checkpoint_ready_rate": 1.0,
+        "runtime_failure_rate": 0.1,
+    }
+
+    resolved = _apply_native_run_validity(
+        summary,
+        additional_reasons=["memory_plugin_finalize_failed"],
+    )
+
+    assert resolved["run_validity"]["valid"] is False
+    assert resolved["benchmark_score"] is None
+    assert "runtime_failure_rate_above_maximum" in resolved["run_validity"]["reasons"]
+    assert "memory_plugin_finalize_failed" in resolved["run_validity"]["reasons"]

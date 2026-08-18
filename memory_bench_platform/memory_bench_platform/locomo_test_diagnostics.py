@@ -1,0 +1,1 @@
+from .adapters.locomo.diagnostics import *  # noqa: F401,F403

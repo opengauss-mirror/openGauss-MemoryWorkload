@@ -1,0 +1,14 @@
+{
+  "benchmark_id": "example-benchmark",
+  "evaluation": {"target": "qa_answer", "profile": "llm_judge@1"},
+  "samples": [
+    {
+      "sample_id": "persona-12",
+      "timeline": [
+        {"event_id": "session-1", "type": "conversation", "timestamp": "2026-01-01", "payload": {"messages": [{"role": "user", "content": "I used to prefer coffee."}]}},
+        {"event_id": "session-2", "type": "conversation", "timestamp": "2026-01-02", "payload": {"messages": [{"role": "user", "content": "I now prefer tea."}]}},
+        {"event_id": "checkpoint-1", "type": "checkpoint", "timestamp": "2026-01-03", "payload": {}, "evaluation": {"target": "qa_answer", "profile": "llm_judge@1", "questions": [{"question_id": "q1", "question": "What do I prefer now?", "reference": "tea", "category": "preference-update"}]}}
+      ]
+    }
+  ]
+}

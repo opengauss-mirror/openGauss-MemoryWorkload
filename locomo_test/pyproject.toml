@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "locomo-test-kit"
+version = "0.1.0"
+description = "Standardized LoCoMo benchmark test toolkit for OpenClaw"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "httpx>=0.27",
+    "websocket-client>=1.6",
+    "openai>=1.0",
+    "memory-bench-platform>=0.1.0",
+]
+
+[project.scripts]
+locomo-test = "locomo_test.cli:main"
+
+[tool.setuptools]
+packages = ["locomo_test", "locomo_test.configs"]
+
+[tool.setuptools.package-dir]
+locomo_test = "locomo_test"
+"locomo_test.configs" = "configs"
+
+[tool.setuptools.package-data]
+"locomo_test.configs" = ["*.toml", "*.toml.example"]

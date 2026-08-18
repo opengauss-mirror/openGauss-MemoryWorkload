@@ -1,0 +1,29 @@
+[
+  {
+    "sample_id": "fixture-sample-1",
+    "conversation": {
+      "speaker_a": "Alex",
+      "speaker_b": "Blair",
+      "session_1_date_time": "1:00 pm on 1 May, 2023",
+      "session_1": [
+        {
+          "speaker": "Alex",
+          "text": "My favorite drink is tea.",
+          "dia_id": "D1:1"
+        },
+        {
+          "speaker": "Blair",
+          "text": "I will remember that.",
+          "dia_id": "D1:2"
+        }
+      ]
+    },
+    "qa": [
+      {
+        "question": "What is Alex's favorite drink?",
+        "answer": "Tea",
+        "category": "1"
+      }
+    ]
+  }
+]

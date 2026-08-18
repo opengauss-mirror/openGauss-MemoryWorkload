@@ -1,0 +1,16 @@
+kind: analysis
+id: openviking-memory-write-diagnosis
+version: 0.1.0
+supports:
+  benchmarks:
+    - locomo
+    - longmemeval
+  agents:
+    - openclaw
+    - hermes
+  sources:
+    - benchmark_case_source
+    - external_benchmark_runner
+outputs:
+  - reports/analysis.json
+  - external_artifacts/*/remote_logs/*.master.log

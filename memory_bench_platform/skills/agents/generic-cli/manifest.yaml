@@ -1,0 +1,38 @@
+kind: agent
+id: generic-cli
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  targets:
+    - name: generic-cli
+      scope: system_under_test
+      version_source: runtime_observed_only
+      record_runtime_version: true
+      notes: This scaffold skill can only record the observed binary/package version unless a concrete upstream-backed agent skill is created.
+  record_runtime_version: true
+  notes: For official benchmark baselines, prefer a concrete agent skill that resolves the latest upstream release tag explicitly instead of this generic wrapper.
+entry:
+  runner: scripts/run_task.py
+  healthcheck: scripts/healthcheck.py
+runtime:
+  mode: process
+io:
+  protocol_mode: stateless_cli
+lifecycle:
+  startup_required: false
+collection:
+  stdout: true
+  stderr: true

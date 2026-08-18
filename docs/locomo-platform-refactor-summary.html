@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LoCoMo Platform Refactor Summary</title>
+  <style>
+    :root {
+      --bg: #f3f6fb;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #667085;
+      --line: #dbe3ec;
+      --accent: #0f766e;
+      --accent-soft: #ecfdf5;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background: linear-gradient(180deg, #f8fafc, #eef4f8);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+    }
+    .hero, .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.05);
+    }
+    .hero { padding: 28px; margin-bottom: 18px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .card { padding: 20px; }
+    h1, h2 { margin: 0 0 12px; }
+    h1 { font-size: 30px; }
+    h2 { font-size: 20px; }
+    p, li {
+      line-height: 1.75;
+      color: var(--text);
+    }
+    .muted { color: var(--muted); }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+    ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+    code {
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-size: 0.95em;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div class="pill">总结</div>
+      <h1>LoCoMo / memory_bench_platform 改动总结</h1>
+      <p class="muted">
+        本轮改动的核心目标是：让 <code>locomo_test</code> 从“平行工具”收敛为
+        <code>memory_bench_platform</code> 的 LoCoMo 专项派生执行层，同时把资源监控、
+        CPU/内存采样、统一 HTML 报告和专项诊断链纳入平台主框架。
+      </p>
+    </section>
+
+    <section class="grid">
+      <section class="card">
+        <h2>1. 架构关系调整</h2>
+        <ul>
+          <li><code>memory_bench_platform</code> 被明确为主框架，负责 skill、run archive、分析和统一报告。</li>
+          <li>LoCoMo benchmark skill 新增 <code>locomo_test_remote</code> external runner entrypoint。</li>
+          <li><code>locomo_test</code> 不再被视为平行平台，而是 LoCoMo 专项执行层。</li>
+          <li>这一关系已体现在 skill manifest、SKILL 文档、README 和入口解析测试中。</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>2. 统一报告与分析</h2>
+        <ul>
+          <li>平台新增统一 <code>run_report.html</code>，汇总 accuracy、failure、resource、artifacts、chain diagnostics。</li>
+          <li>平台可消费 <code>locomo_test</code> 导出的 <code>meta.json</code>、<code>qa_diagnostics.json</code>、<code>qa_results.csv</code>。</li>
+          <li>新增 <code>locomo_test</code> 专项 diagnostics 分析桥和 timing 分析桥。</li>
+          <li><code>locomo_test</code> 自己的 <code>report.html</code> 渲染已下沉到平台 bridge。</li>
+        </ul>
+      </section>
+    </section>
+
+    <section class="grid">
+      <section class="card">
+        <h2>3. 资源监控与 CPU/内存采样</h2>
+        <ul>
+          <li>平台原生 run 和 external runner 都支持 run 生命周期级后台采样，不再只是单点快照。</li>
+          <li><code>locomo_test_remote</code> 在远端容器内持续写出 <code>cpu_status.csv</code> 和 <code>mem_status.csv</code>。</li>
+          <li>平台分析优先消费这些远端 monitor 文件，用于真实被测环境的资源摘要。</li>
+          <li>统一报告现在同时包含 CPU 和内存采样摘要。</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>4. 平台 bridge 下沉</h2>
+        <ul>
+          <li>runtime bootstrap 已下沉到平台：<code>locomo_test_runtime_bridge</code></li>
+          <li>HTML report 渲染已下沉到平台：<code>locomo_test_report_bridge</code></li>
+          <li>metrics / QA diagnostics / closure summary 已下沉到平台：<code>locomo_test_metrics_bridge</code></li>
+          <li>timing report 已下沉到平台：<code>locomo_test_timing</code></li>
+          <li>并新增统一产物读取层：<code>locomo_test_artifacts</code></li>
+        </ul>
+      </section>
+    </section>
+
+    <section class="card" style="margin-bottom: 18px;">
+      <h2>5. 关键文件</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>类别</th>
+            <th>文件</th>
+            <th>作用</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Skill 入口</td>
+            <td><code>memory_bench_platform/skills/benchmarks/locomo/manifest.yaml</code></td>
+            <td>声明 <code>locomo_test_remote</code> 为 LoCoMo external runner entrypoint</td>
+          </tr>
+          <tr>
+            <td>Runtime Bridge</td>
+            <td><code>memory_bench_platform/memory_bench_platform/locomo_test_runtime_bridge.py</code></td>
+            <td>承接远端 OpenClaw/OpenViking runtime bootstrap</td>
+          </tr>
+          <tr>
+            <td>Report Bridge</td>
+            <td><code>memory_bench_platform/memory_bench_platform/locomo_test_report_bridge.py</code></td>
+            <td>承接 <code>locomo_test</code> HTML 报告渲染</td>
+          </tr>
+          <tr>
+            <td>Metrics Bridge</td>
+            <td><code>memory_bench_platform/memory_bench_platform/locomo_test_metrics_bridge.py</code></td>
+            <td>承接 QA diagnostics / closure summary / stats 汇总</td>
+          </tr>
+          <tr>
+            <td>Timing Bridge</td>
+            <td><code>memory_bench_platform/memory_bench_platform/locomo_test_timing.py</code></td>
+            <td>从 <code>pipeline.log</code> / <code>.ingest_record.json</code> / <code>qa_results.csv</code> 生成 timing report</td>
+          </tr>
+          <tr>
+            <td>Artifact Loader</td>
+            <td><code>memory_bench_platform/memory_bench_platform/locomo_test_artifacts.py</code></td>
+            <td>统一读取 <code>locomo_test</code> output bundle，减少 bridge 逻辑重复</td>
+          </tr>
+          <tr>
+            <td>远端入口</td>
+            <td><code>tools/test_entrypoints/run_locomo_test_remote.sh</code></td>
+            <td>同步 <code>locomo_test + memory_bench_platform</code>，并采集远端 monitor 文件</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card" style="margin-bottom: 18px;">
+      <h2>6. 提交链</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Commit</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>5337a5b</code></td><td>统一 locomo diagnostics 和 platform reporting</td></tr>
+          <tr><td><code>e1cab46</code></td><td>LoCoMo skill 派生出 <code>locomo_test_remote</code> 平台入口</td></tr>
+          <tr><td><code>71dd770</code></td><td>采集远端 locomo monitor telemetry</td></tr>
+          <tr><td><code>6d0bdac</code></td><td>平台报告支持分析 <code>locomo_test</code> runs</td></tr>
+          <tr><td><code>158a45a</code></td><td>新增 <code>locomo_test</code> timing bridge</td></tr>
+          <tr><td><code>ca8bc87</code></td><td>runtime bootstrap 下沉到 platform bridge</td></tr>
+          <tr><td><code>49a0d6b</code></td><td>report 渲染下沉到 platform bridge</td></tr>
+          <tr><td><code>3c98dbf</code></td><td>metrics / diagnostics 下沉到 platform bridge</td></tr>
+          <tr><td><code>a3cc700</code></td><td>统一 <code>locomo_test</code> artifact loader</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>7. 当前结论</h2>
+      <ul>
+        <li>目标 1：代码已提交完成。</li>
+        <li>目标 2：<code>locomo_test</code> 已经从入口层和代码层两方面收敛为 <code>memory_bench_platform</code> 的 LoCoMo 派生执行层。</li>
+        <li>目标 3：面向 <code>locomo_test</code> 的资源监控、CPU/内存采样、统一 HTML 报告、专项 diagnostics 和 timing 报告均已打通。</li>
+        <li>当前剩余未跟踪内容仅为临时文件和运行产物，不影响正式代码交付。</li>
+      </ul>
+    </section>
+  </div>
+</body>
+</html>

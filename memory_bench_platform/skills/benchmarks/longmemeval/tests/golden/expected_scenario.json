@@ -1,0 +1,67 @@
+{
+  "source_kind": "benchmark_scenario",
+  "benchmark_id": "longmemeval",
+  "requirements": {
+    "agent": {"multi_turn": true, "stateful_session": true},
+    "memory": {"actions": ["ingest", "recall"]}
+  },
+  "evaluation": {
+    "target": "qa_answer",
+    "profile": "llm_judge@1",
+    "primary_metric": "accuracy"
+  },
+  "samples": [
+    {
+      "sample_id": "q-golden-1",
+      "namespace_hint": "q-golden-1",
+      "timeline": [
+        {
+          "event_id": "session-a",
+          "type": "conversation",
+          "timestamp": "2024-03-05",
+          "payload": {
+            "content": "LongMemEval timestamped conversation session for memory ingestion.\nSession ID: session-a\nSession date: 2024-03-05\nuser: I started my new job this month.\nassistant: Congratulations on the new job.",
+            "messages": [
+              {"role": "user", "content": "I started my new job this month."},
+              {"role": "assistant", "content": "Congratulations on the new job."}
+            ]
+          },
+          "metadata": {"session_index": 1}
+        },
+        {
+          "event_id": "final-qa",
+          "type": "checkpoint",
+          "evaluation": {
+            "target": "qa_answer",
+            "profile": "llm_judge@1",
+            "primary_metric": "accuracy",
+            "questions": [
+              {
+                "question_id": "q-golden-1",
+                "question": "When did the user start the new job?",
+                "reference": "March 2024",
+                "category": "temporal-reasoning",
+                "metadata": {
+                  "question_date": "2024-04-01",
+                  "question_type": "temporal-reasoning",
+                  "answer_session_ids": ["session-a"],
+                  "abstention": false
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {
+        "question_date": "2024-04-01",
+        "question_type": "temporal-reasoning",
+        "session_count": 1
+      }
+    }
+  ],
+  "execution_spec": {
+    "case_mode": "single_path",
+    "max_parallel_steps": 1,
+    "fail_fast": true
+  }
+}

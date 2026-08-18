@@ -1,0 +1,19 @@
+# 测试配置模板 — 复制为你的实验配置
+# cp test.toml.example my-test.toml
+# 然后修改参数，运行: locomo-test run configs/my-test.toml
+
+[general]
+name = "my-experiment"          # 运行名称，决定 output 子目录名
+env_file = "env.toml"           # 指向本地环境文件
+dataset = "locomo10"            # "small" (1 sample, 35 QA) / "locomo10" (完整 10 samples)
+# samples = [0]                  # 可选：跑哪些 sample (0-based)
+                                # 支持: [0, 3, 7] 列表 / "0-4" 范围 / 0 单个，不填则跑全部
+# count = 10                    # 可选：只跑前 N 道 QA 题
+memory_mode = "openviking"      # openviking / ogmem / memcore / none
+parallel = 10                   # QA 并发数 (shared policy 下强制为 1)
+user = "eval-1"                 # 用户标识
+agent_id = "main"               # agent 标识 (需与 openclaw.json 中定义的 agent 一致)
+
+[session]
+policy = "isolated"             # isolated = 每 QA 独立 session (默认)
+                                # shared   = 复用 ingest session, 串行 QA

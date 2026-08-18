@@ -1,0 +1,13 @@
+kind: analysis
+id: locomo-small-chain-diagnosis
+version: 0.1.0
+supports:
+  benchmarks:
+    - locomo
+  agents:
+    - openclaw
+  sources:
+    - external_benchmark_runner
+outputs:
+  - reports/analysis.json
+  - reports/analysis.json.chain_diagnostics

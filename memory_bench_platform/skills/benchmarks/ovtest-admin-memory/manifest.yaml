@@ -1,0 +1,36 @@
+kind: benchmark
+id: ovtest-admin-memory
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  targets:
+    - name: openviking
+      scope: system_under_test
+      version_source: upstream_release_tag
+      upstream: https://github.com/volcengine/OpenViking
+      record_runtime_version: true
+  record_runtime_version: true
+  notes: OpenViking admin-memory checks should run against the latest official release tag by default and record the resolved runtime version in the run archive.
+entry:
+  case_builder: scripts/build_tasks.py
+dataset:
+  default_split: smoke
+execution:
+  mode: multi_turn
+  requires_stateful_agent: false
+  task_isolation: per_task
+judging:
+  mode: builtin

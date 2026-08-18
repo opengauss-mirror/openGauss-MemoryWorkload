@@ -1,0 +1,66 @@
+{
+  "type": "object",
+  "required": ["kind", "id", "version", "entry", "version_policy"],
+  "properties": {
+    "kind": { "const": "benchmark" },
+    "id": { "type": "string" },
+    "version": { "type": "string" },
+    "entry": { "type": "object" },
+    "version_policy": {
+      "type": "object",
+      "required": [
+        "default_selection",
+        "resolution_order",
+        "allowed_overrides",
+        "disallowed_defaults",
+        "targets",
+        "record_runtime_version"
+      ],
+      "properties": {
+        "default_selection": { "const": "latest_official_release_tag" },
+        "resolution_order": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "allowed_overrides": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "disallowed_defaults": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["name", "scope", "version_source"],
+            "properties": {
+              "name": { "type": "string" },
+              "scope": {
+                "enum": [
+                  "system_under_test",
+                  "benchmark_tooling",
+                  "runtime_dependency",
+                  "memory_backend"
+                ]
+              },
+              "version_source": {
+                "enum": ["upstream_release_tag", "runtime_observed_only"]
+              },
+              "upstream": { "type": "string" },
+              "required": { "type": "boolean" },
+              "record_runtime_version": { "type": "boolean" },
+              "notes": { "type": "string" }
+            }
+          }
+        },
+        "record_runtime_version": { "type": "boolean" },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+  "additionalProperties": true
+}

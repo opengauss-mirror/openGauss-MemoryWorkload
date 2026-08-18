@@ -1,0 +1,38 @@
+kind: agent
+id: hermes
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  targets:
+    - name: hermes
+      scope: system_under_test
+      version_source: upstream_release_tag
+      upstream: https://github.com/Integuru-AI/hermes-agent
+      record_runtime_version: true
+  record_runtime_version: true
+  notes: Hermes runs should use the latest official release tag by default and record the concrete runtime version in the run archive.
+entry:
+  runner: scripts/run_task.py
+  healthcheck: scripts/healthcheck.py
+runtime:
+  mode: process
+io:
+  protocol_mode: stateless_cli
+lifecycle:
+  startup_required: false
+collection:
+  stdout: true
+  stderr: true
