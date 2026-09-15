@@ -11,6 +11,7 @@ import traceback
 from .backends import validate_openviking_source
 from .external_report_import import import_external_result
 from .integration import (
+    adapter_environment,
     build_benchmark_scenario,
     build_run_contract,
     build_cases_from_source,
@@ -28,7 +29,7 @@ from .evaluation_profiles import resolve_evaluation_governance
 from .benchmark_scenario import RunBinding
 from .compatibility import resolve_compatibility
 from .composer import compose_run_plan
-from .loader import load_agent_skill, load_all_skills, load_benchmark_skill
+from .loader import load_agent_skill, load_all_skills, load_benchmark_skill, load_trace_skill
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
 from .protocol import (
@@ -47,6 +48,15 @@ from .result_analysis import analyze_run
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .resource_monitor import ResourceMonitor
 from .storage import RunStorage
+from .trace_runtime import TraceRuntime
+from .trace_runtime.platform import (
+    build_trace_environment,
+    build_trace_runtime_config,
+    sanitized_trace_config,
+    trace_metrics,
+    trace_verification,
+    validate_trace_protocols,
+)
 from .versioning import build_external_runner_env, build_version_selection
 from .workflow import execute_cases
 
@@ -71,6 +81,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--run-id")
     p_plan.add_argument("--version-override", action="append", default=[])
 
+    def add_trace_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--trace-mode", choices=["off", "capture", "replay-zero-delay", "replay-with-delay", "mock-fixed"], default="off")
+        command_parser.add_argument("--trace-deployment", choices=["managed", "external"], default="managed")
+        command_parser.add_argument("--trace-profile", default="openai-compatible@1")
+        command_parser.add_argument("--trace-bundle")
+        command_parser.add_argument("--trace-output")
+        command_parser.add_argument("--trace-copies", type=int, default=1)
+        command_parser.add_argument("--trace-delay-scale", type=float, default=1.0)
+        command_parser.add_argument("--trace-channel", action="append", default=[])
+        command_parser.add_argument("--trace-endpoint", action="append", default=[])
+        command_parser.add_argument("--trace-upstream", action="append", default=[])
+        command_parser.add_argument(
+            "--trace-redact-json-pointer", action="append", default=[]
+        )
+
+    add_trace_arguments(p_plan)
+
     p_run = sub.add_parser("run")
     p_run.add_argument("--benchmark", required=True)
     p_run.add_argument("--agent", required=True)
@@ -86,12 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--run-id")
     p_run.add_argument("--smoke-gate")
     p_run.add_argument("--version-override", action="append", default=[])
+    add_trace_arguments(p_run)
 
     p_validate = sub.add_parser("validate")
     p_validate.add_argument("--benchmark")
     p_validate.add_argument("--agent")
     p_validate.add_argument("--smoke")
     p_validate.add_argument("--memory-backend")
+    p_validate.add_argument("--trace")
     p_validate.add_argument("--source-path")
     p_validate.add_argument("--data-path")
     p_validate.add_argument("--api-base", default="https://ark.cn-beijing.volces.com/api/coding/v3")
@@ -139,6 +168,57 @@ def _parse_version_overrides(raw_items: list[str] | None) -> dict[str, str]:
             raise SystemExit(f"invalid --version-override value: {item!r}; expected target=version")
         overrides[target] = version
     return overrides
+
+
+def _validate_installed_trace_protocols(trace_config) -> None:
+    loaded = load_all_skills(SKILLS_ROOT)
+    supported = {
+        protocol
+        for manifest in loaded["traces"]
+        for protocol in manifest.protocols
+    }
+    validate_trace_protocols(trace_config, supported)
+
+
+def _archive_trace_runtime(
+    storage: RunStorage,
+    run_dir: Path,
+    runtime: TraceRuntime,
+    run_id: str,
+) -> tuple[dict, list[dict]]:
+    summary = runtime.verify_and_collect()
+    runtime.collect(run_dir, summary)
+    summary_payload = summary.model_dump(mode="json")
+    verification = trace_verification(summary)
+    metrics = trace_metrics(summary, run_id)
+    storage.write_json_record(run_dir, "records/trace_runtime_summary.json", summary_payload)
+    storage.write_json_record(run_dir, "records/trace_verification.json", verification)
+    if runtime.config.mode == "capture" and runtime.config.output_path:
+        source = Path(runtime.config.output_path).resolve()
+        target = (run_dir / "artifacts" / "provider_traces").resolve()
+        if source != target:
+            storage.mirror_tree(run_dir, source, "artifacts/provider_traces")
+    return verification, metrics
+
+
+def _write_trace_metrics(storage: RunStorage, run_dir: Path, metrics: list[dict]) -> None:
+    records_path = run_dir / "records" / "metrics.json"
+    existing = []
+    if records_path.exists():
+        existing = json.loads(records_path.read_text(encoding="utf-8"))
+    storage.write_json_record(run_dir, "records/metrics.json", [*existing, *metrics])
+
+
+def _stop_and_archive_trace_runtime(
+    storage: RunStorage,
+    run_dir: Path,
+    runtime: TraceRuntime,
+    run_id: str,
+) -> tuple[dict, list[dict]]:
+    runtime.stop()
+    verification, metrics = _archive_trace_runtime(storage, run_dir, runtime, run_id)
+    _write_trace_metrics(storage, run_dir, metrics)
+    return verification, metrics
 
 
 def _build_version_selection(benchmark_manifest, agent_manifest, *, overrides: dict[str, str]) -> dict[str, dict]:
@@ -697,6 +777,7 @@ def main(argv: list[str] | None = None) -> None:
             "memories": [skill.id for skill in loaded["memories"]],
             "memory_plugins": [skill.id for skill in loaded["memory_plugins"]],
             "smokes": [skill.id for skill in loaded["smokes"]],
+            "traces": [skill.id for skill in loaded["traces"]],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
@@ -709,6 +790,13 @@ def main(argv: list[str] | None = None) -> None:
             payload["agent"] = validate_agent(args.agent)
         if args.smoke:
             payload["smoke"] = validate_smoke(args.smoke)
+        if args.trace:
+            trace_manifest = load_trace_skill(SKILLS_ROOT, args.trace)
+            payload["trace"] = {
+                "status": "ok",
+                "trace": trace_manifest.id,
+                "protocols": trace_manifest.protocols,
+            }
         if args.memory_backend == "openviking":
             if not args.source_path:
                 raise SystemExit("--source-path is required for --memory-backend openviking")
@@ -782,12 +870,17 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "plan-run":
         payload = asdict(plan)
-        payload["run_contract"] = build_run_contract(
+        planned_contract = build_run_contract(
             args.benchmark,
             args.agent,
             args.memory_backend,
             args.memory_integration,
         )
+        planned_trace = build_trace_runtime_config(args, planned_contract)
+        if planned_trace is not None:
+            _validate_installed_trace_protocols(planned_trace)
+            planned_contract["trace_runtime"] = sanitized_trace_config(planned_trace)
+        payload["run_contract"] = planned_contract
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
@@ -847,6 +940,39 @@ def main(argv: list[str] | None = None) -> None:
     )
     storage.write_json_record(run_dir, "records/run_contract.json", run_contract)
 
+    if (
+        getattr(args, "trace_mode", "off") == "capture"
+        and getattr(args, "trace_deployment", "managed") == "managed"
+        and not getattr(args, "trace_output", None)
+    ):
+        args.trace_output = str(run_dir / "artifacts" / "provider_traces")
+    try:
+        trace_config = build_trace_runtime_config(args, run_contract)
+        if trace_config is not None:
+            _validate_installed_trace_protocols(trace_config)
+    except Exception as exc:
+        _archive_run_failure(
+            storage=storage,
+            run_dir=run_dir,
+            run_record=run_record,
+            phase="trace_configuration",
+            status="failed",
+            error=exc,
+            traceback_text=traceback.format_exc(),
+        )
+        raise
+    if trace_config is not None:
+        trace_config_payload = sanitized_trace_config(trace_config)
+        run_record.config["trace_runtime"] = trace_config_payload
+        run_contract["trace_runtime"] = trace_config_payload
+        storage.write_run_record(run_dir, run_record)
+        storage.write_json_record(
+            run_dir,
+            "config_snapshot/trace-runtime.json",
+            trace_config_payload,
+        )
+        storage.write_json_record(run_dir, "records/run_contract.json", run_contract)
+
     if getattr(args, "smoke_gate", None):
         try:
             smoke_result = execute_smoke_skill(args.smoke_gate, run_dir)
@@ -891,7 +1017,19 @@ def main(argv: list[str] | None = None) -> None:
 
     if entrypoint.entrypoint_kind == "external_runner":
         output_dir = run_dir / "external_artifacts" / entrypoint.entrypoint_id
+        trace_runtime = None
+        trace_environment: dict[str, str] = {}
+        trace_verification_payload: dict = {"valid": True, "reasons": []}
+        trace_metric_rows: list[dict] = []
         try:
+            if trace_config is not None:
+                trace_runtime = TraceRuntime.prepare(trace_config)
+                trace_runtime.start()
+                trace_environment = build_trace_environment(
+                    run_contract,
+                    trace_runtime.bindings(),
+                    run_id=run_record.run_id,
+                )
             monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
             monitor.setup_writers()
             env = os.environ.copy()
@@ -905,6 +1043,7 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
             env.update(build_external_runner_env(run_record.version_selection))
+            env.update(trace_environment)
             monitor.start_background_sampling()
             try:
                 runner_result = execute_external_runner(
@@ -922,6 +1061,14 @@ def main(argv: list[str] | None = None) -> None:
                 runner_result["stderr"], encoding="utf-8"
             )
         except Exception as exc:
+            trace_finalize_error = None
+            if trace_runtime is not None:
+                try:
+                    trace_verification_payload, trace_metric_rows = _stop_and_archive_trace_runtime(
+                        storage, run_dir, trace_runtime, run_record.run_id
+                    )
+                except Exception as finalize_exc:
+                    trace_finalize_error = finalize_exc
             if run_record.status == "running":
                 _archive_run_failure(
                     storage=storage,
@@ -931,9 +1078,30 @@ def main(argv: list[str] | None = None) -> None:
                     status="failed",
                     error=exc,
                     traceback_text=traceback.format_exc(),
-                    details={"entrypoint_id": entrypoint.entrypoint_id},
+                    details={
+                        "entrypoint_id": entrypoint.entrypoint_id,
+                        "trace_runtime_finalize_error": str(trace_finalize_error)
+                        if trace_finalize_error is not None
+                        else None,
+                    },
                 )
             raise
+        if trace_runtime is not None:
+            try:
+                trace_verification_payload, trace_metric_rows = _stop_and_archive_trace_runtime(
+                    storage, run_dir, trace_runtime, run_record.run_id
+                )
+            except Exception as exc:
+                _archive_run_failure(
+                    storage=storage,
+                    run_dir=run_dir,
+                    run_record=run_record,
+                    phase="trace_runtime_finalize",
+                    status="failed",
+                    error=exc,
+                    traceback_text=traceback.format_exc(),
+                )
+                raise
         if output_dir.exists():
             try:
                 imported = import_external_result(output_dir)
@@ -1019,6 +1187,20 @@ def main(argv: list[str] | None = None) -> None:
                 category_summary={},
             )
         final_status = summary_record.status
+        if final_status != "failed" and not trace_verification_payload["valid"]:
+            final_status = "invalid"
+            summary_record.status = "invalid"
+        summary_record.run_validity = {
+            **summary_record.run_validity,
+            "valid": bool(summary_record.run_validity.get("valid", True))
+            and trace_verification_payload["valid"],
+            "trace_runtime": trace_verification_payload,
+        }
+        summary_record.resource_summary["trace_runtime"] = (
+            json.loads((run_dir / "records" / "trace_runtime_summary.json").read_text(encoding="utf-8"))
+            if trace_runtime is not None
+            else {"mode": "off"}
+        )
         run_record.status = final_status
         run_record.ended_at = datetime.now()
         storage.write_run_record(run_dir, run_record)
@@ -1070,6 +1252,33 @@ def main(argv: list[str] | None = None) -> None:
         version_selection=run_record.version_selection,
     )
 
+    trace_runtime = None
+    trace_environment: dict[str, str] = {}
+    trace_verification_payload: dict = {"valid": True, "reasons": []}
+    trace_metric_rows: list[dict] = []
+    if trace_config is not None:
+        try:
+            trace_runtime = TraceRuntime.prepare(trace_config)
+            trace_runtime.start()
+            trace_environment = build_trace_environment(
+                run_contract,
+                trace_runtime.bindings(),
+                run_id=run_record.run_id,
+            )
+        except Exception as exc:
+            if trace_runtime is not None:
+                trace_runtime.stop()
+            _archive_run_failure(
+                storage=storage,
+                run_dir=run_dir,
+                run_record=run_record,
+                phase="trace_runtime_start",
+                status="failed",
+                error=exc,
+                traceback_text=traceback.format_exc(),
+            )
+            raise
+
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
     monitor.start_background_sampling()
@@ -1082,32 +1291,42 @@ def main(argv: list[str] | None = None) -> None:
     lifecycle_result = None
     lifecycle_traces: list[TraceEventRecord] = []
     lifecycle_metric = None
+    trace_finalize_error: BaseException | None = None
     try:
-        workflow_output = execute_cases(
-            run_id=run_record.run_id,
-            agent_id=args.agent,
-            memory_id=resolved_memory_id,
-            runtime_context=runtime_context,
-            cases=cases,
-            steps=steps,
-            execution_spec=execution_spec,
-            run_dir=run_dir,
-        )
+        with adapter_environment(trace_environment):
+            workflow_output = execute_cases(
+                run_id=run_record.run_id,
+                agent_id=args.agent,
+                memory_id=resolved_memory_id,
+                runtime_context=runtime_context,
+                cases=cases,
+                steps=steps,
+                execution_spec=execution_spec,
+                run_dir=run_dir,
+            )
     except Exception as exc:
         execution_error = exc
         execution_traceback = traceback.format_exc()
     finally:
         try:
-            (
-                plugin_finalize_payload,
-                lifecycle_case,
-                lifecycle_step,
-                lifecycle_result,
-                lifecycle_traces,
-                lifecycle_metric,
-            ) = _run_plugin_finalize(runtime_context)
+            with adapter_environment(trace_environment):
+                (
+                    plugin_finalize_payload,
+                    lifecycle_case,
+                    lifecycle_step,
+                    lifecycle_result,
+                    lifecycle_traces,
+                    lifecycle_metric,
+                ) = _run_plugin_finalize(runtime_context)
         finally:
             monitor.stop_background_sampling()
+            if trace_runtime is not None:
+                try:
+                    trace_verification_payload, trace_metric_rows = _stop_and_archive_trace_runtime(
+                        storage, run_dir, trace_runtime, run_record.run_id
+                    )
+                except BaseException as exc:
+                    trace_finalize_error = exc
         if plugin_finalize_payload is not None:
             storage.write_json_record(
                 run_dir,
@@ -1125,9 +1344,26 @@ def main(argv: list[str] | None = None) -> None:
             status="failed",
             error=execution_error,
             traceback_text=execution_traceback,
-            details={"memory_plugin_finalize": plugin_finalize_payload or {}},
+            details={
+                "memory_plugin_finalize": plugin_finalize_payload or {},
+                "trace_runtime_finalize_error": str(trace_finalize_error)
+                if trace_finalize_error is not None
+                else None,
+            },
         )
         raise execution_error.with_traceback(execution_error.__traceback__)
+
+    if trace_finalize_error is not None:
+        _archive_run_failure(
+            storage=storage,
+            run_dir=run_dir,
+            run_record=run_record,
+            phase="trace_runtime_finalize",
+            status="failed",
+            error=trace_finalize_error,
+            traceback_text="",
+        )
+        raise trace_finalize_error
 
     assert workflow_output is not None
     if lifecycle_case is not None:
@@ -1154,9 +1390,15 @@ def main(argv: list[str] | None = None) -> None:
         ["memory_plugin_finalize_failed"] if finalize_failed else [],
     )
     run_validity = evaluation_summary["run_validity"]
+    run_validity["trace_runtime"] = trace_verification_payload
+    if not trace_verification_payload["valid"]:
+        run_validity["valid"] = False
+        run_validity.setdefault("reasons", []).extend(
+            f"trace_runtime:{reason}" for reason in trace_verification_payload["reasons"]
+        )
     if not judge_results or evaluation_summary["raw_benchmark_score"] is None:
         final_status = "failed"
-    elif not run_validity["valid"]:
+    elif not run_validity["valid"] or not trace_verification_payload["valid"]:
         final_status = "invalid"
     else:
         final_status = (
@@ -1225,6 +1467,7 @@ def main(argv: list[str] | None = None) -> None:
         "records/metrics.json",
         [item.model_dump(mode="json") for item in workflow_output["metrics"]]
         + evaluation_metrics
+        + trace_metric_rows
         + [
             {
                 "metric_id": f"{run_record.run_id}-cpu-idle",
@@ -1258,6 +1501,11 @@ def main(argv: list[str] | None = None) -> None:
             "cpu": cpu_snapshot,
             "evaluation": evaluation_summary,
             "memory_plugin_finalize": plugin_finalize_payload,
+            "trace_runtime": (
+                json.loads((run_dir / "records" / "trace_runtime_summary.json").read_text(encoding="utf-8"))
+                if trace_runtime is not None
+                else {"mode": "off"}
+            ),
         },
         category_summary={},
     )

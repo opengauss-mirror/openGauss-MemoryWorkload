@@ -1,9 +1,109 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+TraceMode = Literal[
+    "off",
+    "capture",
+    "replay-zero-delay",
+    "replay-with-delay",
+    "mock-fixed",
+]
+
+
+class TraceChannelConfig(BaseModel):
+    protocol: Literal[
+        "openai-chat-completions",
+        "openai-responses",
+        "openai-embeddings",
+        "memory-http",
+        "openclaw-session",
+    ]
+    mode: TraceMode | None = None
+    upstream_base_url: str | None = None
+    listen_url: str | None = None
+    match_mode: Literal["strict", "fingerprint", "compat", "ordered"]
+    order_scope: Literal["global", "session", "user", "fingerprint"]
+    concurrency: int = Field(default=64, gt=0)
+    backlog: int = Field(default=1024, gt=0)
+    request_timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
+    idle_connection_timeout_seconds: float = Field(
+        default=30, gt=0, allow_inf_nan=False
+    )
+    max_body_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    redact_json_pointers: list[str] = Field(default_factory=list)
+
+    @field_validator("redact_json_pointers")
+    @classmethod
+    def validate_redact_json_pointers(cls, pointers: list[str]) -> list[str]:
+        invalid = [
+            pointer
+            for pointer in pointers
+            if (pointer and not pointer.startswith("/"))
+            or re.search(r"~(?![01])", pointer)
+        ]
+        if invalid:
+            raise ValueError("redact_json_pointers must use JSON Pointer syntax")
+        return pointers
+
+
+class TraceRuntimeConfig(BaseModel):
+    mode: TraceMode
+    deployment: Literal["managed", "external"] = "managed"
+    profile_id: str
+    bundle_path: str | None = None
+    output_path: str | None = None
+    copies: int = Field(default=1, gt=0)
+    delay_scale: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    startup_timeout_seconds: int = Field(default=120, gt=0)
+    drain_timeout_seconds: int = Field(default=300, ge=0)
+    channels: dict[str, TraceChannelConfig]
+
+    @model_validator(mode="after")
+    def require_mode_inputs(self) -> "TraceRuntimeConfig":
+        if self.mode == "capture":
+            if self.deployment == "managed" and not self.output_path:
+                raise ValueError("capture mode requires output_path")
+            missing = [
+                name
+                for name, channel in self.channels.items()
+                if self.deployment == "managed"
+                and (channel.mode or self.mode) == "capture"
+                and not channel.upstream_base_url
+            ]
+            if missing:
+                raise ValueError(
+                    "capture channels require upstream_base_url: " + ", ".join(missing)
+                )
+        if self.mode.startswith("replay-") and not self.bundle_path:
+            raise ValueError(f"{self.mode} requires bundle_path")
+        if not math.isfinite(self.delay_scale):
+            raise ValueError("delay_scale must be finite")
+        return self
+
+
+class TraceCounterSnapshot(BaseModel):
+    loaded: int = 0
+    matched: int = 0
+    mismatched: int = 0
+    remaining: int = 0
+    errors: int = 0
+    active: int = 0
+    queued: int = 0
+    peak_active: int = 0
+
+
+class TraceRuntimeSummary(BaseModel):
+    mode: TraceMode
+    bundle_id: str | None = None
+    valid: bool
+    channels: dict[str, TraceCounterSnapshot] = Field(default_factory=dict)
 
 
 class RunRecord(BaseModel):

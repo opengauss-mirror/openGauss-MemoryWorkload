@@ -68,6 +68,9 @@ def _execute_agent(
     messages = step.inputs.get("messages")
     if not isinstance(messages, list) or not messages:
         messages = [{"role": "user", "content": str(step.inputs.get("question", ""))}]
+    metadata = dict(step.inputs.get("metadata", {}))
+    metadata.setdefault("case_id", step.case_id)
+    metadata.setdefault("step_id", step.step_id)
     rendered = RenderedTaskInput(
         task_id=step.step_id,
         system_prompt=str(step.inputs.get("system_prompt")) if step.inputs.get("system_prompt") else None,
@@ -75,7 +78,7 @@ def _execute_agent(
         attachments=[str(item) for item in step.inputs.get("attachments", [])]
         if isinstance(step.inputs.get("attachments", []), list)
         else [],
-        metadata=step.inputs.get("metadata", {}),
+        metadata=metadata,
     )
     result = agent_runner(agent_id, rendered)
     if not isinstance(result, dict):

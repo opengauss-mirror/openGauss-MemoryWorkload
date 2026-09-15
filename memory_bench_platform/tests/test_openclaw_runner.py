@@ -1,9 +1,10 @@
-import os
+from pathlib import Path
 
 from skills.agents.openclaw.scripts.run_task import (
     build_openclaw_command,
     build_openclaw_http_request,
     build_openclaw_message,
+    collect_openclaw_session_artifacts,
     extract_openclaw_response_text,
     resolve_transport,
     session_id_from_key,
@@ -108,6 +109,48 @@ def test_openclaw_http_runner_puts_large_context_in_request_body(monkeypatch):
     assert headers["X-OpenClaw-Session-Key"] == "run-1:qa:q1"
     assert headers["X-OpenClaw-Model"] == "openai/gpt-5.6-luna"
     assert headers["Authorization"] == "Bearer secret-token"
+
+
+def test_openclaw_http_runner_propagates_trace_correlation(monkeypatch):
+    monkeypatch.setenv("TRACE_RUN_ID", "run-1")
+    request = {
+        "task_id": "step-1",
+        "messages": [{"role": "user", "content": "hello"}],
+        "metadata": {
+            "agent_id": "main",
+            "case_id": "case-1",
+            "request_id": "request-1",
+            "session_id": "session-1",
+        },
+    }
+
+    _url, headers, _body = build_openclaw_http_request(request)
+
+    assert headers["X-Trace-Run-ID"] == "run-1"
+    assert headers["X-Trace-Case-ID"] == "case-1"
+    assert headers["X-Trace-Step-ID"] == "step-1"
+    assert headers["X-Trace-Session-ID"] == "session-1"
+    assert headers["X-Request-ID"] == "request-1"
+
+
+def test_openclaw_session_collector_returns_explicit_jsonl(tmp_path: Path):
+    session = tmp_path / "session.jsonl"
+    session.write_text('{"type":"session"}\n', encoding="utf-8")
+    artifacts = collect_openclaw_session_artifacts(
+        {"metadata": {"session_jsonl": str(session)}},
+        agent_id="main",
+        session_id="session-1",
+    )
+
+    assert artifacts == [
+        {
+            "kind": "openclaw_session_jsonl",
+            "path": str(session),
+            "content_type": "application/x-ndjson",
+            "size_bytes": session.stat().st_size,
+            "tags": ["openclaw", "session", "trace-source"],
+        }
+    ]
 
 
 def test_openclaw_runner_defaults_to_cli_without_gateway_url(monkeypatch):

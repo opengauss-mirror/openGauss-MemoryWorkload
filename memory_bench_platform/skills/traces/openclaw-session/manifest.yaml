@@ -1,0 +1,14 @@
+kind: trace
+id: openclaw-session
+version: 0.1.0
+protocols:
+  - openclaw-session
+entry:
+  importer: scripts/import.py
+runtime:
+  source_format: openclaw-session-jsonl
+  output_protocol: openai-responses
+capabilities:
+  import: true
+  streaming: true
+  tool_call_deltas: true

@@ -10,6 +10,7 @@ from .manifests import (
     MemoryManifest,
     MemoryPluginManifest,
     SmokeManifest,
+    TraceManifest,
 )
 
 
@@ -42,12 +43,18 @@ def load_memory_plugin_skill(skills_root: Path, plugin_id: str) -> MemoryPluginM
     return MemoryPluginManifest.model_validate(_load_yaml(manifest_path))
 
 
+def load_trace_skill(skills_root: Path, trace_id: str) -> TraceManifest:
+    manifest_path = skills_root / "traces" / trace_id / "manifest.yaml"
+    return TraceManifest.model_validate(_load_yaml(manifest_path))
+
+
 def load_all_skills(skills_root: Path) -> dict[str, list]:
     benchmarks = []
     agents = []
     memories = []
     memory_plugins = []
     smokes = []
+    traces = []
     for manifest_path in sorted((skills_root / "benchmarks").glob("*/manifest.yaml")):
         benchmarks.append(BenchmarkManifest.model_validate(_load_yaml(manifest_path)))
     for manifest_path in sorted((skills_root / "agents").glob("*/manifest.yaml")):
@@ -64,10 +71,15 @@ def load_all_skills(skills_root: Path) -> dict[str, list]:
     if smoke_root.exists():
         for manifest_path in sorted(smoke_root.glob("*/manifest.yaml")):
             smokes.append(SmokeManifest.model_validate(_load_yaml(manifest_path)))
+    trace_root = skills_root / "traces"
+    if trace_root.exists():
+        for manifest_path in sorted(trace_root.glob("*/manifest.yaml")):
+            traces.append(TraceManifest.model_validate(_load_yaml(manifest_path)))
     return {
         "benchmarks": benchmarks,
         "agents": agents,
         "memories": memories,
         "memory_plugins": memory_plugins,
         "smokes": smokes,
+        "traces": traces,
     }

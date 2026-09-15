@@ -1,0 +1,13 @@
+kind: trace
+id: openai-embedding
+version: 0.1.0
+protocols:
+  - openai-embeddings
+entry:
+  server: scripts/serve.py
+runtime:
+  request_path: /v1/embeddings
+capabilities:
+  capture: true
+  replay: true
+  streaming: false

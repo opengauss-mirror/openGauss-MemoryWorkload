@@ -79,6 +79,8 @@ class EntryPoints(BaseModel):
     runner: str | None = None
     collector: str | None = None
     teardown: str | None = None
+    server: str | None = None
+    importer: str | None = None
 
 
 class SmokeEntryPoints(BaseModel):
@@ -123,6 +125,7 @@ class AgentManifest(BaseModel):
     collection: dict[str, Any] = Field(default_factory=dict)
     integration: dict[str, Any] = Field(default_factory=dict)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    model_dependencies: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -147,6 +150,7 @@ class MemoryManifest(BaseModel):
     completion: dict[str, Any] = Field(default_factory=dict)
     integration: dict[str, Any] = Field(default_factory=dict)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    model_dependencies: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -171,6 +175,24 @@ class MemoryPluginManifest(BaseModel):
     phases: dict[str, Any] = Field(default_factory=dict)
     integration: dict[str, Any] = Field(default_factory=dict)
     lifecycle: dict[str, Any] = Field(default_factory=dict)
+
+
+class TraceManifest(BaseModel):
+    kind: Literal["trace"] = "trace"
+    id: str
+    version: str
+    protocols: list[
+        Literal[
+            "openai-chat-completions",
+            "openai-responses",
+            "openai-embeddings",
+            "memory-http",
+            "openclaw-session",
+        ]
+    ] = Field(min_length=1)
+    entry: EntryPoints = Field(default_factory=EntryPoints)
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
 class SmokeManifest(BaseModel):

@@ -40,6 +40,10 @@ io:
   protocol_mode: stateful_session
 lifecycle:
   startup_required: true
+model_dependencies:
+  agent_chat:
+    protocol: openai-responses
+    base_url_env: OPENCLAW_LLM_BASE_URL
 collection:
   stdout: true
   stderr: true

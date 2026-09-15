@@ -62,3 +62,10 @@ capabilities:
     flush: [operation.task_id]
     status: [state, operation]
     recall: [output.evidence_text]
+model_dependencies:
+  memory_extract:
+    protocol: openai-chat-completions
+    base_url_env: MEMORY_LLM_BASE_URL
+  embedding:
+    protocol: openai-embeddings
+    base_url_env: MEMORY_EMBEDDING_BASE_URL

@@ -29,6 +29,7 @@ packages = [
   "memory_bench_platform",
   "memory_bench_platform.adapters",
   "memory_bench_platform.adapters.locomo",
+  "memory_bench_platform.trace_runtime",
   "locomo_test",
   "locomo_test.configs",
   "skills",

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opengauss.org/memory-workload/trace-manifest.schema.json",
+  "title": "Provider Trace Bundle Manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "profile_id",
+    "created_at",
+    "channels",
+    "redaction_policy"
+  ],
+  "properties": {
+    "schema_version": {"const": "trace-bundle/1"},
+    "bundle_id": {"type": "string", "minLength": 1},
+    "profile_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "source_run_id": {"type": ["string", "null"]},
+    "workload": {"type": "object"},
+    "channels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["protocol", "records", "record_count", "sha256", "match_mode", "order_scope"],
+        "properties": {
+          "protocol": {"type": "string"},
+          "records": {"type": "string"},
+          "record_count": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "match_mode": {"enum": ["strict", "fingerprint", "compat", "ordered"]},
+          "order_scope": {"enum": ["global", "session", "user", "fingerprint"]}
+        }
+      }
+    },
+    "producer": {"type": "object"},
+    "redaction_policy": {"type": "string"}
+  }
+}
