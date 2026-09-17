@@ -261,6 +261,99 @@ def test_openclaw_session_importer_builds_responses_bundle(tmp_path: Path):
     assert "response.output_text.delta" in event_types
 
 
+def test_openclaw_session_importer_groups_parallel_tool_results(tmp_path: Path):
+    session_path = tmp_path / "session.jsonl"
+    session_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"type": "session", "id": "session-1"},
+                {
+                    "type": "message",
+                    "message": {"role": "user", "content": "first user"},
+                },
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "call-1",
+                                "name": "weather",
+                                "arguments": {"city": "Paris"},
+                            },
+                            {
+                                "type": "toolCall",
+                                "id": "call-2",
+                                "name": "weather",
+                                "arguments": {"city": "Berlin"},
+                            },
+                        ],
+                    },
+                },
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "toolResult",
+                        "toolCallId": "call-1",
+                        "content": [{"type": "text", "text": "sunny"}],
+                    },
+                },
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "toolResult",
+                        "toolCallId": "call-2",
+                        "content": [{"type": "text", "text": "rainy"}],
+                    },
+                },
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "first answer"}],
+                    },
+                },
+                {
+                    "type": "message",
+                    "message": {"role": "user", "content": "second user"},
+                },
+                {
+                    "type": "message",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "second answer"}],
+                    },
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bundle_path = tmp_path / "imported"
+    import_openclaw_session(session_path, bundle_path)
+    records = load_bundle(bundle_path).records["agent_chat"]
+
+    assert len(records) == 3
+    assert records[0].request.body["input"] == "first user"
+    assert records[1].request.body["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "sunny",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-2",
+            "output": "rainy",
+        },
+    ]
+    assert records[2].request.body["input"] == "second user"
+    assert records[2].response.body["output"][0]["content"][0]["text"] == "second answer"
+
+
 def test_phase3_trace_skills_are_available():
     loaded = load_all_skills(Path(__file__).resolve().parents[1] / "skills")
     traces = {item.id: item for item in loaded["traces"]}

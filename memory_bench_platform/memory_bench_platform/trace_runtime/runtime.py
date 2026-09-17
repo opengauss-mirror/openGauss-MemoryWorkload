@@ -16,6 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import uuid
+import zlib
 
 from memory_bench_platform.protocol import (
     TraceChannelConfig,
@@ -103,6 +104,29 @@ def _parse_body(raw: bytes, content_type: str | None) -> Any:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def _decode_response_body(
+    raw: bytes, content_encoding: str | None, max_body_bytes: int
+) -> tuple[bytes, bool]:
+    encoding = (content_encoding or "identity").strip().lower()
+    if encoding in {"", "identity"}:
+        return raw, False
+    if encoding != "gzip":
+        raise ValueError(f"unsupported upstream content encoding: {encoding}")
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        decoded = bytearray(decoder.decompress(raw, max_body_bytes + 1))
+        if len(decoded) > max_body_bytes or decoder.unconsumed_tail:
+            raise OverflowError("decompressed upstream response exceeds trace limit")
+        decoded.extend(decoder.flush(max_body_bytes + 1 - len(decoded)))
+    except zlib.error as exc:
+        raise ValueError("invalid gzip upstream response") from exc
+    if len(decoded) > max_body_bytes:
+        raise OverflowError("decompressed upstream response exceeds trace limit")
+    if not decoder.eof:
+        raise ValueError("incomplete gzip upstream response")
+    return bytes(decoded), True
 
 
 def _scope_from_headers(
@@ -624,8 +648,10 @@ class TraceRuntime:
             forwarded_headers = {
                 key: value
                 for key, value in headers.items()
-                if key not in HOP_BY_HOP_HEADERS and key not in {"host", "content-length"}
+                if key not in HOP_BY_HOP_HEADERS
+                and key not in {"host", "content-length", "accept-encoding"}
             }
+            forwarded_headers["accept-encoding"] = "identity"
             request = Request(
                 _upstream_url(config.upstream_base_url or "", handler.path),
                 data=raw_body,
@@ -638,7 +664,9 @@ class TraceRuntime:
                     response_headers = {
                         key.lower(): value for key, value in response.headers.items()
                     }
-                    if _is_event_stream(response_headers):
+                    if _is_event_stream(response_headers) and response_headers.get(
+                        "content-encoding", "identity"
+                    ).lower() in {"", "identity"}:
                         response_body = handler._relay_upstream_stream(
                             response_status, response_headers, response, config.max_body_bytes
                         )
@@ -652,7 +680,9 @@ class TraceRuntime:
                 response_headers = {
                     key.lower(): value for key, value in exc.headers.items()
                 }
-                if _is_event_stream(response_headers):
+                if _is_event_stream(response_headers) and response_headers.get(
+                    "content-encoding", "identity"
+                ).lower() in {"", "identity"}:
                     response_body = handler._relay_upstream_stream(
                         response_status, response_headers, exc, config.max_body_bytes
                     )
@@ -677,6 +707,23 @@ class TraceRuntime:
                 if not handler.close_connection:
                     handler._write_response(response_status, response_headers, response_body)
                 return
+            try:
+                decoded_response_body, response_was_encoded = _decode_response_body(
+                    response_body,
+                    response_headers.get("content-encoding"),
+                    config.max_body_bytes,
+                )
+            except (OverflowError, ValueError):
+                response_status = 502
+                response_headers = {"content-type": "application/json"}
+                response_body = b'{"error":{"type":"trace_upstream_encoding_error"}}'
+                error = True
+                handler._write_response(response_status, response_headers, response_body)
+                return
+            recorded_response_headers = dict(response_headers)
+            if response_was_encoded:
+                recorded_response_headers.pop("content-encoding", None)
+                recorded_response_headers.pop("content-length", None)
             duration_ms = (time.monotonic() - started) * 1000
             request_body = _parse_body(raw_body, headers.get("content-type"))
             scope = _scope_from_headers(headers, request_id, request_body)
@@ -688,19 +735,21 @@ class TraceRuntime:
                 raw_body_base64=None,
             )
             parsed_response = _parse_body(
-                response_body, response_headers.get("content-type")
+                decoded_response_body, response_headers.get("content-type")
             )
             redacted_response = redact_json(
                 parsed_response, config.redact_json_pointers
             )
-            recorded_response_body = redact_bytes(response_body)
+            recorded_response_body = redact_bytes(decoded_response_body)
             stream_frames: list[TraceStreamFrame] = []
             if _is_event_stream(response_headers):
                 stream_frames = [
                     _stream_frame(
                         frame, index, tuple(config.redact_json_pointers)
                     )
-                    for index, frame in enumerate(_split_sse_frames(response_body), 1)
+                    for index, frame in enumerate(
+                        _split_sse_frames(decoded_response_body), 1
+                    )
                 ]
                 recorded_response_body = b"".join(
                     frame.body_bytes() for frame in stream_frames
@@ -732,7 +781,7 @@ class TraceRuntime:
                 request=provider_request,
                 response=ProviderResponse(
                     status=response_status,
-                    headers=redact_headers(response_headers),
+                    headers=redact_headers(recorded_response_headers),
                     body=redacted_response,
                     raw_body_base64=base64.b64encode(recorded_response_body).decode("ascii"),
                     stream_frames=stream_frames,
@@ -934,7 +983,10 @@ class TraceRuntime:
                 name: counters.snapshot()
                 for name, counters in self._capture_counters.items()
             }
-            valid = all(snapshot.errors == 0 for snapshot in snapshots.values())
+            valid = all(
+                snapshot.loaded > 0 and snapshot.errors == 0
+                for snapshot in snapshots.values()
+            )
             return TraceRuntimeSummary(
                 mode=self.config.mode,
                 bundle_id=self._finalized_manifest_id,

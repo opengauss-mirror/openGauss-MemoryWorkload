@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import http.client
 import json
 import socket
@@ -14,6 +16,7 @@ import pytest
 
 from memory_bench_platform.protocol import TraceChannelConfig, TraceRuntimeConfig
 from memory_bench_platform.trace_runtime import TraceRuntime
+from memory_bench_platform.trace_runtime.bundle import load_bundle
 
 
 class _ProviderHandler(BaseHTTPRequestHandler):
@@ -40,6 +43,32 @@ class _ProviderHandler(BaseHTTPRequestHandler):
         response_body = json.dumps(response, separators=(",", ":")).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def log_message(self, format, *args):
+        return
+
+
+class _GzipProviderHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        size = int(self.headers.get("content-length", "0"))
+        self.rfile.read(size)
+        response_body = gzip.compress(
+            json.dumps(
+                {
+                    "output": [{"type": "message", "content": "captured"}],
+                    "access_token": "gzip-response-token-must-not-be-recorded",
+                },
+                separators=(",", ":"),
+            ).encode()
+        )
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-encoding", "gzip")
         self.send_header("content-length", str(len(response_body)))
         self.end_headers()
         self.wfile.write(response_body)
@@ -307,6 +336,83 @@ def test_mock_fixed_embedding_is_counted_without_bundle():
     summary = runtime.verify_and_collect()
     assert summary.valid is True
     assert summary.channels["embedding"].matched == 1
+
+
+def test_capture_with_no_requests_is_invalid(tmp_path: Path):
+    runtime = TraceRuntime.prepare(
+        TraceRuntimeConfig(
+            mode="capture",
+            profile_id="openai-compatible@1",
+            output_path=str(tmp_path / "bundle"),
+            channels={
+                "embedding": TraceChannelConfig(
+                    protocol="openai-embeddings",
+                    upstream_base_url="http://127.0.0.1:9",
+                    match_mode="strict",
+                    order_scope="fingerprint",
+                )
+            },
+        )
+    )
+
+    with runtime.activate():
+        pass
+
+    summary = runtime.verify_and_collect()
+    assert summary.valid is False
+    assert summary.channels["embedding"].loaded == 0
+
+
+def test_capture_decompresses_and_redacts_gzip_response(tmp_path: Path):
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _GzipProviderHandler)
+    provider_thread = Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    bundle_path = tmp_path / "bundle"
+    runtime = TraceRuntime.prepare(
+        TraceRuntimeConfig(
+            mode="capture",
+            profile_id="openai-compatible@1",
+            output_path=str(bundle_path),
+            channels={
+                "agent_chat": TraceChannelConfig(
+                    protocol="openai-responses",
+                    upstream_base_url=f"http://127.0.0.1:{provider.server_address[1]}",
+                    match_mode="ordered",
+                    order_scope="session",
+                )
+            },
+        )
+    )
+
+    try:
+        with runtime.activate() as bindings:
+            request = Request(
+                bindings.endpoints["agent_chat"] + "/v1/responses",
+                data=b'{"input":"hello"}',
+                method="POST",
+                headers={
+                    "content-type": "application/json",
+                    "accept-encoding": "gzip",
+                    "x-trace-session-id": "session-1",
+                },
+            )
+            with urlopen(request, timeout=5) as response:
+                assert response.status == 200
+                assert json.loads(gzip.decompress(response.read()))["access_token"].startswith(
+                    "gzip-response-token"
+                )
+        summary = runtime.verify_and_collect()
+    finally:
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+
+    record = load_bundle(bundle_path).records["agent_chat"][0]
+    recorded_body = base64.b64decode(record.response.raw_body_base64)
+    assert summary.valid is True
+    assert record.response.headers.get("content-encoding") is None
+    assert json.loads(recorded_body)["access_token"] == "[REDACTED]"
+    assert b"gzip-response-token-must-not-be-recorded" not in recorded_body
 
 
 def test_trace_runtime_rejects_oversized_request_body():

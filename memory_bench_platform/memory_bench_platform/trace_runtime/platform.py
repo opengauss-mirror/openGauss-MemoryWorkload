@@ -200,7 +200,12 @@ def build_trace_environment(
             env_name = str(dependency.get("base_url_env") or "")
             if env_name:
                 protocol = str(dependency.get("protocol") or "")
-                if protocol.startswith("openai-") and not endpoint.rstrip("/").endswith("/v1"):
+                append_v1 = bool(dependency.get("append_v1", True))
+                if (
+                    protocol.startswith("openai-")
+                    and append_v1
+                    and not endpoint.rstrip("/").endswith("/v1")
+                ):
                     endpoint = endpoint.rstrip("/") + "/v1"
                 environment[env_name] = endpoint
     return environment

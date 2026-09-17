@@ -121,6 +121,32 @@ def _assistant_output(message: dict[str, Any]) -> tuple[list[dict[str, Any]], li
     return output, frames
 
 
+def _tool_result_item(message: dict[str, Any]) -> dict[str, Any]:
+    call_id = message.get("toolCallId") or message.get("tool_call_id") or message.get(
+        "call_id"
+    )
+    if not call_id:
+        raise ValueError("OpenClaw tool result is missing toolCallId")
+    content = message.get("content", "")
+    if isinstance(content, list):
+        text_parts = [
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        ]
+        output: Any = "\n".join(text_parts) if text_parts else content
+    else:
+        output = content
+    output = redact_json(output)
+    if not isinstance(output, str):
+        output = json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "type": "function_call_output",
+        "call_id": str(call_id),
+        "output": output,
+    }
+
+
 def import_openclaw_session(
     session_jsonl: Path,
     output_bundle: Path,
@@ -140,6 +166,7 @@ def import_openclaw_session(
     )
     ordinal = 0
     pending_users: deque[dict[str, Any]] = deque()
+    pending_tool_outputs: list[dict[str, Any]] = []
     malformed_lines = 0
     try:
         with session_jsonl.open("r", encoding="utf-8") as stream:
@@ -155,12 +182,21 @@ def import_openclaw_session(
                 if not isinstance(message, dict):
                     continue
                 role = message.get("role")
-                if role in {"user", "toolResult", "tool"}:
+                if role == "user":
                     pending_users.append(message)
                     continue
-                if role != "assistant" or not pending_users:
+                if role in {"toolResult", "tool"}:
+                    pending_tool_outputs.append(_tool_result_item(message))
                     continue
-                pending_user = pending_users.popleft()
+                if role != "assistant" or (
+                    not pending_users and not pending_tool_outputs
+                ):
+                    continue
+                if pending_tool_outputs:
+                    request_input: Any = pending_tool_outputs
+                    pending_tool_outputs = []
+                else:
+                    request_input = pending_users.popleft().get("content", "")
                 ordinal += 1
                 output, frames = _assistant_output(message)
                 response = {
@@ -182,7 +218,7 @@ def import_openclaw_session(
                     body=redact_json(
                         {
                             "model": message.get("model", "imported"),
-                            "input": pending_user.get("content", ""),
+                            "input": request_input,
                             "stream": True,
                         }
                     ),
