@@ -109,6 +109,7 @@ skills/<type>/<skill-id>/
 - `skills/memories/`：Memory Backend Skill，例如 `openviking`。
 - `skills/smoke/`：最小链路验证 Skill，例如 `locomo-openclaw-openviking-minimal`。
 - `skills/analysis/`：结果诊断和分析 Skill，例如 LoCoMo small 链路诊断、OpenViking 写入诊断。
+- `skills/instrumentation/`：供 meta agent 阅读的指导型 Skill，例如 [memory-system-auto-instrumentation](memory_bench_platform/skills/instrumentation/memory-system-auto-instrumentation/SKILL.md) 及其可复制的 [meta-agent prompt](memory_bench_platform/skills/instrumentation/memory-system-auto-instrumentation/prompts/meta-agent.md)。这类 Skill 不由 Integration Skill loader 加载，也不需要 `manifest.yaml`。
 
 Benchmark Skill 负责：
 
