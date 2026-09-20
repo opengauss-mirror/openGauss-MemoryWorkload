@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -164,3 +165,140 @@ def test_validate_cli_streams_counts_and_shapes(tmp_path: Path):
             "search": [["query", "user_id"]],
         },
     }
+
+
+@pytest.fixture
+def dataset_dir(tmp_path: Path) -> Path:
+    data = tmp_path / "dataset"
+    data.mkdir()
+    _write_row(
+        data / "openmem_add_sample.jsonl",
+        {"user_id": "", "conversation_id": "conv-1", "messages": []},
+    )
+    _write_row(
+        data / "openmem_search_sample.jsonl",
+        {"user_id": "", "query": "needle", "memory_limit_number": 5},
+    )
+    return data
+
+
+def _output(module, *, status="ok", state="completed", operation=None, output=None):
+    return module.MemoryTaskOutput(
+        status=status,
+        state=state,
+        operation=operation or {},
+        output=output or {},
+        metrics=[],
+        artifacts=[],
+        error={} if status == "ok" else {"type": "backend_failed"},
+    )
+
+
+def _config(module, dataset_dir: Path, tmp_path: Path, **overrides):
+    config = module.ReplayConfig(
+        data_path=dataset_dir,
+        output_dir=tmp_path / "out",
+        run_id="run-1",
+        memory_id="fake-memory",
+        agent_id="generic-cli",
+        poll_interval_seconds=0,
+    )
+    return replace(config, **overrides)
+
+
+def test_execute_replay_drains_add_before_search_and_preserves_protocol(
+    dataset_dir: Path, tmp_path: Path
+):
+    module = _module()
+    calls = []
+
+    def invoke(memory_id, request):
+        calls.append((memory_id, request))
+        if request.action == "ingest":
+            assert request.inputs["raw_request"] == {
+                "user_id": "replay-run-1",
+                "conversation_id": "conv-1",
+                "messages": [],
+            }
+            return _output(
+                module,
+                state="accepted",
+                operation={"session_id": "session-1", "task_id": request.task_id},
+            )
+        if request.action == "status":
+            assert request.inputs["operation"]["session_id"] == "session-1"
+            return _output(module, operation=request.inputs["operation"])
+        return _output(
+            module,
+            output={"count": 1, "memories": [], "evidence_text": ""},
+        )
+
+    summary = module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
+    requests = [request for _, request in calls]
+    first_recall = next(i for i, request in enumerate(requests) if request.action == "recall")
+    assert all(request.action in {"ingest", "status"} for request in requests[:first_recall])
+    assert all(request.inputs["source_protocol"] == "openmem-v1" for request in requests)
+    assert requests[0].task_id in requests[0].idempotency_key
+    assert requests[0].idempotency_key == requests[1].idempotency_key
+    assert summary.dataset_state == "complete"
+    assert [event.operation for event in summary.events] == ["add", "search"]
+
+
+def test_completed_ingest_is_not_polled(dataset_dir: Path, tmp_path: Path):
+    module = _module()
+    actions = []
+
+    def invoke(memory_id, request):
+        actions.append(request.action)
+        if request.action == "ingest":
+            return _output(module, operation={"session_id": "session-1"})
+        return _output(module, output={"count": 0})
+
+    module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
+    assert actions == ["ingest", "recall"]
+
+
+@pytest.mark.parametrize("mode", ["terminal_failure", "timeout"])
+def test_failed_or_timed_out_add_marks_dataset_partially_written(
+    dataset_dir: Path, tmp_path: Path, mode: str
+):
+    module = _module()
+
+    def invoke(memory_id, request):
+        if request.action == "ingest":
+            return _output(
+                module,
+                state="accepted",
+                operation={"session_id": "session-1", "task_id": request.task_id},
+            )
+        if request.action == "status":
+            if mode == "terminal_failure":
+                return _output(module, status="failed", state="failed")
+            return _output(module, state="running", operation=request.inputs["operation"])
+        return _output(module, output={"count": 0})
+
+    timeout = 0 if mode == "timeout" else 60
+    summary = module.execute_replay(
+        _config(module, dataset_dir, tmp_path, drain_timeout_seconds=timeout), invoke
+    )
+    assert summary.dataset_state == "partially_written"
+    assert summary.events[0].status == "failed"
+
+
+@pytest.mark.parametrize("mode", ["failed_output", "exception"])
+def test_recall_failures_become_events_and_do_not_expose_exception_payload(
+    dataset_dir: Path, tmp_path: Path, mode: str
+):
+    module = _module()
+
+    def invoke(memory_id, request):
+        if request.action == "ingest":
+            return _output(module, operation={"session_id": "session-1"})
+        if mode == "exception":
+            raise RuntimeError("query needle must not leak")
+        return _output(module, status="failed", state="failed")
+
+    summary = module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
+    search = summary.events[-1]
+    assert search.status == "failed"
+    assert "needle" not in (search.error_message or "")

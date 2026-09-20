@@ -4,9 +4,17 @@ import copy
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
+
+from memory_bench_platform.protocol import (
+    MemoryTaskInput,
+    MemoryTaskOutput,
+    WorkflowRuntimeContext,
+)
 
 
 Operation = Literal["add", "search"]
@@ -28,6 +36,47 @@ class ReplayRecord:
     payload_size_bytes: int
     top_level_fields: tuple[str, ...]
     baseline: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    data_path: Path
+    output_dir: Path
+    run_id: str
+    memory_id: str
+    agent_id: str
+    add_concurrency: int = 1
+    search_concurrency: int = 1
+    add_rate_per_second: float = 0.0
+    search_rate_per_second: float = 0.0
+    request_timeout_seconds: float = 120.0
+    poll_interval_seconds: float = 1.0
+    drain_timeout_seconds: float = 600.0
+
+
+@dataclass(frozen=True)
+class RequestEvent:
+    request_id: str
+    operation: str
+    line_number: int
+    ts: str
+    payload_sha256: str
+    payload_size_bytes: int
+    top_level_fields: tuple[str, ...]
+    duration_ms: float
+    status: str
+    state: str
+    result_count: int | None
+    response_size_bytes: int | None
+    error_type: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class ReplaySummary:
+    run_id: str
+    dataset_state: str
+    events: tuple[RequestEvent, ...]
 
 
 def _has_operation_token(name: str, operation: Operation) -> bool:
@@ -162,3 +211,154 @@ def validate_dataset(path: Path) -> dict[str, Any]:
         "search_count": counts["search"],
         "request_shapes": shapes,
     }
+
+
+def _runtime_context(config: ReplayConfig) -> WorkflowRuntimeContext:
+    return WorkflowRuntimeContext(
+        run_id=config.run_id,
+        run_dir=str(config.output_dir),
+        benchmark_id="production-http-replay",
+        agent_id=config.agent_id,
+        memory_id=config.memory_id,
+    )
+
+
+def _task_input(
+    config: ReplayConfig,
+    record: ReplayRecord,
+    action: Literal["ingest", "status", "recall"],
+    *,
+    operation: dict[str, Any] | None = None,
+) -> MemoryTaskInput:
+    inputs: dict[str, Any] = {
+        "source_protocol": "openmem-v1",
+        "source_operation": record.operation,
+        "request_id": record.request_id,
+    }
+    if action == "status":
+        inputs["operation"] = copy.deepcopy(operation or {})
+    else:
+        inputs["raw_request"] = copy.deepcopy(record.request)
+    return MemoryTaskInput(
+        task_id=record.request_id,
+        action=action,
+        inputs=inputs,
+        runtime_context=_runtime_context(config),
+        idempotency_key=f"production-replay:{record.request_id}",
+    )
+
+
+def _response_size(output: MemoryTaskOutput) -> int:
+    return len(
+        json.dumps(output.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def _event(
+    record: ReplayRecord,
+    started: float,
+    output: MemoryTaskOutput | None,
+    *,
+    state: str | None = None,
+    error_type: str | None = None,
+) -> RequestEvent:
+    succeeded = output is not None and output.status == "ok" and (state or output.state) == "completed"
+    result_count = None
+    if output is not None:
+        count = output.output.get("count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            result_count = count
+        elif isinstance(output.output.get("memories"), list):
+            result_count = len(output.output["memories"])
+    return RequestEvent(
+        request_id=record.request_id,
+        operation=record.operation,
+        line_number=record.line_number,
+        ts=datetime.now(timezone.utc).isoformat(),
+        payload_sha256=record.payload_sha256,
+        payload_size_bytes=record.payload_size_bytes,
+        top_level_fields=record.top_level_fields,
+        duration_ms=(time.perf_counter() - started) * 1000,
+        status="ok" if succeeded else "failed",
+        state=state or (output.state if output is not None else "failed"),
+        result_count=result_count,
+        response_size_bytes=_response_size(output) if output is not None else None,
+        error_type=error_type if not succeeded else None,
+        error_message="memory invocation failed" if error_type else None,
+    )
+
+
+def _run_add(
+    config: ReplayConfig,
+    record: ReplayRecord,
+    invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
+) -> RequestEvent:
+    started = time.perf_counter()
+    try:
+        output = invoke_memory(config.memory_id, _task_input(config, record, "ingest"))
+        if output.status == "ok" and output.state in {"accepted", "running"}:
+            deadline = time.monotonic() + config.drain_timeout_seconds
+            operation = copy.deepcopy(output.operation)
+            while time.monotonic() < deadline:
+                if config.poll_interval_seconds:
+                    time.sleep(config.poll_interval_seconds)
+                output = invoke_memory(
+                    config.memory_id,
+                    _task_input(config, record, "status", operation=operation),
+                )
+                operation = copy.deepcopy(output.operation or operation)
+                if output.status == "failed" or output.state in {"completed", "failed"}:
+                    break
+            else:
+                return _event(record, started, output, state="failed", error_type="drain_timeout")
+        return _event(
+            record,
+            started,
+            output,
+            error_type=None if output.status == "ok" and output.state == "completed" else "memory_failed",
+        )
+    except Exception as exc:  # The request remains in the workload as a failed event.
+        return _event(record, started, None, error_type=type(exc).__name__)
+
+
+def _run_search(
+    config: ReplayConfig,
+    record: ReplayRecord,
+    invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
+) -> RequestEvent:
+    started = time.perf_counter()
+    try:
+        output = invoke_memory(config.memory_id, _task_input(config, record, "recall"))
+        return _event(
+            record,
+            started,
+            output,
+            error_type=None if output.status == "ok" and output.state == "completed" else "memory_failed",
+        )
+    except Exception as exc:  # The request remains in the workload as a failed event.
+        return _event(record, started, None, error_type=type(exc).__name__)
+
+
+def execute_replay(
+    config: ReplayConfig,
+    invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
+) -> ReplaySummary:
+    dataset = discover_dataset(config.data_path)
+    add_events = [
+        _run_add(config, record, invoke_memory)
+        for record in iter_replay_records(dataset.add_path, "add", config.run_id)
+    ]
+    dataset_state = (
+        "complete" if all(event.status == "ok" for event in add_events) else "partially_written"
+    )
+    search_events = [
+        _run_search(config, record, invoke_memory)
+        for record in iter_replay_records(dataset.search_path, "search", config.run_id)
+    ]
+    return ReplaySummary(
+        run_id=config.run_id,
+        dataset_state=dataset_state,
+        events=tuple(add_events + search_events),
+    )
