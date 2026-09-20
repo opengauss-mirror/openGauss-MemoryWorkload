@@ -8,6 +8,10 @@ from typing import Any
 from .adapters.locomo.artifacts import load_locomo_test_artifacts
 
 def import_external_result(run_dir: Path) -> dict[str, Any]:
+    production_summary = run_dir / "production_replay_summary.json"
+    if production_summary.is_file():
+        return _import_production_replay(run_dir, production_summary)
+
     bundle = load_locomo_test_artifacts(run_dir)
     meta = bundle.meta
     diagnostics = bundle.qa_diagnostics
@@ -61,6 +65,152 @@ def import_external_result(run_dir: Path) -> dict[str, Any]:
         },
         "case_results": case_results,
     }
+
+
+_PRODUCTION_EVENT_KEYS = {
+    "request_id",
+    "operation",
+    "line_number",
+    "ts",
+    "payload_sha256",
+    "payload_size_bytes",
+    "top_level_fields",
+    "duration_ms",
+    "status",
+    "state",
+    "result_count",
+    "response_size_bytes",
+    "error_type",
+    "error_message",
+}
+
+
+def _load_production_events(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"missing production replay event file: {path.name}")
+    events: list[dict[str, Any]] = []
+    request_ids: set[str] = set()
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path.name}: line {line_number}: invalid JSON") from exc
+            if not isinstance(event, dict):
+                raise ValueError(f"{path.name}: line {line_number}: event must be an object")
+            forbidden = sorted(set(event) - _PRODUCTION_EVENT_KEYS)
+            if forbidden:
+                raise ValueError(
+                    f"{path.name}: line {line_number}: forbidden event field: "
+                    + ", ".join(forbidden)
+                )
+            request_id = event.get("request_id")
+            operation = event.get("operation")
+            status = event.get("status")
+            state = event.get("state")
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError(f"{path.name}: line {line_number}: invalid request_id")
+            if request_id in request_ids:
+                raise ValueError(f"{path.name}: duplicate request_id: {request_id}")
+            if operation not in {"add", "search"}:
+                raise ValueError(f"{path.name}: line {line_number}: invalid operation")
+            if status not in {"ok", "failed"} or not isinstance(state, str):
+                raise ValueError(f"{path.name}: line {line_number}: invalid status or state")
+            request_ids.add(request_id)
+            events.append(event)
+    return events
+
+
+def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, Any]:
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("production replay summary is not valid JSON") from exc
+    if not isinstance(summary, dict):
+        raise ValueError("production replay summary must be an object")
+    if summary.get("schema") != "production-replay-summary/1":
+        raise ValueError(
+            f"unsupported production replay schema: {summary.get('schema')!r}"
+        )
+
+    events = _load_production_events(run_dir / "request_events.jsonl")
+    case_results: list[dict[str, Any]] = []
+    operation_counts = {"add": 0, "search": 0}
+    operation_success = {"add": 0, "search": 0}
+    for event in events:
+        operation = event["operation"]
+        passed = event["status"] == "ok" and event["state"] == "completed"
+        operation_counts[operation] += 1
+        operation_success[operation] += int(passed)
+        case_results.append(
+            {
+                "case_id": event["request_id"],
+                "passed": passed,
+                "label": "passed" if passed else "failed",
+                "question": operation,
+                "expected": "successful request",
+                "response": event["state"],
+                "category": operation,
+                "reasoning": event.get("error_type") or "",
+            }
+        )
+
+    invalid_reasons: list[str] = []
+    operations = summary.get("operations")
+    if not isinstance(operations, dict):
+        raise ValueError("production replay summary operations must be an object")
+    for operation in ("add", "search"):
+        metrics = operations.get(operation)
+        if not isinstance(metrics, dict):
+            raise ValueError(f"production replay summary missing {operation} metrics")
+        if int(metrics.get("count", -1)) != operation_counts[operation]:
+            invalid_reasons.append(f"{operation}_event_count_mismatch")
+        if int(metrics.get("success", -1)) != operation_success[operation]:
+            invalid_reasons.append(f"{operation}_success_count_mismatch")
+
+    dataset_state = summary.get("dataset_state")
+    attribution_status = summary.get("attribution_status")
+    join_coverage = summary.get("join_coverage")
+    if not isinstance(join_coverage, dict):
+        raise ValueError("production replay summary join_coverage must be an object")
+    if dataset_state != "complete":
+        invalid_reasons.append("dataset_not_complete")
+    if attribution_status != "validated":
+        invalid_reasons.append("attribution_not_validated")
+    if int(join_coverage.get("duplicate_request_ids", 0) or 0) > 0:
+        invalid_reasons.append("duplicate_request_ids")
+
+    total_correct = sum(item["passed"] for item in case_results)
+    total_questions = len(case_results)
+    run_validity = {"valid": not invalid_reasons, "reasons": invalid_reasons}
+    return {
+        "source": "production_http_replay",
+        "summary": {
+            "overall_accuracy": (
+                round(total_correct / total_questions, 4) if total_questions else 0.0
+            ),
+            "total_correct": total_correct,
+            "total_graded": total_questions,
+            "total_questions": total_questions,
+            "ungraded_count": 0,
+            "accuracy_by_category": _build_category_summary(case_results),
+            "token_totals": {},
+            "memory_token_totals": {},
+            "run_validity": run_validity,
+        },
+        "case_results": case_results,
+        "benchmark_diagnostics": {
+            "source": "production_http_replay",
+            "dataset_state": dataset_state,
+            "model_mode": summary.get("model_mode"),
+            "operations": operations,
+            "join_coverage": join_coverage,
+            "attribution_status": attribution_status,
+            "run_validity": run_validity,
+        },
+    }
+
+
 def _build_locomo_benchmark_diagnostics(
     run_dir: Path,
     meta: dict[str, Any],
