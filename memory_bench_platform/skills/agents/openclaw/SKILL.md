@@ -7,6 +7,13 @@ Agent 任务支持两种传输方式：
 
 HTTP 模式可使用 `OPENCLAW_GATEWAY_TOKEN` 认证。插件的配置、Commit 和生命周期管理仍由 Memory Plugin Adapter 负责，不由本 Agent Runner 处理。
 
+HTTP 请求将任务 `system_prompt` 放入 Responses 的 `instructions`，消息按角色放入 `input`，
+避免回答规则进入记忆系统的检索查询。CLI 仍采用文本拼接，不能提供同等的指令隔离；
+openclaw-ogmemory 基准任务因此要求 HTTP。
+HTTP 的真实 session ID 由 Gateway 分配，通过主机可见的 `OPENCLAW_STATE_DIR` 下的会话映射解析。
+没有映射时返回空 session ID，不会用 CLI 的哈希 ID 冒充；是否必须取得真实 ID，
+由绑定的 Memory Plugin Adapter 在调用后检查。CLI 响应保留 stderr 供适配层诊断。
+
 负责将统一任务适配到 OpenClaw 运行时。
 
 ## 接入约束

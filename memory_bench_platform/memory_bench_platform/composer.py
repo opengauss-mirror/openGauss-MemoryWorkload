@@ -6,6 +6,7 @@ from typing import Any
 from .benchmark_scenario import BenchmarkScenario, RunBinding, ScenarioQuestion, TimelineEvent
 from .evaluation_profiles import resolve_evaluation_profile
 from .evaluation_targets import resolve_evaluation_target
+from .answer_prompts import render_answer_prompt
 
 
 def _slug(value: str) -> str:
@@ -206,9 +207,14 @@ def _compose_backend_direct(
     scenario: BenchmarkScenario,
     binding: RunBinding,
     runtime_capabilities: dict[str, Any],
+    answer_prompt: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cases: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
+    action_timeouts = runtime_capabilities.get("memory", {}).get("action_timeouts_seconds", {})
+    flush_timeout = int(action_timeouts.get("flush", 30))
+    if flush_timeout <= 0:
+        raise ValueError("memory flush timeout must be positive")
     for sample in scenario.samples:
         scope_id = _episode_scope_id(binding, sample.sample_id, sample.namespace_hint)
         pending_events: list[TimelineEvent] = []
@@ -278,7 +284,7 @@ def _compose_backend_direct(
                             f"flush_{timeline_event.event_id}",
                             "memory",
                             depends_on=[previous_step_id],
-                            timeout_seconds=30,
+                            timeout_seconds=flush_timeout,
                             inputs={
                                 "action": "flush",
                                 "session_id": {
@@ -392,10 +398,7 @@ def _compose_backend_direct(
                             "agent",
                             depends_on=[recall_step_id],
                             inputs={
-                                "system_prompt": (
-                                    "Answer the question using only the recalled memory evidence. "
-                                    "If the evidence is insufficient, abstain conservatively."
-                                ),
+                                "system_prompt": render_answer_prompt(answer_prompt, question),
                                 "messages": [
                                     {
                                         "role": "user",
@@ -412,6 +415,7 @@ def _compose_backend_direct(
                                     "sample_id": sample.sample_id,
                                     "scope_id": scope_id,
                                     "question_id": question.question_id,
+                                    "session_key": f"{binding.run_id}:qa:{sample.sample_id}:{event.event_id}:{question.question_id}",
                                     **(
                                         {"agent_id": binding.agent_runtime_id}
                                         if binding.agent_runtime_id
@@ -430,6 +434,7 @@ def _compose_agent_plugin(
     scenario: BenchmarkScenario,
     binding: RunBinding,
     runtime_capabilities: dict[str, Any],
+    answer_prompt: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cases: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
@@ -538,7 +543,7 @@ def _compose_agent_plugin(
                 previous_step_id = agent_step_id
 
             commit_required, readiness_required = _plugin_barrier_policy(runtime_capabilities)
-            readiness_operations: list[tuple[TimelineEvent, str, str | None]] = []
+            readiness_operations: list[tuple[TimelineEvent, str, str | None, str]] = []
             for timeline_event, agent_step_id, session_key in ingested_events:
                 event_slug = _slug(timeline_event.event_id)
                 commit_step_id = f"{setup_case_id}-{event_slug}-commit"
@@ -567,10 +572,10 @@ def _compose_agent_plugin(
                     previous_step_id = commit_step_id
                     readiness_operation_step_id = commit_step_id
                 readiness_operations.append(
-                    (timeline_event, session_key, readiness_operation_step_id)
+                    (timeline_event, session_key, readiness_operation_step_id, agent_step_id)
                 )
             if readiness_required:
-                for timeline_event, session_key, readiness_operation_step_id in readiness_operations:
+                for timeline_event, session_key, readiness_operation_step_id, agent_step_id in readiness_operations:
                     event_slug = _slug(timeline_event.event_id)
                     wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                     wait_inputs: dict[str, Any] = {
@@ -582,6 +587,10 @@ def _compose_agent_plugin(
                         "grace_seconds": 0,
                         "interval_seconds": 2,
                     }
+                    if not commit_required:
+                        wait_inputs["session_handle"] = {
+                            "$ref": f"steps.{agent_step_id}.output.session_handle"
+                        }
                     if readiness_operation_step_id:
                         wait_inputs["operation"] = {
                             "$ref": f"steps.{readiness_operation_step_id}.output.operation"
@@ -656,16 +665,13 @@ def _compose_agent_plugin(
                         "agent",
                         timeout_seconds=900,
                         inputs={
-                            "system_prompt": (
-                                "Answer the question using memory supplied by your context engine. "
-                                "If memory is insufficient, abstain briefly."
-                            ),
+                            "system_prompt": render_answer_prompt(answer_prompt, question),
                             "messages": [{"role": "user", "content": f"Question: {question.question}"}],
                             "metadata": {
                                 "sample_id": sample.sample_id,
                                 "scope_id": scope_id,
                                 "question_id": question.question_id,
-                                "session_key": f"{binding.run_id}:qa-{sample.sample_id}-{question.question_id}",
+                                "session_key": f"{binding.run_id}:qa:{sample.sample_id}:{event.event_id}:{question.question_id}",
                                 **(
                                     {"agent_id": binding.agent_runtime_id}
                                     if binding.agent_runtime_id
@@ -686,12 +692,13 @@ def compose_run_plan(
     scenario: BenchmarkScenario,
     binding: RunBinding,
     runtime_capabilities: dict[str, Any] | None = None,
+    answer_prompt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_capabilities = runtime_capabilities or {}
     if binding.memory_integration == "backend_direct":
-        cases, steps = _compose_backend_direct(scenario, binding, runtime_capabilities)
+        cases, steps = _compose_backend_direct(scenario, binding, runtime_capabilities, answer_prompt)
     else:
-        cases, steps = _compose_agent_plugin(scenario, binding, runtime_capabilities)
+        cases, steps = _compose_agent_plugin(scenario, binding, runtime_capabilities, answer_prompt)
     return {
         "source_kind": "benchmark_scenario",
         "memory_integration": binding.memory_integration,

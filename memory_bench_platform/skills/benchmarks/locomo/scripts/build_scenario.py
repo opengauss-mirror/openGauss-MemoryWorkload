@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from datetime import date, datetime
 from pathlib import Path
 
 
@@ -15,6 +17,29 @@ def _session_keys(sample: dict) -> list[str]:
         and isinstance(value, list)
     ]
     return sorted(keys, key=lambda key: int(key.split("_")[1]))
+
+
+def _question_date(sample: dict) -> str:
+    """Use the last nonempty session, never the machine's current date."""
+    conversation = sample.get("conversation", {})
+    for key in reversed(_session_keys(sample)):
+        if not conversation[key]:
+            continue
+        value = str(conversation.get(f"{key}_date_time") or "").strip()
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            match = re.fullmatch(r"(?:.+ on )?(\d{1,2}) ([A-Za-z]+), (\d{4})", value)
+            if match:
+                months = {name.lower(): number for number, name in enumerate(
+                    ("January", "February", "March", "April", "May", "June",
+                     "July", "August", "September", "October", "November", "December"), 1)}
+                try:
+                    return date(int(match[3]), months[match[2].lower()], int(match[1])).isoformat()
+                except (ValueError, KeyError):
+                    pass
+        raise ValueError(f"LoCoMo sample {sample.get('sample_id')}: missing or invalid date for {key}: {value!r}")
+    raise ValueError(f"LoCoMo sample {sample.get('sample_id')}: no nonempty session for question_date")
 
 
 def _conversation_event(sample: dict, session_key: str) -> dict:
@@ -62,6 +87,7 @@ def build_scenario(data_path: Path) -> dict:
             _conversation_event(sample, session_key)
             for session_key in _session_keys(sample)
         ]
+        question_date = _question_date(sample)
         questions = []
         for qa_index, qa in enumerate(sample.get("qa", []), start=1):
             category = str(qa.get("category", ""))
@@ -73,7 +99,11 @@ def build_scenario(data_path: Path) -> dict:
                     "question": str(qa.get("question", "")),
                     "reference": str(qa.get("answer", "")),
                     "category": category,
-                    "metadata": {"question_index": qa_index},
+                    "metadata": {
+                        "question_index": qa_index,
+                        "question_date": question_date,
+                        "question_date_source": "last_nonempty_session",
+                    },
                 }
             )
         timeline.append(

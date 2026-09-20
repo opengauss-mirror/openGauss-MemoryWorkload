@@ -146,7 +146,11 @@ def _judge_prompt(runtime_config: dict[str, Any], judge_input: JudgeInput, actua
     profile = str(runtime_config.get("profile") or runtime_config.get("prompt_style") or "").strip().lower()
     template = runtime_config.get("prompt_template_text")
     if isinstance(template, str) and template.strip():
+        question_date = str(judge_input.reference.get("question_date") or "").strip()
+        if "{question_date}" in template and not question_date:
+            raise ValueError("Judge prompt requires question_date")
         return template.format(
+            question_date=question_date,
             question=question,
             gold_answer=expected,
             response=actual,
@@ -236,6 +240,7 @@ def run_llm_judge(
 
     api_format = str(runtime_config.get("api_format") or "openai").strip().lower()
     timeout = float(runtime_config.get("timeout_seconds") or 60)
+    max_tokens = int(runtime_config.get("max_tokens") or os.environ.get("MEMORY_BENCH_JUDGE_MAX_TOKENS", "256"))
     try:
         prompt = _judge_prompt(runtime_config, judge_input, actual)
     except ValueError as exc:
@@ -258,7 +263,7 @@ def run_llm_judge(
         }
         body = {
             "model": model,
-            "max_tokens": 256,
+            "max_tokens": max_tokens,
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -275,9 +280,12 @@ def run_llm_judge(
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0,
-            "max_tokens": 256,
+            "max_tokens": max_tokens,
         }
 
+    user_agent = os.environ.get("MEMORY_BENCH_JUDGE_USER_AGENT")
+    if user_agent:
+        headers["User-Agent"] = user_agent
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(body).encode("utf-8"),

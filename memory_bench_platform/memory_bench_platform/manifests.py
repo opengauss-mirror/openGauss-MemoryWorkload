@@ -97,6 +97,7 @@ class BenchmarkManifest(BaseModel):
     version_policy: VersionPolicy
     dataset: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
+    answering: dict[str, Any] = Field(default_factory=dict)
     judging: dict[str, Any] = Field(default_factory=dict)
     requirements: dict[str, Any] = Field(default_factory=dict)
     evaluation: dict[str, Any] = Field(default_factory=dict)

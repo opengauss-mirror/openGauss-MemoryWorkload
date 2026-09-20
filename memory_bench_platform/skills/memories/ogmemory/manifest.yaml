@@ -1,0 +1,51 @@
+kind: memory
+id: ogmemory
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  targets:
+    - name: ogmemory
+      scope: memory_backend
+      version_source: runtime_observed_only
+      upstream: https://gitcode.com/opengauss/oGMemory
+      record_runtime_version: true
+      notes: Record the deployed dev commit and image digest through OGMEM_RUNTIME_VERSION; this adapter does not resolve or install releases.
+  record_runtime_version: true
+entry:
+  runner: scripts/run_operation.py
+runtime:
+  benchmark_unit: session
+  actions: [ingest, flush, status, recall]
+ingest:
+  benchmark_unit: session
+recall:
+  mode: native_context_compose
+completion:
+  accept_signal: accepted
+  complete_signal: completed
+integration:
+  protocol_version: memory/1
+capabilities:
+  actions: [ingest, flush, status, recall]
+  async_ingest: true
+  action_timeouts_seconds:
+    flush: 900
+    recall: 330
+  commit:
+    supported: true
+    required_after_ingest: true
+    notes: Synchronous compact performs extraction and archive; status verifies indexing afterwards.
+  readiness:
+    supported: true
+    scoped_by_operation: true
+  scope:
+    supported: true
+    scoped_ingest: true
+    scoped_recall: true
+    isolation_level: episode
+  evidence_output: true
+  outputs:
+    ingest: [operation.session_id, output.session_id]
+    flush: [operation.task_id]
+    status: [state, operation]
+    recall: [output.evidence_text]

@@ -60,7 +60,7 @@ def test_locomo_adapter_emits_runtime_independent_scenario(tmp_path: Path):
             "question": "What language does A prefer?",
             "reference": "Go",
             "category": "2",
-            "metadata": {"question_index": 1},
+            "metadata": {"question_index": 1, "question_date": "2023-05-02", "question_date_source": "last_nonempty_session"},
         }
     ]
     serialized = json.dumps(scenario, ensure_ascii=False)

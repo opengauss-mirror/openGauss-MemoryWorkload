@@ -72,6 +72,7 @@ def _scenario(*, target: str = "qa_answer", allow_override: bool = False):
                                         "question_id": "q1",
                                         "question": "What should be remembered?",
                                         "reference": "tea",
+                                        "metadata": {"question_date": "2023-06-27"},
                                     }
                                 ],
                             },

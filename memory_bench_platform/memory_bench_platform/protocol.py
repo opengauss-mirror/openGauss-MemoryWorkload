@@ -263,6 +263,8 @@ class MemoryPluginTaskInput(BaseModel):
         "flush",
         "wait_settle",
         "enter_qa",
+        "before_agent",
+        "after_agent",
         "finalize",
     ]
     inputs: dict[str, Any] = Field(default_factory=dict)

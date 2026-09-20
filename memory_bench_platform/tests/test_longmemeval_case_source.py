@@ -51,3 +51,22 @@ def test_longmemeval_golden_scenario_matches_checked_fixture():
     assert "wait_ready" not in serialized
     assert "openclaw" not in serialized.lower()
     assert "openviking" not in serialized.lower()
+
+
+def test_native_dates_reach_ogmemory_as_iso(tmp_path):
+    from skills.memories.ogmemory.scripts.run_operation import _created_at
+    from skills.benchmarks.longmemeval.scripts.build_scenario import normalize_timestamp
+    import pytest
+    source = tmp_path / "native.json"
+    source.write_text(json.dumps([{"question_id": "native", "question": "When?",
+        "question_date": "2023/05/21 (Sun) 04:00",
+        "haystack_dates": ["2023/05/20 (Sat) 02:21"],
+        "haystack_sessions": [[{"role": "user", "content": "I moved today."}]]}]))
+    event = build_scenario(source)["samples"][0]["timeline"][0]
+    assert event["timestamp"] == "2023-05-20T02:21:00+00:00"
+    assert _created_at(event["timestamp"]) == event["timestamp"]
+    assert "2023/05/20 (Sat) 02:21" in event["payload"]["content"]
+    assert normalize_timestamp("") is None
+    assert normalize_timestamp("2024-03-01") == "2024-03-01"
+    with pytest.raises(ValueError, match="LongMemEval timestamp"):
+        normalize_timestamp("yesterday")
