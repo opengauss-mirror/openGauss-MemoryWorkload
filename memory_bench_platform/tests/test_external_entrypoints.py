@@ -3,6 +3,8 @@ import os
 import sys
 import json
 
+import pytest
+
 from memory_bench_platform.integration import classify_entrypoint, execute_external_runner, resolve_benchmark_entrypoint
 
 
@@ -562,3 +564,138 @@ def test_external_runner_receives_version_override_env(monkeypatch, tmp_path: Pa
     env = captured["env"]
     assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
     assert env["MEMORY_BENCH_EXPECTED_OPENCLAW_VERSION"] == "v2026.4.8"
+
+
+@pytest.mark.parametrize(
+    ("attribution_status", "missing_traces", "expected_status"),
+    [("exploratory", 2, "partial"), ("validated", 0, "passed")],
+)
+def test_production_replay_external_runner_builds_platform_archive(
+    monkeypatch,
+    tmp_path: Path,
+    attribution_status: str,
+    missing_traces: int,
+    expected_status: str,
+):
+    from memory_bench_platform import cli as cli_module
+
+    run_id = f"run-production-{attribution_status}"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "ResourceMonitor", _Monitor)
+    monkeypatch.setattr(
+        cli_module,
+        "_plan_from_args",
+        lambda args: type(
+            "Plan",
+            (),
+            {
+                "run_id": run_id,
+                "benchmark_id": args.benchmark,
+                "agent_id": args.agent,
+                "benchmark_version": None,
+                "agent_version": None,
+                "memory_backend": args.memory_backend,
+                "hardware_profile": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_run_contract",
+        lambda *args, **kwargs: {
+            "selection": {
+                "benchmark_id": "production-http-replay",
+                "agent_id": "generic-cli",
+                "memory_id": "openmem-memory",
+                "memory_integration": "backend_direct",
+                "memory_plugin_id": None,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_version_selection",
+        lambda manifest, overrides=None: {
+            "selection_mode": "latest_official_release_tag",
+            "overridden": False,
+            "targets": [],
+        },
+    )
+
+    def _fake_execute(entrypoint, env, cwd=None):
+        assert env["MEMORY_BACKEND"] == "openmem-memory"
+        assert env["RUN_DIR"].endswith(f"/runs/{run_id}")
+        output_dir = Path(env["OUTPUT_DIR"])
+        output_dir.mkdir(parents=True)
+        (output_dir / "production_replay_summary.json").write_text(
+            json.dumps(
+                {
+                    "schema": "production-replay-summary/1",
+                    "run_id": run_id,
+                    "dataset_state": "complete",
+                    "model_mode": "real-model",
+                    "operations": {
+                        "add": {"count": 1, "success": 1},
+                        "search": {"count": 1, "success": 1},
+                    },
+                    "join_coverage": {
+                        "client_requests": 2,
+                        "matched_internal_traces": 2 - missing_traces,
+                        "missing_internal_traces": missing_traces,
+                        "duplicate_request_ids": 0,
+                        "unmatched_internal_traces": 0,
+                    },
+                    "attribution_status": attribution_status,
+                }
+            ),
+            encoding="utf-8",
+        )
+        events = [
+            {
+                "request_id": "add-1",
+                "operation": "add",
+                "status": "ok",
+                "state": "completed",
+            },
+            {
+                "request_id": "search-1",
+                "operation": "search",
+                "status": "ok",
+                "state": "completed",
+                "result_count": 1,
+            },
+        ]
+        (output_dir / "request_events.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n",
+            encoding="utf-8",
+        )
+        return {"status": "passed", "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cli_module, "execute_external_runner", _fake_execute)
+    cli_module.main(
+        [
+            "run",
+            "--benchmark",
+            "production-http-replay",
+            "--entrypoint",
+            "replay",
+            "--agent",
+            "generic-cli",
+            "--memory-backend",
+            "openmem-memory",
+            "--data-path",
+            str(tmp_path),
+        ]
+    )
+
+    run_dir = tmp_path / "runs" / run_id
+    for relative in (
+        "records/external_entrypoint.json",
+        "reports/summary.json",
+        "reports/case_results.json",
+        "reports/analysis.json",
+        "reports/run_report.html",
+    ):
+        assert (run_dir / relative).is_file()
+    summary = json.loads((run_dir / "reports/summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == expected_status

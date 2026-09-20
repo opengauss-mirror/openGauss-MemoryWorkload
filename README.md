@@ -502,6 +502,42 @@ version_policy:
 - 实际运行时观测到的软件版本
 - 如果使用非 release build，必须在结论或分析报告中显式标注
 
+## 生产请求回放
+
+`production-http-replay` 从一个目录流式读取一份 add JSONL 和一份 search JSONL，将完整 OpenMem 请求通过 Memory Skill 边界映射为 `ingest`、`status`、`recall`。目标 Memory Skill 必须在 manifest 中声明 `capabilities.raw_request_protocols: [openmem-v1]`，并支持这三个 action。
+
+先校验目录和请求形状：
+
+```bash
+memory-bench validate \
+  --benchmark production-http-replay \
+  --data-path /path/to/add-and-search-directory
+```
+
+再使用兼容的 Memory Skill 回放：
+
+```bash
+memory-bench run \
+  --benchmark production-http-replay \
+  --entrypoint replay \
+  --agent generic-cli \
+  --memory-backend <openmem-v1-compatible-memory-skill> \
+  --data-path /path/to/add-and-search-directory
+```
+
+执行顺序固定为 `add → drain → search`：全部 add 请求及其异步状态轮询结束后才开始 search。分离的 add/search 文件没有统一时间线，因此无法重建生产环境中的读写交错时序，第一版也不复刻请求间隔。
+
+以下环境变量控制回放；括号内为默认值：
+
+- `MEMORY_BENCH_REPLAY_ADD_CONCURRENCY`（`1`）和 `MEMORY_BENCH_REPLAY_SEARCH_CONCURRENCY`（`1`）
+- `MEMORY_BENCH_REPLAY_ADD_RATE`（`0`）和 `MEMORY_BENCH_REPLAY_SEARCH_RATE`（`0`），`0` 表示不限速
+- `MEMORY_BENCH_REPLAY_REQUEST_TIMEOUT_SECONDS`（`120`）
+- `MEMORY_BENCH_REPLAY_POLL_INTERVAL_SECONDS`（`1`）和 `MEMORY_BENCH_REPLAY_DRAIN_TIMEOUT_SECONDS`（`600`）
+- `MEMORY_BENCH_MODEL_MODE`（`real-model`），也接受 `replay-zero-delay`、`replay-with-delay`、`mock-fixed`
+- `MEMORY_BENCH_PERF_TRACE_PATH`：可选的内部 span JSONL，用于 `request_id` 关联覆盖率
+
+外部 runner 生成 `run_config.json`、`request_events.jsonl` 和 `production_replay_summary.json`，平台随后导入 case result、分析 JSON 和 HTML 报告。归档只保留 request ID、payload hash/大小/字段集合、状态、耗时、结果数量和关联统计，不保存 raw request、message、query、memory、凭据、私有 endpoint 或原始身份。关联不完整时结果标记为 exploratory，平台 run 状态为 partial，不生成可信的内部阶段归因结论。
+
 ## 开发和验证
 
 常用轻量检查：
