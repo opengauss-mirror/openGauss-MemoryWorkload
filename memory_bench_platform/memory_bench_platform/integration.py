@@ -628,8 +628,37 @@ def _validate_run_skill_bundle(bundle: RunSkillBundle) -> None:
             f"but agent {bundle.agent.id} protocol_mode={protocol_mode!r}"
         )
 
+    memory_requirements = bundle.benchmark.requirements.get("memory", {})
+    required_actions = {str(item) for item in memory_requirements.get("actions", [])}
+    required_protocols = {
+        str(item) for item in memory_requirements.get("raw_request_protocols", [])
+    }
+
     if bundle.memory is None:
+        if required_actions or required_protocols:
+            raise ValueError(f"benchmark {bundle.benchmark.id} requires a memory backend")
         return
+
+    available_protocols = {
+        str(item)
+        for item in bundle.memory.capabilities.get("raw_request_protocols", [])
+    }
+    missing_protocols = sorted(required_protocols - available_protocols)
+    if missing_protocols:
+        raise ValueError(
+            f"memory {bundle.memory.id} does not support raw request protocols: "
+            + ", ".join(missing_protocols)
+        )
+
+    available_actions = {
+        str(item) for item in bundle.memory.capabilities.get("actions", [])
+    }
+    missing_actions = sorted(required_actions - available_actions)
+    if missing_actions:
+        raise ValueError(
+            f"memory {bundle.memory.id} does not support memory actions: "
+            + ", ".join(missing_actions)
+        )
 
     benchmark_ingest_unit = str(benchmark_execution.get("ingest_unit", "") or "").strip()
     memory_runtime_unit = str(bundle.memory.runtime.get("benchmark_unit", "") or "").strip()

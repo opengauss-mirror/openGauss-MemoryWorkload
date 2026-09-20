@@ -6,6 +6,27 @@ import json
 from memory_bench_platform.integration import classify_entrypoint, execute_external_runner, resolve_benchmark_entrypoint
 
 
+class _Monitor:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def setup_writers(self):
+        pass
+
+    def start_background_sampling(self):
+        pass
+
+    def stop_background_sampling(self):
+        pass
+
+    def capture_once(self):
+        return {
+            "summary_util_idle": 100.0,
+            "summary_util_user": 0.0,
+            "summary_util_sys": 0.0,
+        }
+
+
 def test_classify_entrypoint_marks_official_locomo_script_as_external():
     entry = {"external_runner": "benchmark/locomo/openclaw/run_clean_small_in_container.sh"}
     assert classify_entrypoint(entry) == "external_runner"
@@ -356,6 +377,7 @@ def test_external_runner_receives_expected_version_env(monkeypatch, tmp_path: Pa
     from memory_bench_platform import cli as cli_module
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "ResourceMonitor", _Monitor)
 
     captured = {}
 
@@ -452,6 +474,9 @@ def test_external_runner_receives_expected_version_env(monkeypatch, tmp_path: Pa
     env = captured["env"]
     assert env["MEMORY_BENCH_EXPECTED_OPENVIKING_VERSION"] == "v0.3.24"
     assert env["MEMORY_BENCH_EXPECTED_OPENCLAW_UPSTREAM"] == "https://github.com/openclaw/openclaw"
+    assert env["MEMORY_BACKEND"] == "openviking"
+    assert env["MEMORY_INTEGRATION"] == "backend_direct"
+    assert env["RUN_DIR"].endswith("/runs/run-ext-version-env")
 
 
 def test_external_runner_receives_version_override_env(monkeypatch, tmp_path: Path):
