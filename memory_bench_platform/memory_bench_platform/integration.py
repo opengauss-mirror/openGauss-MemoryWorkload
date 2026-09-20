@@ -118,6 +118,7 @@ def run_json_script(
     args: list[str] | None = None,
     stdin_payload: dict | None = None,
     environment: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict:
     cmd = [sys.executable, str(script_path), *(args or [])]
     scoped_environment = {
@@ -132,6 +133,7 @@ def run_json_script(
         capture_output=True,
         check=True,
         env=scoped_environment,
+        timeout=timeout_seconds,
     )
     return json.loads(proc.stdout or "{}")
 
@@ -395,7 +397,12 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
     )
 
 
-def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput:
+def run_memory_task(
+    skill_id: str,
+    request: MemoryTaskInput,
+    *,
+    timeout_seconds: float | None = None,
+) -> MemoryTaskOutput:
     manifest = get_memory_manifest(skill_id)
     manifest_path = _manifest_path("memories", skill_id)
     if not manifest.entry.runner:
@@ -404,6 +411,7 @@ def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput
         payload = run_json_script(
             _script_for_manifest(manifest_path, manifest.entry.runner),
             stdin_payload=request.model_dump(mode="json"),
+            timeout_seconds=timeout_seconds,
         )
     except json.JSONDecodeError as exc:
         raise ValueError(f"memory skill {skill_id} runner returned invalid JSON") from exc

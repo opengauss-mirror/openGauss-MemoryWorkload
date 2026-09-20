@@ -332,3 +332,27 @@ def test_production_replay_import_rejects_content_fields(
     )
     with pytest.raises(ValueError, match="forbidden event field"):
         import_external_result(tmp_path)
+
+
+def test_production_replay_import_rejects_content_fields_in_summary(tmp_path: Path):
+    _write_replay_summary(
+        tmp_path,
+        dataset_state="complete",
+        operations={
+            "add": {"count": 1, "success": 1, "raw_request": "SUMMARY_SECRET"},
+            "search": {"count": 0, "success": 0},
+        },
+    )
+    _write_replay_events(
+        tmp_path,
+        [
+            {
+                "request_id": "add-1",
+                "operation": "add",
+                "status": "ok",
+                "state": "completed",
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="forbidden add summary field"):
+        import_external_result(tmp_path)

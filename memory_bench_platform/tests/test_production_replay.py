@@ -235,13 +235,18 @@ def test_execute_replay_drains_add_before_search_and_preserves_protocol(
             output={"count": 1, "memories": [], "evidence_text": ""},
         )
 
-    summary = module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
+    platform_run_dir = tmp_path / "platform-run"
+    summary = module.execute_replay(
+        _config(module, dataset_dir, tmp_path, run_dir=platform_run_dir), invoke
+    )
     requests = [request for _, request in calls]
     first_recall = next(i for i, request in enumerate(requests) if request.action == "recall")
     assert all(request.action in {"ingest", "status"} for request in requests[:first_recall])
     assert all(request.inputs["source_protocol"] == "openmem-v1" for request in requests)
     assert requests[0].task_id in requests[0].idempotency_key
     assert requests[0].idempotency_key == requests[1].idempotency_key
+    assert all(request.runtime_context.run_dir == str(platform_run_dir) for request in requests)
+    assert all(request.runtime_context.memory_integration == "backend_direct" for request in requests)
     assert summary.dataset_state == "complete"
     assert [event.operation for event in summary.events] == ["add", "search"]
 
@@ -258,6 +263,49 @@ def test_completed_ingest_is_not_polled(dataset_dir: Path, tmp_path: Path):
 
     module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
     assert actions == ["ingest", "recall"]
+
+
+def test_completed_ingest_requires_session_id(dataset_dir: Path, tmp_path: Path):
+    module = _module()
+
+    def invoke(memory_id, request):
+        if request.action == "ingest":
+            return _output(module)
+        return _output(module, output={"count": 0})
+
+    summary = module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
+    assert summary.dataset_state == "partially_written"
+    assert summary.events[0].error_type == "invalid_ingest_operation"
+
+
+def test_status_polling_preserves_complete_operation_context(
+    dataset_dir: Path, tmp_path: Path
+):
+    module = _module()
+    polls = 0
+
+    def invoke(memory_id, request):
+        nonlocal polls
+        if request.action == "ingest":
+            return _output(
+                module,
+                state="accepted",
+                operation={"session_id": "session-1", "task_id": "task-1"},
+            )
+        if request.action == "status":
+            polls += 1
+            assert request.inputs["operation"] == {
+                "session_id": "session-1",
+                "task_id": "task-1",
+            }
+            if polls == 1:
+                return _output(module, state="running", operation={"task_id": "task-1"})
+            return _output(module, operation={"task_id": "task-1"})
+        return _output(module, output={"count": 0})
+
+    summary = module.execute_replay(_config(module, dataset_dir, tmp_path), invoke)
+    assert summary.dataset_state == "complete"
+    assert polls == 2
 
 
 @pytest.mark.parametrize("mode", ["terminal_failure", "timeout"])
@@ -431,6 +479,34 @@ def test_summary_percentiles_duplicates_and_trace_coverage(tmp_path: Path):
     assert summary.attribution_status == "exploratory"
 
 
+def test_summary_qps_uses_phase_wall_time_for_concurrent_requests():
+    module = _module()
+    base = module.RequestEvent(
+        request_id="add-1",
+        operation="add",
+        line_number=1,
+        ts="2026-01-01T00:00:00+00:00",
+        payload_sha256="a" * 64,
+        payload_size_bytes=1,
+        top_level_fields=("messages",),
+        duration_ms=20,
+        status="ok",
+        state="completed",
+        result_count=None,
+        response_size_bytes=1,
+        error_type=None,
+        error_message=None,
+    )
+    summary = module.summarize_replay(
+        "run-1",
+        "complete",
+        (base, replace(base, request_id="add-2", line_number=2)),
+        (),
+        phase_elapsed_ms={"add": 20, "search": 0},
+    )
+    assert summary.operations["add"]["qps"] == 100
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -441,6 +517,7 @@ def test_summary_percentiles_duplicates_and_trace_coverage(tmp_path: Path):
         {"poll_interval_seconds": -1},
         {"drain_timeout_seconds": -1},
         {"model_mode": "invalid"},
+        {"memory_integration": "agent_plugin"},
     ],
 )
 def test_replay_config_rejects_invalid_controls(

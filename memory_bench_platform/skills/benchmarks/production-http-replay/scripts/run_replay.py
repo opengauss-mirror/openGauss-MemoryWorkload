@@ -49,6 +49,8 @@ class ReplayConfig:
     run_id: str
     memory_id: str
     agent_id: str
+    run_dir: Path | None = None
+    memory_integration: str = "backend_direct"
     add_concurrency: int = 1
     search_concurrency: int = 1
     add_rate_per_second: float = 0.0
@@ -75,6 +77,10 @@ class ReplayConfig:
             "mock-fixed",
         }:
             raise ValueError(f"unsupported model mode: {self.model_mode}")
+        if self.memory_integration != "backend_direct":
+            raise ValueError(
+                "production replay requires backend_direct memory integration"
+            )
 
 
 @dataclass(frozen=True)
@@ -262,10 +268,11 @@ def validate_dataset(path: Path) -> dict[str, Any]:
 def _runtime_context(config: ReplayConfig) -> WorkflowRuntimeContext:
     return WorkflowRuntimeContext(
         run_id=config.run_id,
-        run_dir=str(config.output_dir),
+        run_dir=str(config.run_dir or config.output_dir),
         benchmark_id="production-http-replay",
         agent_id=config.agent_id,
         memory_id=config.memory_id,
+        memory_integration="backend_direct",
     )
 
 
@@ -344,17 +351,38 @@ def _run_add(
     started = time.perf_counter()
     try:
         output = invoke_memory(config.memory_id, _task_input(config, record, "ingest"))
+        if output.status == "ok" and not output.operation.get("session_id"):
+            return _event(
+                record,
+                started,
+                output,
+                state="failed",
+                error_type="invalid_ingest_operation",
+            )
         if output.status == "ok" and output.state in {"accepted", "running"}:
+            if not output.operation.get("task_id"):
+                return _event(
+                    record,
+                    started,
+                    output,
+                    state="failed",
+                    error_type="invalid_ingest_operation",
+                )
             deadline = time.monotonic() + config.drain_timeout_seconds
             operation = copy.deepcopy(output.operation)
             while time.monotonic() < deadline:
                 if config.poll_interval_seconds:
-                    time.sleep(config.poll_interval_seconds)
+                    time.sleep(
+                        min(
+                            config.poll_interval_seconds,
+                            max(0.0, deadline - time.monotonic()),
+                        )
+                    )
                 output = invoke_memory(
                     config.memory_id,
                     _task_input(config, record, "status", operation=operation),
                 )
-                operation = copy.deepcopy(output.operation or operation)
+                operation = {**operation, **copy.deepcopy(output.operation)}
                 if output.status == "failed" or output.state in {"completed", "failed"}:
                     break
             else:
@@ -392,7 +420,8 @@ def _run_phase(
     concurrency: int,
     rate_per_second: float,
     worker: Callable[[ReplayRecord], RequestEvent],
-) -> list[RequestEvent]:
+) -> tuple[list[RequestEvent], float]:
+    phase_started = time.perf_counter()
     pacer = _Pacer(rate_per_second)
 
     def paced_worker(record: ReplayRecord) -> RequestEvent:
@@ -415,7 +444,10 @@ def _run_phase(
                     pending.add(executor.submit(paced_worker, next(records)))
                 except StopIteration:
                     pass
-    return sorted(events, key=lambda event: event.line_number)
+    return (
+        sorted(events, key=lambda event: event.line_number),
+        (time.perf_counter() - phase_started) * 1000,
+    )
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -429,11 +461,15 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
-def _operation_summary(events: tuple[RequestEvent, ...], operation: str) -> dict[str, Any]:
+def _operation_summary(
+    events: tuple[RequestEvent, ...],
+    operation: str,
+    elapsed_ms: float | None = None,
+) -> dict[str, Any]:
     selected = [event for event in events if event.operation == operation]
     durations = [event.duration_ms for event in selected]
     success = sum(event.status == "ok" for event in selected)
-    elapsed_seconds = sum(durations) / 1000
+    elapsed_seconds = (elapsed_ms if elapsed_ms is not None else sum(durations)) / 1000
     result: dict[str, Any] = {
         "count": len(selected),
         "success": success,
@@ -462,6 +498,7 @@ def summarize_replay(
     events: tuple[RequestEvent, ...],
     internal_request_ids: tuple[str, ...],
     model_mode: str = "real-model",
+    phase_elapsed_ms: dict[str, float] | None = None,
 ) -> ReplaySummary:
     client_ids = [event.request_id for event in events]
     unique_clients = set(client_ids)
@@ -486,8 +523,14 @@ def summarize_replay(
         dataset_state=dataset_state,
         model_mode=model_mode,
         operations={
-            "add": _operation_summary(events, "add"),
-            "search": _operation_summary(events, "search"),
+            "add": _operation_summary(
+                events, "add", None if phase_elapsed_ms is None else phase_elapsed_ms.get("add")
+            ),
+            "search": _operation_summary(
+                events,
+                "search",
+                None if phase_elapsed_ms is None else phase_elapsed_ms.get("search"),
+            ),
         },
         join_coverage=join_coverage,
         attribution_status=attribution_status,
@@ -522,6 +565,7 @@ def _write_run_config(config: ReplayConfig) -> None:
         "benchmark_id": "production-http-replay",
         "memory_id": config.memory_id,
         "agent_id": config.agent_id,
+        "memory_integration": config.memory_integration,
         "model_mode": config.model_mode,
         "add_concurrency": config.add_concurrency,
         "search_concurrency": config.search_concurrency,
@@ -556,7 +600,7 @@ def execute_replay(
 ) -> ReplaySummary:
     dataset = discover_dataset(config.data_path)
     _write_run_config(config)
-    add_events = _run_phase(
+    add_events, add_elapsed_ms = _run_phase(
         iter_replay_records(dataset.add_path, "add", config.run_id),
         config.add_concurrency,
         config.add_rate_per_second,
@@ -565,7 +609,7 @@ def execute_replay(
     dataset_state = (
         "complete" if all(event.status == "ok" for event in add_events) else "partially_written"
     )
-    search_events = _run_phase(
+    search_events, search_elapsed_ms = _run_phase(
         iter_replay_records(dataset.search_path, "search", config.run_id),
         config.search_concurrency,
         config.search_rate_per_second,
@@ -577,6 +621,7 @@ def execute_replay(
         tuple(add_events + search_events),
         _load_internal_request_ids(config.perf_trace_path),
         config.model_mode,
+        {"add": add_elapsed_ms, "search": search_elapsed_ms},
     )
     _write_artifacts(config, summary)
     return summary
@@ -604,6 +649,10 @@ def main() -> None:
             run_id=os.environ["RUN_ID"],
             memory_id=os.environ["MEMORY_BACKEND"],
             agent_id=os.environ.get("AGENT_ID", "generic-cli"),
+            run_dir=Path(os.environ.get("RUN_DIR") or output_dir),
+            memory_integration=os.environ.get(
+                "MEMORY_INTEGRATION", "backend_direct"
+            ),
             add_concurrency=_env_int("MEMORY_BENCH_REPLAY_ADD_CONCURRENCY", 1),
             search_concurrency=_env_int("MEMORY_BENCH_REPLAY_SEARCH_CONCURRENCY", 1),
             add_rate_per_second=_env_float("MEMORY_BENCH_REPLAY_ADD_RATE", 0),
@@ -624,7 +673,14 @@ def main() -> None:
                 else None
             ),
         )
-        execute_replay(config, run_memory_task)
+        execute_replay(
+            config,
+            lambda memory_id, request: run_memory_task(
+                memory_id,
+                request,
+                timeout_seconds=config.request_timeout_seconds,
+            ),
+        )
     except (KeyError, OSError, ValueError) as exc:
         print(f"production replay configuration failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from None

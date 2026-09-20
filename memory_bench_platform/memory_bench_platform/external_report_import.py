@@ -84,6 +84,27 @@ _PRODUCTION_EVENT_KEYS = {
     "error_message",
 }
 
+_PRODUCTION_OPERATION_KEYS = {
+    "count",
+    "success",
+    "success_rate",
+    "qps",
+    "p50_ms",
+    "p95_ms",
+    "p99_ms",
+    "max_ms",
+    "non_empty_rate",
+    "result_count_distribution",
+}
+
+_PRODUCTION_JOIN_KEYS = {
+    "client_requests",
+    "matched_internal_traces",
+    "missing_internal_traces",
+    "duplicate_request_ids",
+    "unmatched_internal_traces",
+}
+
 
 def _load_production_events(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
@@ -163,6 +184,11 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
         metrics = operations.get(operation)
         if not isinstance(metrics, dict):
             raise ValueError(f"production replay summary missing {operation} metrics")
+        forbidden = sorted(set(metrics) - _PRODUCTION_OPERATION_KEYS)
+        if forbidden:
+            raise ValueError(
+                f"forbidden {operation} summary field: " + ", ".join(forbidden)
+            )
         if int(metrics.get("count", -1)) != operation_counts[operation]:
             invalid_reasons.append(f"{operation}_event_count_mismatch")
         if int(metrics.get("success", -1)) != operation_success[operation]:
@@ -173,6 +199,11 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
     join_coverage = summary.get("join_coverage")
     if not isinstance(join_coverage, dict):
         raise ValueError("production replay summary join_coverage must be an object")
+    forbidden_join = sorted(set(join_coverage) - _PRODUCTION_JOIN_KEYS)
+    if forbidden_join:
+        raise ValueError(
+            "forbidden join coverage field: " + ", ".join(forbidden_join)
+        )
     if dataset_state != "complete":
         invalid_reasons.append("dataset_not_complete")
     if attribution_status != "validated":

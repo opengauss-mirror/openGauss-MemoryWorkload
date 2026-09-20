@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -152,3 +153,14 @@ print(json.dumps({
     assert result.error["code"] == "timeouterror"
     assert result.error["category"] == "runtime"
     assert result.error["retryable"] is False
+
+
+def test_run_memory_task_enforces_subprocess_timeout(tmp_path: Path, monkeypatch):
+    skills_root = _write_memory_skill(
+        tmp_path,
+        "import time\ntime.sleep(1)\n",
+    )
+    monkeypatch.setattr("memory_bench_platform.integration.SKILLS_ROOT", skills_root)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_memory_task("demo-memory", _request(tmp_path), timeout_seconds=0.01)
