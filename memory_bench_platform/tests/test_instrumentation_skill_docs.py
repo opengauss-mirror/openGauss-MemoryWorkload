@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from memory_bench_platform.loader import load_all_skills
+
 
 SKILL = (
     Path(__file__).resolve().parents[1]
@@ -67,3 +69,10 @@ def test_readme_distinguishes_guidance_and_runtime_skills():
     assert "skills/instrumentation/" in text
     assert "指导型 Skill" in text
     assert "不由 Integration Skill loader 加载" in text
+
+
+def test_guidance_skill_is_not_loaded_as_runtime_integration():
+    platform_root = Path(__file__).resolve().parents[1]
+    loaded = load_all_skills(platform_root / "skills")
+    loaded_ids = {item.id for kind in loaded.values() for item in kind}
+    assert "memory-system-auto-instrumentation" not in loaded_ids
