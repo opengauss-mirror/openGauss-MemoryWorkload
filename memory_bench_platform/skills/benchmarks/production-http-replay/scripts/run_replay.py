@@ -3,9 +3,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import sys
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
@@ -52,6 +56,25 @@ class ReplayConfig:
     request_timeout_seconds: float = 120.0
     poll_interval_seconds: float = 1.0
     drain_timeout_seconds: float = 600.0
+    model_mode: str = "real-model"
+    perf_trace_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.add_concurrency < 1 or self.search_concurrency < 1:
+            raise ValueError("replay concurrency must be at least 1")
+        if self.add_rate_per_second < 0 or self.search_rate_per_second < 0:
+            raise ValueError("replay rate must not be negative")
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request timeout must be positive")
+        if self.poll_interval_seconds < 0 or self.drain_timeout_seconds < 0:
+            raise ValueError("poll interval and drain timeout must not be negative")
+        if self.model_mode not in {
+            "real-model",
+            "replay-zero-delay",
+            "replay-with-delay",
+            "mock-fixed",
+        }:
+            raise ValueError(f"unsupported model mode: {self.model_mode}")
 
 
 @dataclass(frozen=True)
@@ -74,9 +97,32 @@ class RequestEvent:
 
 @dataclass(frozen=True)
 class ReplaySummary:
+    schema: str
     run_id: str
     dataset_state: str
+    model_mode: str
+    operations: dict[str, dict[str, Any]]
+    join_coverage: dict[str, int]
+    attribution_status: str
     events: tuple[RequestEvent, ...]
+
+
+class _Pacer:
+    def __init__(self, rate_per_second: float):
+        self._interval = 0.0 if rate_per_second == 0 else 1.0 / rate_per_second
+        self._next_start = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        if self._interval == 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            reserved = max(now, self._next_start)
+            self._next_start = reserved + self._interval
+        delay = reserved - now
+        if delay > 0:
+            time.sleep(delay)
 
 
 def _has_operation_token(name: str, operation: Operation) -> bool:
@@ -341,24 +387,248 @@ def _run_search(
         return _event(record, started, None, error_type=type(exc).__name__)
 
 
+def _run_phase(
+    records: Iterator[ReplayRecord],
+    concurrency: int,
+    rate_per_second: float,
+    worker: Callable[[ReplayRecord], RequestEvent],
+) -> list[RequestEvent]:
+    pacer = _Pacer(rate_per_second)
+
+    def paced_worker(record: ReplayRecord) -> RequestEvent:
+        pacer.wait()
+        return worker(record)
+
+    events: list[RequestEvent] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        pending = set()
+        for _ in range(concurrency):
+            try:
+                pending.add(executor.submit(paced_worker, next(records)))
+            except StopIteration:
+                break
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                events.append(future.result())
+                try:
+                    pending.add(executor.submit(paced_worker, next(records)))
+                except StopIteration:
+                    pass
+    return sorted(events, key=lambda event: event.line_number)
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _operation_summary(events: tuple[RequestEvent, ...], operation: str) -> dict[str, Any]:
+    selected = [event for event in events if event.operation == operation]
+    durations = [event.duration_ms for event in selected]
+    success = sum(event.status == "ok" for event in selected)
+    elapsed_seconds = sum(durations) / 1000
+    result: dict[str, Any] = {
+        "count": len(selected),
+        "success": success,
+        "success_rate": success / len(selected) if selected else 0.0,
+        "qps": len(selected) / elapsed_seconds if elapsed_seconds else 0.0,
+        "p50_ms": _percentile(durations, 0.50),
+        "p95_ms": _percentile(durations, 0.95),
+        "p99_ms": _percentile(durations, 0.99),
+        "max_ms": max(durations, default=0.0),
+    }
+    if operation == "search":
+        successful = [event for event in selected if event.status == "ok"]
+        non_empty = sum((event.result_count or 0) > 0 for event in successful)
+        distribution: dict[str, int] = {}
+        for event in successful:
+            key = str(event.result_count or 0)
+            distribution[key] = distribution.get(key, 0) + 1
+        result["non_empty_rate"] = non_empty / len(successful) if successful else 0.0
+        result["result_count_distribution"] = distribution
+    return result
+
+
+def summarize_replay(
+    run_id: str,
+    dataset_state: str,
+    events: tuple[RequestEvent, ...],
+    internal_request_ids: tuple[str, ...],
+    model_mode: str = "real-model",
+) -> ReplaySummary:
+    client_ids = [event.request_id for event in events]
+    unique_clients = set(client_ids)
+    unique_internal = set(internal_request_ids)
+    matched = unique_clients & unique_internal
+    duplicates = len(client_ids) - len(unique_clients)
+    join_coverage = {
+        "client_requests": len(events),
+        "matched_internal_traces": len(matched),
+        "missing_internal_traces": len(unique_clients - unique_internal),
+        "duplicate_request_ids": duplicates,
+        "unmatched_internal_traces": len(unique_internal - unique_clients),
+    }
+    attribution_status = (
+        "validated"
+        if unique_clients and not duplicates and not join_coverage["missing_internal_traces"]
+        else "exploratory"
+    )
+    return ReplaySummary(
+        schema="production-replay-summary/1",
+        run_id=run_id,
+        dataset_state=dataset_state,
+        model_mode=model_mode,
+        operations={
+            "add": _operation_summary(events, "add"),
+            "search": _operation_summary(events, "search"),
+        },
+        join_coverage=join_coverage,
+        attribution_status=attribution_status,
+        events=events,
+    )
+
+
+def _load_internal_request_ids(path: Path | None) -> tuple[str, ...]:
+    if path is None or not path.is_file():
+        return ()
+    request_ids: list[str] = []
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            payload = line.strip()
+            if payload.startswith("[MEM_PERF]"):
+                payload = payload[len("[MEM_PERF]") :].strip()
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path.name}: line {line_number}: invalid trace JSON") from exc
+            request_id = event.get("request_id") if isinstance(event, dict) else None
+            if isinstance(request_id, str) and request_id:
+                request_ids.append(request_id)
+    return tuple(request_ids)
+
+
+def _write_run_config(config: ReplayConfig) -> None:
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "schema": "production-replay-config/1",
+        "run_id": config.run_id,
+        "benchmark_id": "production-http-replay",
+        "memory_id": config.memory_id,
+        "agent_id": config.agent_id,
+        "model_mode": config.model_mode,
+        "add_concurrency": config.add_concurrency,
+        "search_concurrency": config.search_concurrency,
+        "add_rate_per_second": config.add_rate_per_second,
+        "search_rate_per_second": config.search_rate_per_second,
+        "request_timeout_seconds": config.request_timeout_seconds,
+        "poll_interval_seconds": config.poll_interval_seconds,
+        "drain_timeout_seconds": config.drain_timeout_seconds,
+        "identity_policy": "empty-user-id-to-replay-run-id",
+    }
+    (config.output_dir / "run_config.json").write_text(
+        json.dumps(run_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_artifacts(config: ReplayConfig, summary: ReplaySummary) -> None:
+    with (config.output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
+        for event in summary.events:
+            stream.write(json.dumps(asdict(event), ensure_ascii=False, sort_keys=True) + "\n")
+    summary_payload = asdict(summary)
+    summary_payload.pop("events")
+    (config.output_dir / "production_replay_summary.json").write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def execute_replay(
     config: ReplayConfig,
     invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
 ) -> ReplaySummary:
     dataset = discover_dataset(config.data_path)
-    add_events = [
-        _run_add(config, record, invoke_memory)
-        for record in iter_replay_records(dataset.add_path, "add", config.run_id)
-    ]
+    _write_run_config(config)
+    add_events = _run_phase(
+        iter_replay_records(dataset.add_path, "add", config.run_id),
+        config.add_concurrency,
+        config.add_rate_per_second,
+        lambda record: _run_add(config, record, invoke_memory),
+    )
     dataset_state = (
         "complete" if all(event.status == "ok" for event in add_events) else "partially_written"
     )
-    search_events = [
-        _run_search(config, record, invoke_memory)
-        for record in iter_replay_records(dataset.search_path, "search", config.run_id)
-    ]
-    return ReplaySummary(
-        run_id=config.run_id,
-        dataset_state=dataset_state,
-        events=tuple(add_events + search_events),
+    search_events = _run_phase(
+        iter_replay_records(dataset.search_path, "search", config.run_id),
+        config.search_concurrency,
+        config.search_rate_per_second,
+        lambda record: _run_search(config, record, invoke_memory),
     )
+    summary = summarize_replay(
+        config.run_id,
+        dataset_state,
+        tuple(add_events + search_events),
+        _load_internal_request_ids(config.perf_trace_path),
+        config.model_mode,
+    )
+    _write_artifacts(config, summary)
+    return summary
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return default if value is None else float(value)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return default if value is None else int(value)
+
+
+def main() -> None:
+    from memory_bench_platform.integration import run_memory_task
+
+    try:
+        data_path = Path(os.environ["DATA_PATH"])
+        output_dir = Path(os.environ.get("OUTPUT_DIR") or os.environ["RUN_DIR"])
+        config = ReplayConfig(
+            data_path=data_path,
+            output_dir=output_dir,
+            run_id=os.environ["RUN_ID"],
+            memory_id=os.environ["MEMORY_BACKEND"],
+            agent_id=os.environ.get("AGENT_ID", "generic-cli"),
+            add_concurrency=_env_int("MEMORY_BENCH_REPLAY_ADD_CONCURRENCY", 1),
+            search_concurrency=_env_int("MEMORY_BENCH_REPLAY_SEARCH_CONCURRENCY", 1),
+            add_rate_per_second=_env_float("MEMORY_BENCH_REPLAY_ADD_RATE", 0),
+            search_rate_per_second=_env_float("MEMORY_BENCH_REPLAY_SEARCH_RATE", 0),
+            request_timeout_seconds=_env_float(
+                "MEMORY_BENCH_REPLAY_REQUEST_TIMEOUT_SECONDS", 120
+            ),
+            poll_interval_seconds=_env_float(
+                "MEMORY_BENCH_REPLAY_POLL_INTERVAL_SECONDS", 1
+            ),
+            drain_timeout_seconds=_env_float(
+                "MEMORY_BENCH_REPLAY_DRAIN_TIMEOUT_SECONDS", 600
+            ),
+            model_mode=os.environ.get("MEMORY_BENCH_MODEL_MODE", "real-model"),
+            perf_trace_path=(
+                Path(os.environ["MEMORY_BENCH_PERF_TRACE_PATH"])
+                if os.environ.get("MEMORY_BENCH_PERF_TRACE_PATH")
+                else None
+            ),
+        )
+        execute_replay(config, run_memory_task)
+    except (KeyError, OSError, ValueError) as exc:
+        print(f"production replay configuration failed: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+if __name__ == "__main__":
+    main()

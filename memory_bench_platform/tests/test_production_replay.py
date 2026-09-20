@@ -4,6 +4,8 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -302,3 +304,148 @@ def test_recall_failures_become_events_and_do_not_expose_exception_payload(
     search = summary.events[-1]
     assert search.status == "failed"
     assert "needle" not in (search.error_message or "")
+
+
+def test_replay_uses_bounded_add_concurrency_and_keeps_phase_barrier(
+    dataset_dir: Path, tmp_path: Path
+):
+    module = _module()
+    add_path = dataset_dir / "openmem_add_sample.jsonl"
+    add_path.write_text(
+        "".join(
+            json.dumps({"request": {"user_id": "", "messages": [], "n": n}}) + "\n"
+            for n in range(3)
+        ),
+        encoding="utf-8",
+    )
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+    completed = 0
+
+    def invoke(memory_id, request):
+        nonlocal active, maximum, completed
+        if request.action == "ingest":
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+                completed += 1
+            return _output(module, operation={"session_id": request.task_id})
+        assert completed == 3
+        return _output(module, output={"count": 0})
+
+    config = _config(module, dataset_dir, tmp_path, add_concurrency=2)
+    summary = module.execute_replay(config, invoke)
+    assert maximum == 2
+    assert [event.line_number for event in summary.events[:3]] == [1, 2, 3]
+
+
+def test_replay_artifacts_exclude_payload_and_secret_sentinels(
+    dataset_dir: Path, tmp_path: Path
+):
+    module = _module()
+    _write_row(
+        dataset_dir / "openmem_add_sample.jsonl",
+        {"user_id": "", "messages": [{"content": "MESSAGE_SENTINEL"}]},
+        {"api_key": "API_KEY_SENTINEL"},
+    )
+    _write_row(
+        dataset_dir / "openmem_search_sample.jsonl",
+        {"user_id": "", "query": "QUERY_SENTINEL"},
+        {"data": {"memory_detail_list": [{"content": "MEMORY_SENTINEL"}]}},
+    )
+
+    def invoke(memory_id, request):
+        if request.action == "ingest":
+            return _output(module, operation={"session_id": "session-1"})
+        return _output(
+            module,
+            output={"count": 1, "memories": [{"content": "MEMORY_SENTINEL"}]},
+        )
+
+    config = _config(module, dataset_dir, tmp_path)
+    summary = module.execute_replay(config, invoke)
+    artifact_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in config.output_dir.rglob("*")
+        if path.is_file()
+    )
+    for sentinel in (
+        "MESSAGE_SENTINEL",
+        "QUERY_SENTINEL",
+        "MEMORY_SENTINEL",
+        "API_KEY_SENTINEL",
+    ):
+        assert sentinel not in artifact_text
+    assert summary.join_coverage["client_requests"] == 2
+
+
+def test_run_config_exists_before_first_request(dataset_dir: Path, tmp_path: Path):
+    module = _module()
+    config = _config(module, dataset_dir, tmp_path)
+    existed_before_request = []
+
+    def invoke(memory_id, request):
+        existed_before_request.append((config.output_dir / "run_config.json").is_file())
+        if request.action == "ingest":
+            return _output(module, operation={"session_id": "session-1"})
+        return _output(module, output={"count": 0})
+
+    summary = module.execute_replay(config, invoke)
+    assert all(existed_before_request)
+    assert all(event.status == "ok" for event in summary.events)
+
+
+def test_summary_percentiles_duplicates_and_trace_coverage(tmp_path: Path):
+    module = _module()
+    base = module.RequestEvent(
+        request_id="same",
+        operation="add",
+        line_number=1,
+        ts="2026-01-01T00:00:00+00:00",
+        payload_sha256="a" * 64,
+        payload_size_bytes=1,
+        top_level_fields=("messages",),
+        duration_ms=10,
+        status="ok",
+        state="completed",
+        result_count=None,
+        response_size_bytes=1,
+        error_type=None,
+        error_message=None,
+    )
+    events = (base, replace(base, line_number=2, duration_ms=20))
+    summary = module.summarize_replay("run-1", "complete", events, ())
+    assert summary.operations["add"]["p50_ms"] == 15
+    assert summary.operations["add"]["p95_ms"] == 19.5
+    assert summary.join_coverage == {
+        "client_requests": 2,
+        "matched_internal_traces": 0,
+        "missing_internal_traces": 1,
+        "duplicate_request_ids": 1,
+        "unmatched_internal_traces": 0,
+    }
+    assert summary.attribution_status == "exploratory"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"add_concurrency": 0},
+        {"search_concurrency": 0},
+        {"add_rate_per_second": -1},
+        {"request_timeout_seconds": 0},
+        {"poll_interval_seconds": -1},
+        {"drain_timeout_seconds": -1},
+        {"model_mode": "invalid"},
+    ],
+)
+def test_replay_config_rejects_invalid_controls(
+    dataset_dir: Path, tmp_path: Path, overrides: dict
+):
+    module = _module()
+    with pytest.raises(ValueError):
+        _config(module, dataset_dir, tmp_path, **overrides)
