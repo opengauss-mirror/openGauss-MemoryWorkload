@@ -40,6 +40,11 @@ io:
   protocol_mode: stateful_session
 lifecycle:
   startup_required: true
+model_dependencies:
+  agent_chat:
+    protocol: openai-responses
+    base_url_env: OPENCLAW_GATEWAY_URL
+    append_v1: false
 collection:
   stdout: true
   stderr: true

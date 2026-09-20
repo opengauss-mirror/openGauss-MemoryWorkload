@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +31,20 @@ from .protocol import (
 )
 from .benchmark_scenario import BenchmarkScenario
 from .evaluation_profiles import resolve_evaluation_governance
+
+
+_adapter_environment: ContextVar[dict[str, str]] = ContextVar(
+    "adapter_environment", default={}
+)
+
+
+@contextmanager
+def adapter_environment(environment: dict[str, str] | None):
+    token = _adapter_environment.set(dict(environment or {}))
+    try:
+        yield
+    finally:
+        _adapter_environment.reset(token)
 
 
 @dataclass(frozen=True)
@@ -95,14 +112,26 @@ def _script_for_manifest(manifest_path: Path, relative_script: str) -> Path:
     return manifest_path.parent / relative_script
 
 
-def run_json_script(script_path: Path, *, args: list[str] | None = None, stdin_payload: dict | None = None) -> dict:
+def run_json_script(
+    script_path: Path,
+    *,
+    args: list[str] | None = None,
+    stdin_payload: dict | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict:
     cmd = [sys.executable, str(script_path), *(args or [])]
+    scoped_environment = {
+        **os.environ,
+        **_adapter_environment.get(),
+        **(environment or {}),
+    }
     proc = subprocess.run(
         cmd,
         input=None if stdin_payload is None else json.dumps(stdin_payload),
         text=True,
         capture_output=True,
         check=True,
+        env=scoped_environment,
     )
     return json.loads(proc.stdout or "{}")
 
@@ -284,6 +313,10 @@ def build_run_contract(
             "actions": memory_plugin.runtime.get("actions", []) if memory_plugin is not None else [],
             "capabilities": memory_plugin.capabilities if memory_plugin is not None else {},
             "phases": memory_plugin.phases if memory_plugin is not None else {},
+        },
+        "model_dependencies": {
+            **agent.model_dependencies,
+            **(memory.model_dependencies if memory is not None else {}),
         },
         "judge_runtime": judge_runtime,
         "evaluation_validity": {

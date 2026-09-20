@@ -1,0 +1,13 @@
+kind: trace
+id: openai-chat
+version: 0.1.0
+protocols:
+  - openai-chat-completions
+entry:
+  server: scripts/serve.py
+runtime:
+  request_path: /v1/chat/completions
+capabilities:
+  capture: true
+  replay: true
+  streaming: false

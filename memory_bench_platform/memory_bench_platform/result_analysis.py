@@ -91,6 +91,9 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "failure_summary": _summarize_failures(case_results, buckets),
         "failure_buckets": buckets,
         "resource_summary": _read_resource_summary(run_dir),
+        "trace_runtime": _load_optional_json(
+            run_dir / "records" / "trace_runtime_summary.json"
+        ) or {"mode": "off", "valid": True, "channels": {}},
         "resource_timeline": resource_timeline,
         "resource_phase_summary": _summarize_resource_phases(resource_timeline),
         "ingest_summary": _read_ingest_summary(run_dir),
@@ -129,6 +132,26 @@ def _refresh_external_reports(
 
     case_results = imported["case_results"]
     summary = _summary_from_external_result(run_dir.name, imported)
+    current_summary = _load_optional_json(run_dir / "reports" / "summary.json")
+    if isinstance(current_summary, dict):
+        current_validity = current_summary.get("run_validity", {})
+        trace_validity = (
+            current_validity.get("trace_runtime")
+            if isinstance(current_validity, dict)
+            else None
+        )
+        if isinstance(trace_validity, dict):
+            summary["run_validity"] = {
+                **summary.get("run_validity", {}),
+                "valid": bool(summary.get("run_validity", {}).get("valid", True))
+                and bool(trace_validity.get("valid", False)),
+                "trace_runtime": trace_validity,
+            }
+            if not trace_validity.get("valid", False) and summary["status"] != "failed":
+                summary["status"] = "invalid"
+        current_resources = current_summary.get("resource_summary", {})
+        if isinstance(current_resources, dict) and "trace_runtime" in current_resources:
+            summary["resource_summary"]["trace_runtime"] = current_resources["trace_runtime"]
     write_external_result_summary(run_dir, imported)
     write_case_results(run_dir, case_results)
     write_summary(run_dir, summary)
@@ -181,6 +204,7 @@ def _summary_from_external_result(run_id: str, imported: dict[str, Any]) -> dict
         "case_passed": total_correct,
         "case_failed": total_graded - total_correct if ungraded_count <= 0 else total_questions - total_correct,
         "category_summary": summary.get("accuracy_by_category", {}),
+        "run_validity": run_validity if isinstance(run_validity, dict) else {},
         "resource_summary": {
             "token_totals": summary.get("token_totals", {}),
             "memory_token_totals": summary.get("memory_token_totals", {}),
@@ -630,6 +654,12 @@ def _render_analysis_markdown(analysis: dict[str, Any]) -> str:
         lines.extend(["", "## Chain Diagnostics", ""])
         for key, value in analysis["chain_diagnostics"].items():
             lines.append(f"- {key}: `{value}`")
+    lines.extend(["", "## Trace Runtime", ""])
+    trace_runtime = analysis.get("trace_runtime", {})
+    lines.append(f"- mode: `{trace_runtime.get('mode', 'off')}`")
+    lines.append(f"- valid: `{trace_runtime.get('valid', True)}`")
+    for channel, counters in trace_runtime.get("channels", {}).items():
+        lines.append(f"- {channel}: `{counters}`")
     lines.extend(["", "## Notes", ""])
     for note in analysis["analysis_notes"]:
         lines.append(f"- {note}")
@@ -849,6 +879,19 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
             + render_mapping(analysis["chain_diagnostics"])
             + "</tbody></table></section>"
         )
+    trace_runtime = analysis.get("trace_runtime") or {}
+    trace_channels = trace_runtime.get("channels", {}) if isinstance(trace_runtime, dict) else {}
+    trace_html = (
+        "<section class='card' style='margin-top: 16px;'><h2>Trace Runtime</h2><table><tbody>"
+        + render_mapping(
+            {
+                "mode": trace_runtime.get("mode", "off"),
+                "valid": trace_runtime.get("valid", True),
+                **{f"channel.{name}": counters for name, counters in trace_channels.items()},
+            }
+        )
+        + "</tbody></table></section>"
+    )
     phase_html = ""
     if analysis.get("resource_phase_summary"):
         phase_html = (
@@ -938,6 +981,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     <section class="sections">
       <section class="card"><h2>Failure Summary</h2><table><tbody>{render_mapping(analysis.get("failure_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Resource Summary</h2><table><tbody>{render_mapping(analysis.get("resource_summary", {}))}</tbody></table></section>
+      {trace_html}
       <section class="card"><h2>Ingest Summary</h2><table><tbody>{render_mapping(analysis.get("ingest_summary", {}))}</tbody></table></section>
       <section class="card"><h2>Benchmark Diagnostics</h2><table><tbody>{render_mapping(analysis.get("benchmark_diagnostics", {}))}</tbody></table></section>
       <section class="card"><h2>Category Summary</h2><table><tbody>{render_mapping(analysis.get("category_summary", {}))}</tbody></table></section>

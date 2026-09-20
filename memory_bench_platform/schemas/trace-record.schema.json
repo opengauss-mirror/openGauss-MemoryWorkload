@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opengauss.org/memory-workload/trace-record.schema.json",
+  "title": "Provider Trace Record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trace_id",
+    "ordinal",
+    "channel",
+    "protocol",
+    "scope",
+    "request",
+    "response",
+    "timing",
+    "redaction"
+  ],
+  "properties": {
+    "schema_version": {"const": "trace-record/1"},
+    "trace_id": {"type": "string", "minLength": 1},
+    "ordinal": {"type": "integer", "minimum": 1},
+    "channel": {"type": "string", "minLength": 1},
+    "protocol": {"type": "string", "minLength": 1},
+    "scope": {"type": "object"},
+    "request": {
+      "type": "object",
+      "required": ["method", "path", "headers"],
+      "properties": {
+        "method": {"type": "string"},
+        "path": {"type": "string"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "body": {},
+        "raw_body_base64": {"type": ["string", "null"]}
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": ["status", "headers"],
+      "properties": {
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "body": {},
+        "raw_body_base64": {"type": ["string", "null"]},
+        "stream_frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ordinal", "raw_base64"],
+            "properties": {
+              "ordinal": {"type": "integer", "minimum": 1},
+              "raw_base64": {"type": "string"},
+              "event": {"type": ["string", "null"]},
+              "data": {}
+            }
+          }
+        }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "required": ["started_at", "upstream_duration_ms"],
+      "properties": {
+        "started_at": {"type": "string", "format": "date-time"},
+        "upstream_duration_ms": {"type": "number", "minimum": 0}
+      }
+    },
+    "matching": {"type": ["object", "null"]},
+    "redaction": {
+      "type": "object",
+      "required": ["policy", "applied"],
+      "properties": {
+        "policy": {"type": "string"},
+        "applied": {"type": "boolean"}
+      }
+    }
+  }
+}

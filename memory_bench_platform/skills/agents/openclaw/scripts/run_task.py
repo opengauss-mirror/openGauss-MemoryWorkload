@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 def _resolve_openclaw_bin() -> str:
@@ -148,12 +150,54 @@ def build_openclaw_http_request(request: dict) -> tuple[str, dict[str, str], dic
     if model:
         headers["X-OpenClaw-Model"] = str(model)
 
+    correlation = {
+        "X-Trace-Run-ID": os.environ.get("TRACE_RUN_ID"),
+        "X-Trace-Case-ID": metadata.get("case_id"),
+        "X-Trace-Step-ID": metadata.get("step_id") or request.get("task_id"),
+        "X-Trace-User-ID": metadata.get("user_id"),
+        "X-Trace-Session-ID": session_id
+        or (session_id_from_key(str(session_key)) if session_key else None),
+        "X-Request-ID": metadata.get("request_id") or str(uuid.uuid4()),
+    }
+    headers.update({key: str(value) for key, value in correlation.items() if value})
+
     payload = {
         "model": f"openclaw/{agent_id}",
         "input": build_openclaw_message(request),
         "stream": False,
     }
+    trace_metadata = {
+        key: metadata[key]
+        for key in ("run_id", "case_id", "step_id", "user_id", "session_id")
+        if metadata.get(key) is not None
+    }
+    if trace_metadata:
+        payload["metadata"] = trace_metadata
     return f"{_resolve_gateway_url()}/v1/responses", headers, payload
+
+
+def collect_openclaw_session_artifacts(
+    request: dict, *, agent_id: str, session_id: str
+) -> list[dict]:
+    metadata = request.get("metadata", {})
+    configured = metadata.get("session_jsonl") or os.environ.get("OPENCLAW_SESSION_JSONL")
+    if configured:
+        candidates = [Path(str(configured))]
+    else:
+        state_dir = Path(os.environ.get("OPENCLAW_STATE_DIR") or Path.home() / ".openclaw")
+        candidates = [state_dir / "agents" / agent_id / "sessions" / f"{session_id}.jsonl"]
+    for candidate in candidates:
+        if candidate.is_file():
+            return [
+                {
+                    "kind": "openclaw_session_jsonl",
+                    "path": str(candidate),
+                    "content_type": "application/x-ndjson",
+                    "size_bytes": candidate.stat().st_size,
+                    "tags": ["openclaw", "session", "trace-source"],
+                }
+            ]
+    return []
 
 
 def extract_openclaw_response_text(payload: dict) -> str:
@@ -222,7 +266,11 @@ def run_openclaw_http(request: dict) -> dict:
             },
         },
         "turns": [{"text": text}] if text else [],
-        "artifacts": [],
+        "artifacts": collect_openclaw_session_artifacts(
+            request,
+            agent_id=str(metadata.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID") or "main"),
+            session_id=resolved_session_id,
+        ),
         "metrics": [{"name": "duration_ms", "value": duration_ms}],
     }
 
@@ -280,7 +328,11 @@ def main() -> None:
             },
         },
         "turns": result_payload.get("payloads", []),
-        "artifacts": [],
+        "artifacts": collect_openclaw_session_artifacts(
+            request,
+            agent_id=str(metadata.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID") or "main"),
+            session_id=resolved_session_id,
+        ),
         "metrics": [
             {
                 "name": "duration_ms",

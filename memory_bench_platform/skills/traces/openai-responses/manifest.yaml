@@ -1,0 +1,14 @@
+kind: trace
+id: openai-responses
+version: 0.1.0
+protocols:
+  - openai-responses
+entry:
+  server: scripts/serve.py
+runtime:
+  request_path: /v1/responses
+capabilities:
+  capture: true
+  replay: true
+  streaming: true
+  tool_call_deltas: true
