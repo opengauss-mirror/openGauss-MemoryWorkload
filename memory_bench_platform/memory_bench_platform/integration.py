@@ -508,11 +508,14 @@ def _require_runtime_fields(kind: str, action: str, payload: dict[str, Any], fie
 def _validate_memory_action_output(action: str, result: MemoryTaskOutput) -> None:
     if result.status != "ok":
         return
+    if action == "recall":
+        if not isinstance(result.output.get("evidence_text"), str):
+            raise ValueError("memory action 'recall' requires string output.evidence_text")
+        return
     required = {
         "ingest": {"operation.session_id"},
         "flush": {"operation.task_id"},
         "status": {"state"},
-        "recall": {"output.evidence_text"},
     }.get(action, set())
     _require_runtime_fields("memory", action, result.model_dump(mode="json"), required)
 

@@ -137,6 +137,27 @@ print(json.dumps({
         run_memory_task("demo-memory", _request(tmp_path))
 
 
+def test_run_memory_task_accepts_empty_recall(tmp_path: Path, monkeypatch):
+    payload = {
+        "status": "ok", "state": "completed",
+        "output": {"count": 0, "memories": [], "evidence_text": ""},
+    }
+    skills_root = _write_memory_skill(tmp_path, f"print({json.dumps(payload)!r})\n")
+    monkeypatch.setattr("memory_bench_platform.integration.SKILLS_ROOT", skills_root)
+    result = run_memory_task("demo-memory", _request(tmp_path))
+    assert result.status == "ok"
+    assert result.output == payload["output"]
+
+
+@pytest.mark.parametrize("evidence", [None, 0, [], {}])
+def test_run_memory_task_rejects_non_string_evidence(tmp_path: Path, monkeypatch, evidence):
+    payload = {"status": "ok", "state": "completed", "output": {"evidence_text": evidence}}
+    skills_root = _write_memory_skill(tmp_path, f"print({json.dumps(payload)!r})\n")
+    monkeypatch.setattr("memory_bench_platform.integration.SKILLS_ROOT", skills_root)
+    with pytest.raises(ValueError, match="output.evidence_text"):
+        run_memory_task("demo-memory", _request(tmp_path))
+
+
 def test_failed_memory_response_gets_standard_error_fields(tmp_path: Path, monkeypatch):
     runner = """
 import json

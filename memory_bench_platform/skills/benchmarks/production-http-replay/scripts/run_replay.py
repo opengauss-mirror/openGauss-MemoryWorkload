@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -111,6 +112,7 @@ class ReplaySummary:
     join_coverage: dict[str, int]
     attribution_status: str
     events: tuple[RequestEvent, ...]
+    attribution_error: str | None = None
 
 
 class _Pacer:
@@ -170,8 +172,9 @@ def _canonical_request_bytes(request: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def _request_id(operation: str, line_number: int, digest: str) -> str:
-    return f"{operation}-{line_number:06d}-{digest[:12]}"
+def _request_id(operation: str, line_number: int, digest: str, run_id: str) -> str:
+    run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
+    return f"{operation}-{line_number:06d}-{digest[:12]}-{run_digest}"
 
 
 def _result_count(response: dict[str, Any]) -> int | None:
@@ -229,7 +232,7 @@ def iter_replay_records(
             yield ReplayRecord(
                 operation=operation,
                 line_number=line_number,
-                request_id=_request_id(operation, line_number, digest),
+                request_id=_request_id(operation, line_number, digest, run_id),
                 request=replay_request,
                 payload_sha256=digest,
                 payload_size_bytes=len(canonical),
@@ -346,11 +349,14 @@ def _event(
 def _run_add(
     config: ReplayConfig,
     record: ReplayRecord,
-    invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
+    invoke_memory: Callable[..., MemoryTaskOutput],
 ) -> RequestEvent:
     started = time.perf_counter()
     try:
-        output = invoke_memory(config.memory_id, _task_input(config, record, "ingest"))
+        output = invoke_memory(
+            config.memory_id, _task_input(config, record, "ingest"),
+            timeout_seconds=config.request_timeout_seconds,
+        )
         if output.status == "ok" and not output.operation.get("session_id"):
             return _event(
                 record,
@@ -378,10 +384,21 @@ def _run_add(
                             max(0.0, deadline - time.monotonic()),
                         )
                     )
-                output = invoke_memory(
-                    config.memory_id,
-                    _task_input(config, record, "status", operation=operation),
-                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return _event(record, started, output, state="failed", error_type="drain_timeout")
+                try:
+                    output = invoke_memory(
+                        config.memory_id,
+                        _task_input(config, record, "status", operation=operation),
+                        timeout_seconds=min(config.request_timeout_seconds, remaining),
+                    )
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        return _event(record, started, None, state="failed", error_type="drain_timeout")
+                    raise
+                if time.monotonic() >= deadline:
+                    return _event(record, started, output, state="failed", error_type="drain_timeout")
                 operation = {**operation, **copy.deepcopy(output.operation)}
                 if output.status == "failed" or output.state in {"completed", "failed"}:
                     break
@@ -400,11 +417,14 @@ def _run_add(
 def _run_search(
     config: ReplayConfig,
     record: ReplayRecord,
-    invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
+    invoke_memory: Callable[..., MemoryTaskOutput],
 ) -> RequestEvent:
     started = time.perf_counter()
     try:
-        output = invoke_memory(config.memory_id, _task_input(config, record, "recall"))
+        output = invoke_memory(
+            config.memory_id, _task_input(config, record, "recall"),
+            timeout_seconds=config.request_timeout_seconds,
+        )
         return _event(
             record,
             started,
@@ -499,6 +519,7 @@ def summarize_replay(
     internal_request_ids: tuple[str, ...],
     model_mode: str = "real-model",
     phase_elapsed_ms: dict[str, float] | None = None,
+    attribution_error: str | None = None,
 ) -> ReplaySummary:
     client_ids = [event.request_id for event in events]
     unique_clients = set(client_ids)
@@ -514,7 +535,7 @@ def summarize_replay(
     }
     attribution_status = (
         "validated"
-        if unique_clients and not duplicates and not join_coverage["missing_internal_traces"]
+        if unique_clients and not duplicates and not join_coverage["missing_internal_traces"] and not attribution_error
         else "exploratory"
     )
     return ReplaySummary(
@@ -535,11 +556,12 @@ def summarize_replay(
         join_coverage=join_coverage,
         attribution_status=attribution_status,
         events=events,
+        attribution_error=attribution_error,
     )
 
 
 def _load_internal_request_ids(path: Path | None) -> tuple[str, ...]:
-    if path is None or not path.is_file():
+    if path is None:
         return ()
     request_ids: list[str] = []
     with path.open("r", encoding="utf-8") as stream:
@@ -582,10 +604,13 @@ def _write_run_config(config: ReplayConfig) -> None:
     )
 
 
-def _write_artifacts(config: ReplayConfig, summary: ReplaySummary) -> None:
+def _write_request_events(config: ReplayConfig, events: tuple[RequestEvent, ...]) -> None:
     with (config.output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
-        for event in summary.events:
+        for event in events:
             stream.write(json.dumps(asdict(event), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _write_summary(config: ReplayConfig, summary: ReplaySummary) -> None:
     summary_payload = asdict(summary)
     summary_payload.pop("events")
     (config.output_dir / "production_replay_summary.json").write_text(
@@ -596,7 +621,7 @@ def _write_artifacts(config: ReplayConfig, summary: ReplaySummary) -> None:
 
 def execute_replay(
     config: ReplayConfig,
-    invoke_memory: Callable[[str, MemoryTaskInput], MemoryTaskOutput],
+    invoke_memory: Callable[..., MemoryTaskOutput],
 ) -> ReplaySummary:
     dataset = discover_dataset(config.data_path)
     _write_run_config(config)
@@ -615,15 +640,26 @@ def execute_replay(
         config.search_rate_per_second,
         lambda record: _run_search(config, record, invoke_memory),
     )
+    events = tuple(add_events + search_events)
+    _write_request_events(config, events)
+    internal_request_ids: tuple[str, ...] = ()
+    attribution_error = None
+    try:
+        internal_request_ids = _load_internal_request_ids(config.perf_trace_path)
+    except OSError:
+        attribution_error = "trace_read_error"
+    except ValueError:
+        attribution_error = "trace_parse_error"
     summary = summarize_replay(
         config.run_id,
         dataset_state,
-        tuple(add_events + search_events),
-        _load_internal_request_ids(config.perf_trace_path),
+        events,
+        internal_request_ids,
         config.model_mode,
         {"add": add_elapsed_ms, "search": search_elapsed_ms},
+        attribution_error=attribution_error,
     )
-    _write_artifacts(config, summary)
+    _write_summary(config, summary)
     return summary
 
 
@@ -673,14 +709,7 @@ def main() -> None:
                 else None
             ),
         )
-        execute_replay(
-            config,
-            lambda memory_id, request: run_memory_task(
-                memory_id,
-                request,
-                timeout_seconds=config.request_timeout_seconds,
-            ),
-        )
+        execute_replay(config, run_memory_task)
     except (KeyError, OSError, ValueError) as exc:
         print(f"production replay configuration failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from None

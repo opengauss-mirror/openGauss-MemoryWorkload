@@ -536,7 +536,13 @@ memory-bench run \
 - `MEMORY_BENCH_MODEL_MODE`（`real-model`），也接受 `replay-zero-delay`、`replay-with-delay`、`mock-fixed`
 - `MEMORY_BENCH_PERF_TRACE_PATH`：可选的内部 span JSONL，用于 `request_id` 关联覆盖率
 
+请求 ID 包含本轮 `run_id` 的哈希，幂等键沿用该请求 ID：同一轮重试保持稳定，不同轮回放相互隔离。目标系统打点需原样传递本轮请求 ID，历史轮次的 trace 不参与本轮匹配。
+
+异步写入的 drain 截止时间从 ingest 返回 accepted/running 后开始计算，包含轮询间隔和 status 调用；每次 status 使用请求超时与剩余 drain 时间的较小值。正常的零命中 search（`count=0`、`memories=[]`、`evidence_text=""`）计为成功。
+
 外部 runner 生成 `run_config.json`、`request_events.jsonl` 和 `production_replay_summary.json`，平台随后导入 case result、分析 JSON 和 HTML 报告。归档只保留 request ID、payload hash/大小/字段集合、状态、耗时、结果数量和关联统计，不保存 raw request、message、query、memory、凭据、私有 endpoint 或原始身份。关联不完整时结果标记为 exploratory，平台 run 状态为 partial，不生成可信的内部阶段归因结论。
+
+Runner 在读取可选 trace 前保存客户端事件。指定 trace 文件读取失败或 JSON 损坏时，保留请求统计并降级为 exploratory；汇总的 `attribution_error` 记录 `trace_read_error` 或 `trace_parse_error`，不包含原始异常内容。报告导入仅接受 add/search 指标、数值字段和计数分布，拒绝未知字段及嵌套业务内容。
 
 ## 开发和验证
 

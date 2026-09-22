@@ -111,7 +111,10 @@ def test_iter_records_preserves_nonempty_user_and_stable_hash(tmp_path: Path):
     first = next(_module().iter_replay_records(path, "search", "run-1"))
     second = next(_module().iter_replay_records(path, "search", "run-2"))
     assert first.request["user_id"] == "existing"
-    assert first.request_id == second.request_id
+    assert first.request_id != second.request_id
+    assert first.request_id == next(
+        _module().iter_replay_records(path, "search", "run-1")
+    ).request_id
     assert first.payload_sha256 == second.payload_sha256
 
 
@@ -208,13 +211,52 @@ def _config(module, dataset_dir: Path, tmp_path: Path, **overrides):
     return replace(config, **overrides)
 
 
+def test_ingest_idempotency_is_scoped_to_run(dataset_dir: Path, tmp_path: Path):
+    module = _module()
+    config = _config(module, dataset_dir, tmp_path)
+    path = dataset_dir / "openmem_add_sample.jsonl"
+    first = next(module.iter_replay_records(path, "add", "run-1"))
+    second = next(module.iter_replay_records(path, "add", "run-2"))
+    request1 = module._task_input(config, first, "ingest")
+    request2 = module._task_input(replace(config, run_id="run-2"), second, "ingest")
+    assert request1.inputs["raw_request"] != request2.inputs["raw_request"]
+    assert request1.idempotency_key != request2.idempotency_key
+    assert request1.idempotency_key == module._task_input(config, first, "ingest").idempotency_key
+    assert request1.idempotency_key == module._task_input(config, first, "status").idempotency_key
+
+
+def test_old_run_traces_do_not_validate_new_run(dataset_dir: Path, tmp_path: Path):
+    module = _module()
+    trace = tmp_path / "perf.jsonl"
+    old_ids = [
+        next(module.iter_replay_records(path, operation, "old-run")).request_id
+        for operation, path in (
+            ("add", dataset_dir / "openmem_add_sample.jsonl"),
+            ("search", dataset_dir / "openmem_search_sample.jsonl"),
+        )
+    ]
+    trace.write_text("".join(json.dumps({"request_id": rid}) + "\n" for rid in old_ids))
+
+    def invoke(memory_id, request, **kwargs):
+        return _output(module, operation={"session_id": "s"}, output={"count": 0})
+
+    config = _config(module, dataset_dir, tmp_path, perf_trace_path=trace)
+    summary = module.execute_replay(config, invoke)
+    assert summary.attribution_status == "exploratory"
+    assert summary.join_coverage["matched_internal_traces"] == 0
+    assert summary.join_coverage["missing_internal_traces"] == 2
+
+    trace.write_text("".join(json.dumps({"request_id": e.request_id}) + "\n" for e in summary.events))
+    assert module.execute_replay(config, invoke).attribution_status == "validated"
+
+
 def test_execute_replay_drains_add_before_search_and_preserves_protocol(
     dataset_dir: Path, tmp_path: Path
 ):
     module = _module()
     calls = []
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         calls.append((memory_id, request))
         if request.action == "ingest":
             assert request.inputs["raw_request"] == {
@@ -255,7 +297,7 @@ def test_completed_ingest_is_not_polled(dataset_dir: Path, tmp_path: Path):
     module = _module()
     actions = []
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         actions.append(request.action)
         if request.action == "ingest":
             return _output(module, operation={"session_id": "session-1"})
@@ -268,7 +310,7 @@ def test_completed_ingest_is_not_polled(dataset_dir: Path, tmp_path: Path):
 def test_completed_ingest_requires_session_id(dataset_dir: Path, tmp_path: Path):
     module = _module()
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         if request.action == "ingest":
             return _output(module)
         return _output(module, output={"count": 0})
@@ -284,7 +326,7 @@ def test_status_polling_preserves_complete_operation_context(
     module = _module()
     polls = 0
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         nonlocal polls
         if request.action == "ingest":
             return _output(
@@ -314,7 +356,7 @@ def test_failed_or_timed_out_add_marks_dataset_partially_written(
 ):
     module = _module()
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         if request.action == "ingest":
             return _output(
                 module,
@@ -341,7 +383,7 @@ def test_recall_failures_become_events_and_do_not_expose_exception_payload(
 ):
     module = _module()
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         if request.action == "ingest":
             return _output(module, operation={"session_id": "session-1"})
         if mode == "exception":
@@ -371,7 +413,7 @@ def test_replay_uses_bounded_add_concurrency_and_keeps_phase_barrier(
     maximum = 0
     completed = 0
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         nonlocal active, maximum, completed
         if request.action == "ingest":
             with lock:
@@ -406,7 +448,7 @@ def test_replay_artifacts_exclude_payload_and_secret_sentinels(
         {"data": {"memory_detail_list": [{"content": "MEMORY_SENTINEL"}]}},
     )
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         if request.action == "ingest":
             return _output(module, operation={"session_id": "session-1"})
         return _output(
@@ -436,7 +478,7 @@ def test_run_config_exists_before_first_request(dataset_dir: Path, tmp_path: Pat
     config = _config(module, dataset_dir, tmp_path)
     existed_before_request = []
 
-    def invoke(memory_id, request):
+    def invoke(memory_id, request, *, timeout_seconds=None):
         existed_before_request.append((config.output_dir / "run_config.json").is_file())
         if request.action == "ingest":
             return _output(module, operation={"session_id": "session-1"})
@@ -505,6 +547,125 @@ def test_summary_qps_uses_phase_wall_time_for_concurrent_requests():
         phase_elapsed_ms={"add": 20, "search": 0},
     )
     assert summary.operations["add"]["qps"] == 100
+
+
+@pytest.mark.parametrize("failure", ["truncated", "io", "encoding", "missing"])
+def test_trace_failure_preserves_client_artifacts(dataset_dir, tmp_path, monkeypatch, failure):
+    from memory_bench_platform.external_report_import import import_external_result
+
+    module = _module()
+    trace = tmp_path / "perf.jsonl"
+    if failure != "missing":
+        trace.write_text('{"request_id":')
+    if failure == "encoding":
+        trace.write_bytes(b"\xff")
+    config = _config(module, dataset_dir, tmp_path, perf_trace_path=trace)
+    original = module._load_internal_request_ids
+
+    def load(path):
+        archived = config.output_dir / "request_events.jsonl"
+        assert len(archived.read_text().splitlines()) == 2
+        if failure == "io":
+            raise OSError("PRIVATE_SENTINEL")
+        return original(path)
+
+    monkeypatch.setattr(module, "_load_internal_request_ids", load)
+
+    def invoke(memory_id, request, **kwargs):
+        return _output(module, operation={"session_id": "s"}, output={"count": 0})
+
+    summary = module.execute_replay(config, invoke)
+    assert summary.dataset_state == "complete"
+    assert summary.attribution_status == "exploratory"
+    expected = "trace_read_error" if failure in {"io", "missing"} else "trace_parse_error"
+    assert summary.attribution_error == expected
+    imported = import_external_result(config.output_dir)
+    assert imported["summary"]["total_correct"] == 2
+    assert expected in imported["summary"]["run_validity"]["reasons"]
+    assert "PRIVATE_SENTINEL" not in json.dumps(imported)
+
+
+@pytest.mark.parametrize("mode", ["sleep_exhausted", "late_response", "status_timeout", "within_budget"])
+def test_drain_deadline_bounds_status_calls(dataset_dir, tmp_path, monkeypatch, mode):
+    module = _module()
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    config = _config(module, dataset_dir, tmp_path,
+                     drain_timeout_seconds=1, request_timeout_seconds=5,
+                     poll_interval_seconds=2 if mode == "sleep_exhausted" else 0.25)
+    record = next(module.iter_replay_records(dataset_dir / "openmem_add_sample.jsonl", "add", config.run_id))
+    timeouts = []
+
+    def invoke(memory_id, request, *, timeout_seconds=None):
+        if request.action == "ingest":
+            assert timeout_seconds == 5
+            return _output(module, state="accepted", operation={"session_id": "s", "task_id": "t"})
+        timeouts.append(timeout_seconds)
+        if mode != "within_budget":
+            clock[0] = 1.01
+        if mode == "status_timeout":
+            raise subprocess.TimeoutExpired("runner", timeout_seconds)
+        return _output(module)
+
+    event = module._run_add(config, record, invoke)
+    if mode == "within_budget":
+        assert event.status == "ok"
+    else:
+        assert event.status == "failed"
+        assert event.error_type == "drain_timeout"
+    assert timeouts == ([] if mode == "sleep_exhausted" else [0.75])
+
+
+@pytest.mark.parametrize("mode", ["sync", "drain_timeout"])
+def test_main_uses_real_memory_subprocess_for_empty_recall_and_drain(
+    dataset_dir, tmp_path, monkeypatch, mode
+):
+    from types import SimpleNamespace
+    from memory_bench_platform import integration
+    from memory_bench_platform.external_report_import import import_external_result
+
+    runner = tmp_path / "run.py"
+    runner.write_text(
+        "import json, sys, time\n"
+        "request = json.load(sys.stdin)\n"
+        "response = {'status': 'ok', 'state': 'completed', 'operation': {'session_id': 's'}, "
+        "'output': {'count': 0, 'memories': [], 'evidence_text': ''}}\n"
+        f"if {mode!r} == 'drain_timeout':\n"
+        "    if request['action'] == 'ingest':\n"
+        "        response['state'] = 'accepted'\n"
+        "        response['operation']['task_id'] = 'task-1'\n"
+        "    elif request['action'] == 'status':\n"
+        "        time.sleep(1)\n"
+        "print(json.dumps(response))\n"
+    )
+    monkeypatch.setattr(integration, "get_memory_manifest", lambda _: SimpleNamespace(
+        entry=SimpleNamespace(runner="run.py")
+    ))
+    monkeypatch.setattr(integration, "_manifest_path", lambda *args: tmp_path / "manifest.yaml")
+    output = tmp_path / "out"
+    for key, value in {
+        "DATA_PATH": str(dataset_dir), "OUTPUT_DIR": str(output), "RUN_DIR": str(tmp_path),
+        "RUN_ID": "test-real-runner", "MEMORY_BACKEND": "fake-memory", "AGENT_ID": "generic-cli",
+        "MEMORY_INTEGRATION": "backend_direct", "MEMORY_BENCH_MODEL_MODE": "real-model",
+        "MEMORY_BENCH_REPLAY_REQUEST_TIMEOUT_SECONDS": "5",
+        "MEMORY_BENCH_REPLAY_DRAIN_TIMEOUT_SECONDS": "0.05",
+        "MEMORY_BENCH_REPLAY_POLL_INTERVAL_SECONDS": "0",
+        "MEMORY_BENCH_REPLAY_ADD_CONCURRENCY": "1", "MEMORY_BENCH_REPLAY_SEARCH_CONCURRENCY": "1",
+        "MEMORY_BENCH_REPLAY_ADD_RATE": "0", "MEMORY_BENCH_REPLAY_SEARCH_RATE": "0",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("MEMORY_BENCH_PERF_TRACE_PATH", raising=False)
+    _module().main()
+    events = [json.loads(line) for line in (output / "request_events.jsonl").read_text().splitlines()]
+    assert events[-1]["status"] == "ok"
+    assert events[-1]["result_count"] == 0
+    if mode == "drain_timeout":
+        assert events[0]["error_type"] == "drain_timeout"
+    else:
+        assert events[0]["status"] == "ok"
+    imported = import_external_result(output)
+    assert imported["summary"]["total_correct"] == (2 if mode == "sync" else 1)
 
 
 @pytest.mark.parametrize(

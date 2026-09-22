@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,27 @@ _PRODUCTION_JOIN_KEYS = {
 }
 
 
+def _validate_production_metrics(metrics: dict[str, Any]) -> None:
+    for key, value in metrics.items():
+        if key == "result_count_distribution":
+            if not isinstance(value, dict) or any(
+                not isinstance(count, str) or not count.isascii() or not count.isdecimal()
+                or type(frequency) is not int or frequency < 0
+                for count, frequency in value.items()
+            ):
+                raise ValueError("invalid production result count distribution")
+        elif key in {"count", "success"}:
+            if type(value) is not int or value < 0:
+                raise ValueError("invalid production count metric")
+        elif (
+            type(value) not in (int, float)
+            or (isinstance(value, float) and not math.isfinite(value))
+            or value < 0
+            or (key in {"success_rate", "non_empty_rate"} and value > 1)
+        ):
+            raise ValueError("invalid production numeric metric")
+
+
 def _load_production_events(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"missing production replay event file: {path.name}")
@@ -153,6 +175,19 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
         raise ValueError(
             f"unsupported production replay schema: {summary.get('schema')!r}"
         )
+    if set(summary) - {
+        "schema", "run_id", "dataset_state", "model_mode", "operations",
+        "join_coverage", "attribution_status", "attribution_error",
+    }:
+        raise ValueError("forbidden production replay summary field")
+    for key, allowed in (
+        ("dataset_state", ("complete", "partially_written")),
+        ("model_mode", ("real-model", "replay-zero-delay", "replay-with-delay", "mock-fixed")),
+        ("attribution_status", ("validated", "exploratory")),
+        ("attribution_error", (None, "trace_read_error", "trace_parse_error")),
+    ):
+        if summary.get(key) not in allowed:
+            raise ValueError(f"invalid production replay {key}")
 
     events = _load_production_events(run_dir / "request_events.jsonl")
     case_results: list[dict[str, Any]] = []
@@ -180,6 +215,8 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
     operations = summary.get("operations")
     if not isinstance(operations, dict):
         raise ValueError("production replay summary operations must be an object")
+    if set(operations) - {"add", "search"}:
+        raise ValueError("forbidden production replay operation")
     for operation in ("add", "search"):
         metrics = operations.get(operation)
         if not isinstance(metrics, dict):
@@ -189,6 +226,7 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
             raise ValueError(
                 f"forbidden {operation} summary field: " + ", ".join(forbidden)
             )
+        _validate_production_metrics(metrics)
         if int(metrics.get("count", -1)) != operation_counts[operation]:
             invalid_reasons.append(f"{operation}_event_count_mismatch")
         if int(metrics.get("success", -1)) != operation_success[operation]:
@@ -204,10 +242,14 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
         raise ValueError(
             "forbidden join coverage field: " + ", ".join(forbidden_join)
         )
+    if any(type(value) is not int or value < 0 for value in join_coverage.values()):
+        raise ValueError("invalid production join coverage metric")
     if dataset_state != "complete":
         invalid_reasons.append("dataset_not_complete")
     if attribution_status != "validated":
         invalid_reasons.append("attribution_not_validated")
+    if summary.get("attribution_error"):
+        invalid_reasons.append(summary["attribution_error"])
     if int(join_coverage.get("duplicate_request_ids", 0) or 0) > 0:
         invalid_reasons.append("duplicate_request_ids")
 
@@ -237,6 +279,7 @@ def _import_production_replay(run_dir: Path, summary_path: Path) -> dict[str, An
             "operations": operations,
             "join_coverage": join_coverage,
             "attribution_status": attribution_status,
+            "attribution_error": summary.get("attribution_error"),
             "run_validity": run_validity,
         },
     }

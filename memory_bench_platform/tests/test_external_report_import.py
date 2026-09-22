@@ -356,3 +356,44 @@ def test_production_replay_import_rejects_content_fields_in_summary(tmp_path: Pa
     )
     with pytest.raises(ValueError, match="forbidden add summary field"):
         import_external_result(tmp_path)
+
+
+@pytest.mark.parametrize("poison", [
+    {"operations": {"add": {"count": 0, "success": 0}, "search": {"count": 0, "success": 0},
+                    "raw_request": {"api_key": "PRIVATE_SENTINEL"}}},
+    {"operations": {"add": {"count": 0, "success": 0, "qps": {"query": "PRIVATE_SENTINEL"}},
+                    "search": {"count": 0, "success": 0}}},
+    {"operations": {"add": {"count": 0, "success": 0}, "search": {
+        "count": 0, "success": 0, "result_count_distribution": {"PRIVATE_SENTINEL": 1}}}},
+    {"operations": {"add": {"count": 0, "success": 0}, "search": {
+        "count": 0, "success": 0, "result_count_distribution": {"0": {"messages": "PRIVATE_SENTINEL"}}}}},
+    {"join_coverage": {"client_requests": {"api_key": "PRIVATE_SENTINEL"}}},
+    {"model_mode": {"messages": "PRIVATE_SENTINEL"}},
+    {"dataset_state": "PRIVATE_SENTINEL"},
+    {"attribution_status": "PRIVATE_SENTINEL"},
+    {"raw_request": "PRIVATE_SENTINEL"},
+])
+def test_replay_import_rejects_nested_content(tmp_path: Path, poison):
+    _write_replay_summary(tmp_path, **poison)
+    _write_replay_events(tmp_path, [{
+        "request_id": "add-1", "operation": "add", "status": "ok", "state": "completed",
+    }])
+    with pytest.raises(ValueError) as exc:
+        import_external_result(tmp_path)
+    assert "PRIVATE_SENTINEL" not in str(exc.value)
+
+
+@pytest.mark.parametrize("metric,value", [
+    ("count", True), ("success", "1"), ("qps", float("nan")),
+    ("p95_ms", float("inf")), ("p50_ms", -1), ("success_rate", 1.1),
+])
+def test_replay_import_rejects_invalid_metric_types(tmp_path: Path, metric, value):
+    _write_replay_summary(tmp_path, operations={
+        "add": {"count": 1, "success": 1, metric: value},
+        "search": {"count": 0, "success": 0},
+    })
+    _write_replay_events(tmp_path, [{
+        "request_id": "add-1", "operation": "add", "status": "ok", "state": "completed",
+    }])
+    with pytest.raises(ValueError):
+        import_external_result(tmp_path)
