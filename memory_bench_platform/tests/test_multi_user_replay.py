@@ -491,3 +491,84 @@ def test_bad_result_count_does_not_abort_other_users(tmp_path, monkeypatch, memo
     report = run_multi_user(load_config(path), tmp_path / "out", "r")
     assert report["status"] == "failed"
     assert report["overall"]["search"]["failed"] == 2
+
+
+def test_slow_instance_cannot_take_fast_instances_last_slot(tmp_path, monkeypatch, memory_adapter):
+    import time
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, data = config_file(tmp_path)
+    data["max_workers"] = 2
+    data["instances"]["i"]["environment"] = {"TARGET": "slow"}
+    data["instances"]["j"] = {**data["instances"]["i"], "environment": {"TARGET": "fast"}}
+    data["users"].append({"id": "charlie", "workload": "fast", "instance": "j"})
+    data["workloads"]["fast"] = {**data["workloads"]["w"], "add_file": "fast.jsonl"}
+    (tmp_path / "fast.jsonl").write_text((tmp_path / "add.jsonl").read_text() * 2)
+    path.write_text(yaml.safe_dump(data))
+    order = []
+    def invoke(skill, request, *, environment, **kwargs):
+        if request.action == "ingest":
+            order.append(environment["TARGET"])
+            time.sleep(0.3 if environment["TARGET"] == "slow" else 0.01)
+        return MemoryTaskOutput(status="ok", state="completed", operation={"session_id": "s"})
+    monkeypatch.setattr(integration, "run_memory_task", invoke)
+    run_multi_user(load_config(path), tmp_path / "out", "r")
+    assert order[:3] == ["slow", "fast", "fast"]
+
+
+@pytest.mark.parametrize("body", [{"status": "failed", "error": {"message": "PRIVATE_ERROR"}}, {},
+                                  {"status": "incomplete", "output": []}])
+def test_openclaw_http_bad_response_is_failed_request(tmp_path, monkeypatch, body):
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import Replay
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    path, _ = config_file(tmp_path, mode="openclaw")
+    config = load_config(path)
+    replay = Replay(config, tmp_path, "r", {"i": {"OPENCLAW_GATEWAY_URL": f"http://127.0.0.1:{server.server_port}"}})
+    try:
+        user = config.users[0]
+        event = replay.invoke(user, next(replay.records(user, "search")), "search", time.monotonic())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert event["status"] == "failed"
+    assert "PRIVATE_ERROR" not in json.dumps(event)
+
+
+def test_adapter_artifacts_are_outside_archive_and_isolated(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, data = config_file(tmp_path)
+    data["instances"]["j"] = dict(data["instances"]["i"])
+    data["users"][1]["instance"] = "j"
+    path.write_text(yaml.safe_dump(data))
+    directories = set()
+    def invoke(skill, request, **kwargs):
+        run_dir = Path(request.runtime_context.run_dir)
+        directories.add(run_dir)
+        (run_dir / "artifacts").mkdir(exist_ok=True)
+        (run_dir / "artifacts/request.json").write_text("PRIVATE_ARTIFACT")
+        return MemoryTaskOutput(status="ok", state="completed", operation={"session_id": "s"})
+    monkeypatch.setattr(integration, "run_memory_task", invoke)
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    assert len(directories) == 2
+    assert all(not p.exists() for p in directories)
+    assert all("PRIVATE_ARTIFACT" not in file.read_text() for file in out.rglob("*") if file.is_file())

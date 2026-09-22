@@ -74,7 +74,10 @@ class Replay:
             status="failed", error_type=None, result_count=None)
         try:
             if self.config.mode == "backend_direct":
+                adapter_dir = runtime.scratch / uid
+                adapter_dir.mkdir(exist_ok=True)
                 cfg = replay_module().ReplayConfig(data_path=self.output_dir, output_dir=self.output_dir,
+                    run_dir=adapter_dir,
                     run_id=self.run_id, memory_id=runtime.config.memory_skill, agent_id="none",
                     request_timeout_seconds=controls.request_timeout_seconds,
                     drain_timeout_seconds=controls.drain_timeout_seconds,
@@ -118,6 +121,12 @@ class Replay:
                                                     timeout_seconds=controls.request_timeout_seconds)
                 if not isinstance(result, dict) or result.get("status") != "ok":
                     raise ValueError("invalid Agent response")
+                raw = result.get("raw")
+                if (not isinstance(raw, dict) or raw.get("error")
+                        or raw.get("status") not in {None, "completed"}
+                        or not isinstance(raw.get("output"), list)
+                        or any(not isinstance(item, dict) for item in raw["output"])):
+                    raise ValueError("invalid or failed Responses API response")
                 if operation == "add":
                     handle = result.get("output", {}).get("session_handle", {})
                     if not isinstance(handle, dict):
@@ -154,6 +163,7 @@ class Replay:
         pending = deque(ordered)
         ready_at = {u.id: started for u in users}
         inflight = {name: 0 for name in self.runtimes}
+        remaining_users = {name: sum(u.instance == name for u in users) for name in self.runtimes}
         futures = {}
         executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
         def collect(future):
@@ -169,13 +179,22 @@ class Replay:
             while pending or futures:
                 for _ in range(len(pending)):
                     user = pending.popleft()
+                    active_instances = sum(count > 0 for count in remaining_users.values())
+                    # Reserve one slot per active instance when the worker budget permits.
+                    # Otherwise use at most one slot per instance until one exhausts its work.
+                    reserved = sum(name != user.instance and count > 0 and inflight[name] == 0
+                                   for name, count in remaining_users.items())
+                    available = self.config.max_workers - reserved if active_instances <= self.config.max_workers else self.config.max_workers
                     if (len(futures) >= self.config.max_workers
+                            or len(futures) >= available
+                            or (active_instances > self.config.max_workers and inflight[user.instance] > 0)
                             or inflight[user.instance] >= self.runtimes[user.instance].config.max_inflight
                             or time.monotonic() < ready_at[user.id]):
                         pending.append(user)
                         continue
                     record = next(queues[user.id], None)
                     if record is None:
+                        remaining_users[user.instance] -= 1
                         continue
                     eligible = ready_at[user.id]
                     rate = getattr(self.config.controls_for(user), operation + "_rate", 0)

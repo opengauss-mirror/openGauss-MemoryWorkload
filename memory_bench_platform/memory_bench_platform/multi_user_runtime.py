@@ -56,9 +56,9 @@ class InstanceRuntime:
             except subprocess.TimeoutExpired:
                 pass
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        # Both plugin snapshots and adapter artifacts can contain private data.
+        self.scratch = Path(tempfile.mkdtemp(prefix="memory-bench-instance-"))
         if self.config.kind == "openclaw":
-            # Plugin snapshots may contain credentials; keep them out of report archives.
-            self.scratch = Path(tempfile.mkdtemp(prefix="memory-bench-instance-"))
             self.prepared = True  # finalize even when prepare failed partway through
             self.plugin("prepare", {"namespace": identity(self.run_id, "namespace")})
             self.probe_isolation()

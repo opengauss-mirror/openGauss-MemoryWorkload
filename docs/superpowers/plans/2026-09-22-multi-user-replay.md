@@ -61,3 +61,35 @@ Files: cli.py, multi_user_report.py, external_report_import.py, README.md, examp
 - [ ] 运行新增测试及平台/LoCoMo 回归测试；区分已知 macOS /proc 限制。
 - [ ] 自审每个目标与配置示例，执行 git diff --check。
 - [ ] 用当前仓库邮箱提交并更新已授权的 real-workload PR 分支。
+
+## Verification record
+
+2026-09-22, Python 3.11 on macOS, implementation commit 8dabf0d:
+
+- Multi-user + OpenClaw runner: 38 passed.
+- Full platform suite: 434 passed, 8 failed (the same pre-existing Linux `/proc` dependencies below).
+- LoCoMo: 84 passed.
+- Platform excluding the three affected test modules: 422 passed.
+- `git diff --check` and module compilation: passed.
+- HTTP/subprocess fixtures verify routing and control flow only; no real OpenClaw/memory service performance claim.
+
+Existing environment failures (not modified by this feature):
+
+1. `test_e2e_stub_run.py::test_stub_run_creates_run_json_and_summary`
+2. `test_external_entrypoints.py::test_external_runner_missing_output_becomes_failed_summary`
+3. `test_external_entrypoints.py::test_cli_run_openclaw_import_entrypoint_copy_mode_builds_platform_report`
+4. `test_external_entrypoints.py::test_external_runner_receives_version_override_env`
+5. `test_resource_monitor.py::test_resource_monitor_prepares_clusterbench_style_csv_files`
+6. `test_resource_monitor.py::test_resource_monitor_background_sampling_writes_multiple_rows`
+7. `test_resource_monitor.py::test_resource_monitor_cpu_sampling_uses_delta_between_snapshots`
+8. `test_resource_monitor.py::test_resource_monitor_disk_and_network_sampling_use_deltas`
+
+Fresh-context final review found three Important issues; all have reproducing RED→GREEN tests:
+
+- Reserve a scheduling slot for each active instance when the worker budget allows.
+- Reject HTTP-200 Responses API business failures, incomplete responses, and empty objects.
+- Keep adapter artifacts in private instance/user scratch directories outside the archive.
+
+After this fix pass: focused suite 43 passed; platform excluding the three affected modules 427 passed; LoCoMo 84 passed. No Critical or Minor findings were deferred.
+
+Final full platform run: 439 passed, the same 8 macOS `/proc` failures, 5 resource-monitor warnings. Per the finishing skill's full-suite gate, local commits are retained; this feature has not been pushed or merged.

@@ -137,11 +137,15 @@ exclusive_resources:
 
 插件恢复快照可能含凭据，只存放在权限 0700 的系统临时目录，不进入报告。finalize 成功后移除；失败时保留以便恢复，报告 `recovery_snapshot` 给出临时目录名，位于 Python `tempfile.gettempdir()` 下。恢复后由操作员清理，不要把快照提交或加入报告归档。
 
+Memory 适配器的 runtime_context.run_dir 同样放在报告目录之外，并按实例/用户分区；正常退出后移除。适配器自行生成的原文调试文件不会并入报告，只有协调器的白名单事件与数值汇总会归档。
+
 ## 阶段和指标
 
 全局 add → drain → search，所有用户完成写入后再进入检索。backend_direct 的 add 耗时包含异步状态轮询；OpenClaw 分开记录 Agent 接收耗时与原生 compact/精确任务 drain 耗时。sleep、全局队列清空等弱证据不视为精确就绪。单请求失败不停止其他用户；已有部分写入的用户标记 partially_written。
 
 每用户最多一个在途请求，每实例 max_inflight 和全局 max_workers 都生效。速率是每用户请求开始间隔的上限（0 不限速）；不会复刻源文件的生产时间间隔，也不重放原始 add/search 交错顺序。
+
+当 max_workers 不小于活跃实例数时，为每个实例保留至少一个执行槽，避免慢实例占满线程池；其他槽可供实例共享。worker 数少于活跃实例数时每实例最多占一个槽，实例之间仍需轮流等待，因此建议 max_workers 至少等于实例数。OpenClaw 的 HTTP 200 还会检查业务状态和 Responses 输出结构，failed/incomplete 或空对象不能计为成功。
 
 输出位于 `runs/<run-id>/`：
 
