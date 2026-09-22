@@ -39,11 +39,15 @@ def test_checks_bracket_call_and_reject_failures(failure):
         seen.append("agent")
         return {"status": "ok", "turns": [{"text": "answer"}]}
     ctx = context(actions=["before_agent", "after_agent"])
+    result = _execute_agent(step(), "openclaw", agent, ctx, plugin)
     if failure:
-        with pytest.raises(RuntimeError, match="guard rejected"):
-            _execute_agent(step(), "openclaw", agent, ctx, plugin)
+        assert result["status"] == "failed"
+        assert "guard rejected" in result["error_message"]
+        assert result["plugin_checks"][failure]["state"] == "failed"
     else:
-        assert _execute_agent(step(), "openclaw", agent, ctx, plugin)["agent_answer"] == "answer"
+        assert result["status"] == "ok"
+    if failure != "before_agent":
+        assert result["agent_answer"] == "answer"
     assert seen == (["before_agent"] if failure == "before_agent" else
                     ["before_agent", "agent", "after_agent"])
 
@@ -62,6 +66,6 @@ def test_unrelated_modes_do_not_call_checks(mode, actions):
 
 def test_noncompleted_before_check_does_not_start_agent():
     def agent(*args): pytest.fail("agent started before check completed")
-    with pytest.raises(RuntimeError, match="accepted"):
-        _execute_agent(step(), "openclaw", agent, context(actions=["before_agent"]),
-                       lambda *a: MemoryPluginTaskOutput(status="ok", state="accepted"))
+    result = _execute_agent(step(), "openclaw", agent, context(actions=["before_agent"]),
+                            lambda *a: MemoryPluginTaskOutput(status="ok", state="accepted"))
+    assert result["status"] == "failed" and "accepted" in result["error_message"]

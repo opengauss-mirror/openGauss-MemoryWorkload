@@ -100,7 +100,11 @@ def finalize_prompt_models(run_dir):
     for artifact in (root / "artifacts" / "step-stdout").glob("*-agent-answer.json"):
         try:
             result = json.loads(artifact.read_text(encoding="utf-8"))
-            meta = result.get("raw", {}).get("meta", {}).get("agentMeta", {})
+            raw = result.get("raw", {})
+            payload = raw.get("result", raw)
+            meta = payload.get("meta", {}).get("agentMeta", {})
+            if not meta.get("model") and payload.get("model"):
+                meta = {"model": payload["model"], "provider": payload.get("provider", "")}
             if meta.get("model"):
                 observed.add((str(meta.get("provider") or ""), str(meta["model"])))
         except (ValueError, AttributeError):

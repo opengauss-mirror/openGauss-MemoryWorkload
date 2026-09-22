@@ -56,3 +56,23 @@ def test_refuses_to_overwrite_probe_records(tmp_path):
     with pytest.raises(FileExistsError):
         probe("ogmemory", tmp_path, invoke=invoke)
     assert not requests
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -float("inf"), 0, -1])
+def test_invalid_timeout_rejected_before_side_effects(tmp_path, timeout):
+    invoke, requests = fake_backend()
+    target = tmp_path / "probe"
+    with pytest.raises(ValueError, match="finite and positive"):
+        probe("ogmemory", target, ready_timeout=timeout, invoke=invoke)
+    assert not requests and not target.exists()
+
+
+@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf", "0", "-1"])
+def test_cli_rejects_invalid_timeout(monkeypatch, tmp_path, timeout):
+    from memory_bench_platform.memory_probe import main
+    monkeypatch.setattr("sys.argv", ["probe", "--memory-backend", "ogmemory",
+                        "--output", str(tmp_path / "probe"), "--ready-timeout=" + timeout])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert not (tmp_path / "probe").exists()

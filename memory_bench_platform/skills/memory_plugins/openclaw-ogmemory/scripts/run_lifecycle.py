@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -76,7 +77,7 @@ def prepare_runtime(source_config, upstream, destination, api_url, runtime_path=
     return target
 
 
-def backend(base, path, body, identity, *, method="POST"):
+def backend(base, path, body, identity, *, method="POST", timeout=60):
     headers = {"Content-Type": "application/json", "X-Account-ID": identity["accountId"],
                "X-User-ID": identity["userId"], "X-Agent-ID": identity["agentId"]}
     if os.environ.get("OGMEM_API_KEY"):
@@ -88,7 +89,7 @@ def backend(base, path, body, identity, *, method="POST"):
     else:
         data = json.dumps({**body, **identity}).encode()
     with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers,
-                                                      method=method), timeout=60) as response:
+                                                      method=method), timeout=timeout) as response:
         result = json.load(response)
     if not isinstance(result, dict) or result.get("ok") is False or result.get("error"):
         raise RuntimeError("oGMemory rejected readiness request")
@@ -152,36 +153,54 @@ def wait_ready(base, state, inputs):
         raise ValueError("Native agent session_handle.session_id is required")
     identity = state["identity"]
     body = {"sessionId": sid, "timeoutSeconds": 1, "drainOutbox": False, "waitOutbox": False}
-    deadline = time.monotonic() + float(inputs.get("timeout_seconds", 600))
-    while time.monotonic() < deadline:
-        idle = backend(base, "/api/v1/call/wait_until_idle", body, identity)
+    timeout = float(inputs.get("timeout_seconds", 600))
+    interval = float(inputs.get("interval_seconds", 2))
+    if not math.isfinite(timeout) or not math.isfinite(interval) or interval < 0:
+        raise ValueError("Readiness timeout and interval must be finite; interval must be non-negative")
+    deadline = time.monotonic() + timeout
+
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("Native capture/indexing did not settle before deadline")
+        return budget
+
+    def request(path, payload, **kwargs):
+        budget = remaining()
+        result = backend(base, path, payload, identity, timeout=min(60, budget), **kwargs)
+        remaining()
+        return result
+
+    while True:
+        idle = request("/api/v1/call/wait_until_idle", body)
         # Do not call GET session first: that endpoint can create an empty session.
         if idle.get("reason") == "session_not_found":
             raise RuntimeError("Native capture session missing; inspect OpenClaw/backend logs")
         if idle.get("idle") is True:
-            session = backend(base, "/api/v1/sessions/" + urllib.parse.quote(sid, safe=""),
-                              {}, identity, method="GET")
+            session = request("/api/v1/sessions/" + urllib.parse.quote(sid, safe=""),
+                              {}, method="GET")
             if int(session.get("message_count", 0)) <= 0 and int(session.get("commit_count", 0)) <= 0:
                 raise RuntimeError("Native capture has no accepted history")
             if int(session.get("commit_count", 0)) == 0:
                 # An idle buffer does not prove extraction; preserve native threshold behavior.
+                remaining()
                 return {"session_id": sid, "history_archived": False,
                         "reason": "buffered_without_archive", "session": session,
                         "backend_result": idle}
-            drained = backend(base, "/api/v1/call/wait_until_idle",
-                              {**body, "drainOutbox": True}, identity)
+            drained = request("/api/v1/call/wait_until_idle",
+                              {**body, "drainOutbox": True})
             if drained.get("reason") == "session_not_found" or int((drained.get("drain") or {}).get("failed", 0)):
                 raise RuntimeError("Captured session missing or indexing failed")
-            settled = backend(base, "/api/v1/call/wait_until_idle",
-                              {**body, "waitOutbox": True}, identity)
+            settled = request("/api/v1/call/wait_until_idle",
+                              {**body, "waitOutbox": True})
             outbox = settled.get("outbox") or {}
             if settled.get("reason") == "session_not_found" or outbox.get("supported") is False or outbox.get("error"):
                 raise RuntimeError("Backend cannot verify readiness")
             if settled.get("idle") is True and "total" in outbox and int(outbox["total"]) == 0:
+                remaining()
                 return {"session_id": sid, "history_archived": True, "session": session,
                         "backend_result": settled, "extraction_trigger": "agent_native_after_turn"}
-        time.sleep(float(inputs.get("interval_seconds", 2)))
-    raise TimeoutError("Native capture/indexing did not settle before deadline")
+        time.sleep(min(interval, remaining()))
 
 
 def check_ogmemory_hook_errors(text, phase=None):
@@ -303,6 +322,7 @@ def run(request):
         raise ValueError("runtime_context.run_dir is required")
     if state.get("active") and state.get("owner") != owner:
         raise ValueError("Runtime is owned by another active run; use a dedicated runtime")
+    events = Path(str(path) + "." + digest(owner) + ".events.jsonl")
     output, artifacts = {}, []
     if action == "validate":
         props = json.loads((path.parent / "plugin/openclaw.plugin.json").read_text())["configSchema"]["properties"]
@@ -330,7 +350,6 @@ def run(request):
     elif action == "finalize":
         configure(path, config, {**state, "active": False}, "inactive")
         output = {"inactive": True}
-        events = Path(str(path) + ".events.jsonl")
         if events.exists():
             archive = Path(owner) / "artifacts/memory_plugin/openclaw-ogmemory-events.jsonl"
             archive.parent.mkdir(parents=True, exist_ok=True)
@@ -352,8 +371,9 @@ def run(request):
         else:
             raise ValueError(f"Unsupported action: {action}")
     if action != "finalize":
-        with open(str(path) + ".events.jsonl", "a", opener=lambda n, f: os.open(n, f, 0o600)) as log:
-            log.write(json.dumps({"action": action, "scope_id": inputs.get("scope_id", state.get("scope_id")),
+        with open(events, "a", opener=lambda n, f: os.open(n, f, 0o600)) as log:
+            log.write(json.dumps({"action": action, "owner": owner,
+                                  "scope_id": inputs.get("scope_id", state.get("scope_id") if state.get("owner") == owner else None),
                                   "output": output, "at": time.time()}) + "\n")
     return {"protocol_version": "memory-plugin/1", "status": "ok", "state": "completed",
             "operation": {}, "output": output, "metrics": [], "artifacts": artifacts, "error": {}}

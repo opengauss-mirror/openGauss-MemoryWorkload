@@ -132,7 +132,7 @@ def test_short_history_is_buffered_not_reported_as_extracted(runtime, monkeypatc
     _, module, run = runtime; run("prepare", scope_id="run:a"); calls = []
     def backend(base, path, body, identity, **kw):
         calls.append(path)
-        return {"message_count": 2, "commit_count": 0, "pending_tokens": 40} if kw else {"idle": True}
+        return {"message_count": 2, "commit_count": 0, "pending_tokens": 40} if kw.get("method") == "GET" else {"idle": True}
     monkeypatch.setattr(module, "backend", backend)
     result = run("wait_ready", scope_id="run:a", session_handle={"session_id": "short"})
     assert result["output"]["history_archived"] is False
@@ -263,7 +263,7 @@ def test_real_plugin_protocol_brackets_generic_agent(runtime):
         "status": "ok", "transport": "cli", "stderr": "og-memory: mode=remote",
         "turns": [{"text": "INGEST_OK"}]}, ctx, run_memory_plugin_task)
     assert result["agent_answer"] == "INGEST_OK"
-    actions = [json.loads(line)["action"] for line in Path(str(state)+".events.jsonl").read_text().splitlines()]
+    actions = [json.loads(line)["action"] for line in Path(str(state)+"."+load().digest(str(state.parent.parent / "run"))+".events.jsonl").read_text().splitlines()]
     assert actions[-2:] == ["before_agent", "after_agent"]
 
 
@@ -330,3 +330,57 @@ def test_qa_expected_gateway_session(runtime, monkeypatch, metadata, expected):
     else:
         with pytest.raises(ValueError, match="explicit session"):
             module.before_agent(state, config, data, request)
+
+
+def test_event_archive_is_per_owner_and_preserves_samples(runtime, tmp_path):
+    state, module, run = runtime
+    run("prepare", scope_id="old-scope")
+    old_identity = json.loads(state.read_text())["identity"]["userId"]
+    first = Path(run("finalize")["artifacts"][0]["path"]).read_text()
+    def next_run(action, **inputs):
+        return module.run({"action": action, "inputs": inputs,
+                           "runtime_context": {"run_dir": str(tmp_path / "run-two")}})
+    next_run("validate")
+    next_run("prepare", scope_id="new-a")
+    next_run("prepare", scope_id="new-b")
+    second = Path(next_run("finalize")["artifacts"][0]["path"]).read_text()
+    assert "old-scope" in first
+    assert "old-scope" not in second and old_identity not in second
+    assert "new-a" in second and "new-b" in second
+    assert Path(tmp_path / "run/artifacts/memory_plugin/openclaw-ogmemory-events.jsonl").read_text() == first
+
+
+@pytest.mark.parametrize("slow_call", [1, 2, 3, 4])
+def test_readiness_rejects_success_after_deadline(runtime, monkeypatch, slow_call):
+    _, module, run = runtime
+    run("prepare", scope_id="run:a")
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    def backend(base, path, body, identity, **kw):
+        calls.append(kw["timeout"])
+        assert 0 < kw["timeout"] <= 0.5 - clock[0]
+        clock[0] += 0.6 if len(calls) == slow_call else 0.01
+        if kw.get("method") == "GET":
+            return {"message_count": 2, "commit_count": 1}
+        return {"idle": True, "outbox": {"total": 0}}
+    monkeypatch.setattr(module, "backend", backend)
+    with pytest.raises(TimeoutError):
+        run("wait_ready", scope_id="run:a", session_handle={"session_id": "s"}, timeout_seconds=0.5)
+    assert len(calls) == slow_call
+
+
+def test_readiness_sleep_is_limited_to_remaining_budget(runtime, monkeypatch):
+    _, module, run = runtime
+    run("prepare", scope_id="run:a")
+    clock, sleeps = [0.0], []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "backend", lambda *a, **kw: {"idle": False})
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    with pytest.raises(TimeoutError):
+        run("wait_ready", scope_id="run:a", session_handle={"session_id": "s"},
+            timeout_seconds=0.5, interval_seconds=2)
+    assert sleeps == [0.5]

@@ -88,6 +88,7 @@ def _execute_agent(
     # Optional checks belong to the bound plugin, not to an Agent implementation.
     plugin_id = runtime_context.memory_plugin_id
     actions = (runtime_context.run_contract.get("memory_plugin_runtime") or {}).get("actions", [])
+    checks = {}
     def check(action, **inputs):
         if runtime_context.memory_integration != "agent_plugin" or not plugin_id or action not in actions:
             return {}
@@ -99,12 +100,22 @@ def _execute_agent(
             runtime_context=runtime_context,
             idempotency_key=f"{runtime_context.run_id}:{step.step_id}:{action}",
         ))
-        if response.status != "ok" or response.state != "completed":
-            raise RuntimeError(f"memory plugin {action} failed: " +
-                               str(response.error.get("message") or response.state))
+        checks[action] = response.model_dump(mode="json")
         return response.output
 
+    def failed_check(action, result=None):
+        response = checks.get(action, {})
+        if not response or (response["status"] == "ok" and response["state"] == "completed"):
+            return None
+        return {**(result or {}), "status": "failed", "exit_code": 1,
+                "error_message": f"memory plugin {action} failed: " +
+                    str(response.get("error", {}).get("message") or response["state"]),
+                "plugin_checks": checks}
+
     check_context = check("before_agent")
+    failure = failed_check("before_agent")
+    if failure is not None:
+        return failure
     result = agent_runner(agent_id, rendered)
     if not isinstance(result, dict):
         raise ValueError("agent runner returned a non-object response")
@@ -119,9 +130,14 @@ def _execute_agent(
                 break
     if result["status"] == "ok" and not answer:
         raise ValueError("successful agent runner response requires a final answer text")
-    check("after_agent", check_context=check_context, agent_result=result)
     normalized = dict(result)
     normalized["agent_answer"] = answer
+    check("after_agent", check_context=check_context, agent_result=result)
+    failure = failed_check("after_agent", normalized)
+    if failure is not None:
+        return failure
+    if checks:
+        normalized["plugin_checks"] = checks
     return normalized
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from .protocol import MemoryTaskInput, MemoryTaskOutput, WorkflowRuntimeContext
 
 def probe(backend, run_dir, *, ready_timeout=120, invoke=None):
     """Exercise the public contract without deploying, patching or invoking an agent."""
+    if not math.isfinite(ready_timeout) or ready_timeout <= 0:
+        raise ValueError("ready_timeout must be finite and positive")
     manifest = get_memory_manifest(backend)
     commit, readiness = _direct_barrier_policy({"memory": manifest.capabilities})
     required = {"ingest", "recall"} | ({"flush"} if commit else set()) | ({"status"} if readiness else set())
@@ -90,8 +93,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="New directory for the probe record")
     parser.add_argument("--ready-timeout", type=float, default=120)
     args = parser.parse_args()
-    if args.ready_timeout <= 0:
-        parser.error("--ready-timeout must be positive")
+    if not math.isfinite(args.ready_timeout) or args.ready_timeout <= 0:
+        parser.error("--ready-timeout must be finite and positive")
     report = probe(args.memory_backend, args.output, ready_timeout=args.ready_timeout)
     print(json.dumps({"status": report["status"], "report": str(args.output.resolve() / "probe.json")}))
     return 0 if report["status"] == "passed" else 1

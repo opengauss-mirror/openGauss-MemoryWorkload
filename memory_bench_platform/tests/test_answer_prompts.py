@@ -141,3 +141,19 @@ def test_locomo_rejects_invalid_latest_date(value):
         "session_2": [{"text": "Later"}], "session_2_date_time": value}}
     with pytest.raises(ValueError, match="invalid date"):
         _question_date(sample)
+
+
+@pytest.mark.parametrize("raw", [
+    {"meta": {"agentMeta": {"provider": "test", "model": "actual"}}},
+    {"status": "ok", "result": {"meta": {"agentMeta": {"provider": "test", "model": "actual"}}}},
+    {"model": "actual", "provider": "test"},
+])
+def test_observed_model_supports_cli_and_http(tmp_path, raw):
+    from memory_bench_platform.answer_prompts import finalize_prompt_models
+    (tmp_path / "prompt_manifest.json").write_text('{"models": {}}')
+    artifacts = tmp_path / "artifacts/step-stdout"
+    artifacts.mkdir(parents=True)
+    (artifacts / "q-agent-answer.json").write_text(json.dumps({"raw": raw}))
+    finalize_prompt_models(tmp_path)
+    record = json.loads((tmp_path / "prompt_manifest.json").read_text())
+    assert record["models"]["answer"]["observed"] == [{"provider": "test", "model": "actual"}]
