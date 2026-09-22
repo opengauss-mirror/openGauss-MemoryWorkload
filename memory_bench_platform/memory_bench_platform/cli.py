@@ -77,7 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="backend_direct",
     )
     p_plan.add_argument("--hardware-profile")
-    p_plan.add_argument("--data-path")
+    plan_data = p_plan.add_mutually_exclusive_group()
+    plan_data.add_argument("--data-path")
+    plan_data.add_argument("--workload-config")
     p_plan.add_argument("--run-id")
     p_plan.add_argument("--version-override", action="append", default=[])
 
@@ -108,7 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="backend_direct",
     )
     p_run.add_argument("--hardware-profile")
-    p_run.add_argument("--data-path")
+    run_data = p_run.add_mutually_exclusive_group()
+    run_data.add_argument("--data-path")
+    run_data.add_argument("--workload-config")
     p_run.add_argument("--entrypoint")
     p_run.add_argument("--run-id")
     p_run.add_argument("--smoke-gate")
@@ -122,7 +126,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate.add_argument("--memory-backend")
     p_validate.add_argument("--trace")
     p_validate.add_argument("--source-path")
-    p_validate.add_argument("--data-path")
+    validate_data = p_validate.add_mutually_exclusive_group()
+    validate_data.add_argument("--data-path")
+    validate_data.add_argument("--workload-config")
     p_validate.add_argument("--api-base", default="https://ark.cn-beijing.volces.com/api/coding/v3")
     p_validate.add_argument("--api-key", default="")
     p_validate.add_argument("--vlm-model", default="doubao-seed-2.0-pro")
@@ -769,6 +775,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if getattr(args, "workload_config", None):
+        from .multi_user_cli import execute
+        execute(args, argv)
+        return
+
     if args.command == "list-skills":
         loaded = load_all_skills(SKILLS_ROOT)
         payload = {
@@ -819,6 +830,16 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "analyze-run":
         run_dir = Path(args.run_dir)
+        if (run_dir / "run_config.json").is_file():
+            try:
+                marker = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                marker = {}
+            if marker.get("schema") == "multi-user-run/1":
+                from .multi_user_report import import_report
+                import_report(run_dir)
+                print(str(run_dir))
+                return
         analyze_run(run_dir)
         print(str(run_dir))
         return

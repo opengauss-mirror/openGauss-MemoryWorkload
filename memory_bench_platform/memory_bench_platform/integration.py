@@ -386,7 +386,9 @@ def build_cases_from_source(
     )
 
 
-def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
+def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput, *,
+                   environment: dict[str, str] | None = None,
+                   timeout_seconds: float | None = None) -> dict:
     manifest = get_agent_manifest(skill_id)
     manifest_path = _manifest_path("agents", skill_id)
     if not manifest.entry.runner:
@@ -394,6 +396,8 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
     return run_json_script(
         _script_for_manifest(manifest_path, manifest.entry.runner),
         stdin_payload=rendered_input.model_dump(),
+        **({"environment": environment} if environment is not None else {}),
+        **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
     )
 
 
@@ -402,6 +406,7 @@ def run_memory_task(
     request: MemoryTaskInput,
     *,
     timeout_seconds: float | None = None,
+    environment: dict[str, str] | None = None,
 ) -> MemoryTaskOutput:
     manifest = get_memory_manifest(skill_id)
     manifest_path = _manifest_path("memories", skill_id)
@@ -412,6 +417,7 @@ def run_memory_task(
             _script_for_manifest(manifest_path, manifest.entry.runner),
             stdin_payload=request.model_dump(mode="json"),
             timeout_seconds=timeout_seconds,
+            **({"environment": environment} if environment is not None else {}),
         )
     except json.JSONDecodeError as exc:
         raise ValueError(f"memory skill {skill_id} runner returned invalid JSON") from exc
@@ -428,6 +434,9 @@ def run_memory_task(
 def run_memory_plugin_task(
     skill_id: str,
     request: MemoryPluginTaskInput,
+    *,
+    environment: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> MemoryPluginTaskOutput:
     manifest = get_memory_plugin_manifest(skill_id)
     manifest_path = _manifest_path("memory_plugins", skill_id)
@@ -437,6 +446,8 @@ def run_memory_plugin_task(
         payload = run_json_script(
             _script_for_manifest(manifest_path, manifest.entry.runner),
             stdin_payload=request.model_dump(mode="json"),
+            **({"environment": environment} if environment is not None else {}),
+            **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
         )
     except json.JSONDecodeError as exc:
         raise ValueError(f"memory plugin skill {skill_id} runner returned invalid JSON") from exc

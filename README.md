@@ -544,6 +544,10 @@ memory-bench run \
 
 Runner 在读取可选 trace 前保存客户端事件。指定 trace 文件读取失败或 JSON 损坏时，保留请求统计并降级为 exploratory；汇总的 `attribution_error` 记录 `trace_read_error` 或 `trace_parse_error`，不包含原始异常内容。报告导入仅接受 add/search 指标、数值字段和计数分布，拒绝未知字段及嵌套业务内容。
 
+### 多用户与多实例
+
+新增 `--workload-config workloads.yaml`：配置每个用户的 JSONL、固定目标实例和速率，支持 backend_direct 与 OpenClaw（`--agent openclaw`）、external/managed 实例，输出每用户/实例 JSON、CSV 与 HTML。详见 [多用户回放配置、隔离探针与报告说明](docs/multi-user-replay.md)。旧 `--data-path` 路径保持不变，两者互斥。
+
 ## 开发和验证
 
 常用轻量检查：
