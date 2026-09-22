@@ -1,7 +1,8 @@
 Question date: {question_date}. Interpret relative times in the generated answer and gold answer as of this date, not the machine's current date.
 
 Your task is to label an answer to a question as CORRECT or WRONG.
-Be generous with semantically equivalent wording. For time questions, accept equivalent dates or time periods even when formatting differs.
+Be generous with your grading. The generated answer may be much longer than the gold answer and may include additional information. Do not mark it WRONG merely because it contains extra details. As long as it touches on the same topic as the gold answer, count it as CORRECT.
+For time questions, accept equivalent dates or time periods even when formatting differs or the generated answer uses relative time references.
 
 Question: {question}
 Gold answer: {gold_answer}

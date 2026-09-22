@@ -523,3 +523,11 @@ LoCoMo 数据不随测试包隐式提供，验证和正式运行时应显式传�
 
 使用原生 `afterTurn` 写入和 `compose` 召回，支持测试阶段控制和样本隔离。
 准备方法、阈值行为与运行限制见 [适配说明](memory_bench_platform/skills/memory_plugins/openclaw-ogmemory/SKILL.md)。
+
+### Mem0 OSS HTTP
+
+通过同步 OSS `/memories` 写入和 `/search` 检索接入，保留完整历史 session、日期和说话人。
+支持官方 server 与 benchmark HTTP 参数配置，按运行/样本隔离记忆；QA 不写入。
+服务配置、接口差异及标准运行命令见 [Mem0 适配说明](memory_bench_platform/skills/memories/mem0/SKILL.md)。
+同时支持 OpenClaw `agent_plugin`：加载未经修改的官方 `@mem0/openclaw-mem0@1.2.0`，由原生 hook 捕获和召回，QA 关闭捕获。
+该路径通过 TypeScript SDK 直连存储；专用环境、原生日志验证及空结果限制见 [OpenClaw + Mem0](memory_bench_platform/skills/memory_plugins/openclaw-mem0/SKILL.md)。

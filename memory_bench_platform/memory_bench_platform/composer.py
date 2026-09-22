@@ -212,6 +212,9 @@ def _compose_backend_direct(
     cases: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
     action_timeouts = runtime_capabilities.get("memory", {}).get("action_timeouts_seconds", {})
+    ingest_timeout = int(action_timeouts.get("ingest", 30))
+    if ingest_timeout <= 0:
+        raise ValueError("memory ingest timeout must be positive")
     flush_timeout = int(action_timeouts.get("flush", 30))
     if flush_timeout <= 0:
         raise ValueError("memory flush timeout must be positive")
@@ -254,7 +257,7 @@ def _compose_backend_direct(
                         f"ingest_{timeline_event.event_id}",
                         "memory",
                         depends_on=[previous_step_id] if previous_step_id else [],
-                        timeout_seconds=30,
+                        timeout_seconds=ingest_timeout,
                         inputs={
                             "action": "ingest",
                             "content": _event_content(timeline_event),

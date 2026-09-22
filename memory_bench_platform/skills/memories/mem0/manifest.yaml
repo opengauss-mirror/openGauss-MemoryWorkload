@@ -1,0 +1,46 @@
+kind: memory
+id: mem0
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  targets:
+    - name: mem0
+      scope: memory_backend
+      version_source: runtime_observed_only
+      upstream: https://github.com/mem0ai/mem0
+      record_runtime_version: true
+  record_runtime_version: true
+entry:
+  runner: scripts/run_operation.py
+runtime:
+  benchmark_unit: session
+  actions: [ingest, recall]
+ingest:
+  benchmark_unit: session
+recall:
+  mode: native_search
+completion:
+  accept_signal: completed
+  complete_signal: completed
+integration:
+  protocol_version: memory/1
+capabilities:
+  actions: [ingest, recall]
+  async_ingest: false
+  action_timeouts_seconds:
+    ingest: 900
+    recall: 90
+  commit:
+    supported: false
+    required_after_ingest: false
+  readiness:
+    supported: false
+  scope:
+    supported: true
+    scoped_ingest: true
+    scoped_recall: true
+    isolation_level: episode
+  evidence_output: true
+  outputs:
+    ingest: [operation.session_id, output.session_id]
+    recall: [output.evidence_text]
