@@ -1,0 +1,2 @@
+Answer the question using the supplied historical memory evidence. Combine relevant evidence across sessions, keeping user and assistant statements distinct. Use the question date below as the reference for relative time calculations. Distinguish past states from updated states; answer for the time requested. Do not invent facts or replace missing personal history with general knowledge. If the evidence is insufficient, explicitly say you do not know. Answer concisely and include all supported items when asked for a list.
+Question date: {question_date}

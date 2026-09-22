@@ -586,3 +586,48 @@ def test_workflow_skips_qa_when_setup_case_fails(monkeypatch, tmp_path: Path):
     assert calls == ["setup-step"]
     assert qa_result.status == "skipped"
     assert "sample-setup" in qa_result.gate_detail
+
+
+def test_plugin_check_failures_are_archived_and_obey_fail_fast(monkeypatch, tmp_path):
+    import json
+    from memory_bench_platform.protocol import MemoryPluginTaskOutput
+    for action in ("before_agent", "after_agent"):
+        for fail_fast in (False, True):
+            target = tmp_path / (action + str(fail_fast))
+            calls = []
+            def agent(skill, request):
+                calls.append(request.task_id)
+                return {"status": "ok", "turns": [{"text": "answer"}],
+                        "raw": {"original": request.task_id}}
+            def plugin(skill, request):
+                failed = request.task_id == "s1:" + action
+                return MemoryPluginTaskOutput(status="failed" if failed else "ok",
+                    state="failed" if failed else "completed",
+                    error={"message": "check rejected"} if failed else {},
+                    output={"checked": not failed})
+            monkeypatch.setattr("memory_bench_platform.workflow.run_agent_task", agent)
+            monkeypatch.setattr("memory_bench_platform.workflow.run_memory_plugin_task", plugin)
+            cases = [CaseRecord(case_id=f"c{i}", run_id="r", title="test", goal="answer",
+                     capability="memory/question-answering", reference={"expected_answer": "answer"})
+                     for i in range(2)]
+            steps = [StepRecord(step_id=f"s{i}", case_id="c0" if i == 0 else "c1", name="answer",
+                     operator_kind="agent", gate_policy="hard", inputs={"question": "question"}) for i in range(3)]
+            context = WorkflowRuntimeContext(run_id="r", run_dir=str(target),
+                benchmark_id="locomo", agent_id="openclaw", memory_integration="agent_plugin",
+                memory_plugin_id="openclaw-ogmemory",
+                run_contract={"memory_plugin_runtime": {"actions": ["before_agent", "after_agent"]}})
+            output = execute_cases(run_id="r", agent_id="openclaw", cases=cases, steps=steps,
+                execution_spec=ExecutionSpec(fail_fast=fail_fast), runtime_context=context, run_dir=target)
+            assert output["step_results"][0].status == "passed"
+            failed = output["step_results"][1]
+            assert failed.status == "failed" and "check rejected" in failed.gate_detail
+            assert ("s2" in calls) is (not fail_fast)
+            archived = json.loads((target / failed.stdout_ref).read_text())
+            assert archived["plugin_checks"][action]["status"] == "failed"
+            if action == "after_agent":
+                assert archived["agent_answer"] == "answer"
+                assert archived["raw"] == {"original": "s1"}
+            else:
+                assert "s1" not in calls
+            assert output["judge_results"][0].passed is True
+            assert output["judge_results"][1].label == "runtime-error"

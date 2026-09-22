@@ -30,7 +30,7 @@ def dispatch_step_operator(
     poll_trace: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
     if step.operator_kind == "agent":
-        return _execute_agent(step, agent_id, agent_runner)
+        return _execute_agent(step, agent_id, agent_runner, runtime_context, memory_plugin_runner)
     if step.operator_kind == "wait":
         return _execute_wait(step, sleep)
     if step.operator_kind == "bash":
@@ -64,11 +64,16 @@ def _execute_agent(
     step: StepRecord,
     agent_id: str,
     agent_runner: Callable[..., dict[str, Any]],
+    runtime_context: WorkflowRuntimeContext,
+    memory_plugin_runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     messages = step.inputs.get("messages")
     if not isinstance(messages, list) or not messages:
         messages = [{"role": "user", "content": str(step.inputs.get("question", ""))}]
     metadata = dict(step.inputs.get("metadata", {}))
+    # Runtime binding is authoritative; task metadata must not select a plugin.
+    metadata["memory_integration"] = runtime_context.memory_integration
+    metadata["memory_plugin_id"] = runtime_context.memory_plugin_id
     metadata.setdefault("case_id", step.case_id)
     metadata.setdefault("step_id", step.step_id)
     rendered = RenderedTaskInput(
@@ -80,6 +85,37 @@ def _execute_agent(
         else [],
         metadata=metadata,
     )
+    # Optional checks belong to the bound plugin, not to an Agent implementation.
+    plugin_id = runtime_context.memory_plugin_id
+    actions = (runtime_context.run_contract.get("memory_plugin_runtime") or {}).get("actions", [])
+    checks = {}
+    def check(action, **inputs):
+        if runtime_context.memory_integration != "agent_plugin" or not plugin_id or action not in actions:
+            return {}
+        if memory_plugin_runner is None:
+            raise ValueError("declared Agent checks require a memory plugin runner")
+        response = memory_plugin_runner(plugin_id, MemoryPluginTaskInput(
+            task_id=f"{step.step_id}:{action}", action=action,
+            inputs={"agent_request": rendered.model_dump(mode="json"), **inputs},
+            runtime_context=runtime_context,
+            idempotency_key=f"{runtime_context.run_id}:{step.step_id}:{action}",
+        ))
+        checks[action] = response.model_dump(mode="json")
+        return response.output
+
+    def failed_check(action, result=None):
+        response = checks.get(action, {})
+        if not response or (response["status"] == "ok" and response["state"] == "completed"):
+            return None
+        return {**(result or {}), "status": "failed", "exit_code": 1,
+                "error_message": f"memory plugin {action} failed: " +
+                    str(response.get("error", {}).get("message") or response["state"]),
+                "plugin_checks": checks}
+
+    check_context = check("before_agent")
+    failure = failed_check("before_agent")
+    if failure is not None:
+        return failure
     result = agent_runner(agent_id, rendered)
     if not isinstance(result, dict):
         raise ValueError("agent runner returned a non-object response")
@@ -96,6 +132,12 @@ def _execute_agent(
         raise ValueError("successful agent runner response requires a final answer text")
     normalized = dict(result)
     normalized["agent_answer"] = answer
+    check("after_agent", check_context=check_context, agent_result=result)
+    failure = failed_check("after_agent", normalized)
+    if failure is not None:
+        return failure
+    if checks:
+        normalized["plugin_checks"] = checks
     return normalized
 
 

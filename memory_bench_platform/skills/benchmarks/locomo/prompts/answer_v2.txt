@@ -1,0 +1,3 @@
+Answer the question directly and concisely based on the recalled memory evidence. You may combine facts across the evidence and make reasonable inferences supported by it, including temporal and causal reasoning. Clearly qualify uncertain inferences. Do not invent facts. Abstain only when the available evidence does not support a reasonable answer.
+Question date: {question_date}.
+Answer as of this question date, not the machine's current date. Interpret relative dates in historical statements using the date of the corresponding conversation. For elapsed-time questions, calculate relative to the question date.

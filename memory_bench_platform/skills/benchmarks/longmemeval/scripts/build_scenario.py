@@ -1,9 +1,31 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def normalize_timestamp(value: str) -> str | None:
+    """Normalize native LongMemEval dates; retain already valid ISO dates.
+
+    Native dates have no timezone. Use UTC consistently with the adapters,
+    without changing the original timestamp shown in the historical content.
+    """
+    if not value:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value
+    except ValueError:
+        # Ignore the English weekday label so parsing is independent of locale.
+        native = re.fullmatch(r"(\d{4}/\d{2}/\d{2}) \([A-Za-z]{3}\) (\d{2}:\d{2})", value)
+        if not native:
+            raise ValueError(f"Unsupported LongMemEval timestamp: {value!r}")
+        stamp = datetime.strptime(" ".join(native.groups()), "%Y/%m/%d %H:%M")
+        return stamp.replace(tzinfo=timezone.utc).isoformat()
 
 
 def _session_content(session: list[dict[str, Any]], date: str, session_id: str) -> str:
@@ -42,7 +64,7 @@ def build_scenario(data_path: Path | None = None) -> dict[str, Any]:
                 {
                     "event_id": session_id,
                     "type": "conversation",
-                    "timestamp": date or None,
+                    "timestamp": normalize_timestamp(date),
                     "payload": {
                         "content": _session_content(session, date, session_id),
                         "messages": session,

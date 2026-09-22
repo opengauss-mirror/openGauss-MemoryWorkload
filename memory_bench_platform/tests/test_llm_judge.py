@@ -92,6 +92,20 @@ def test_llm_judge_uses_semantic_grade(monkeypatch):
     assert "May 7, 2023" in captured["body"]["messages"][1]["content"]
 
 
+def test_llm_judge_supports_gateway_header_and_reasoning_token_budget(monkeypatch):
+    monkeypatch.setenv("MEMORY_BENCH_JUDGE_API_KEY", "test-key")
+    monkeypatch.setenv("MEMORY_BENCH_JUDGE_BASE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("MEMORY_BENCH_JUDGE_MODEL", "reasoning-model")
+    monkeypatch.setenv("MEMORY_BENCH_JUDGE_USER_AGENT", "memory-bench/test")
+    monkeypatch.setenv("MEMORY_BENCH_JUDGE_MAX_TOKENS", "2048")
+    def opener(request, timeout):
+        assert request.get_header("User-agent") == "memory-bench/test"
+        assert json.loads(request.data)["max_tokens"] == 2048
+        return _FakeResponse({"choices":[{"message":{"content":'{"is_correct":"CORRECT"}'}}]})
+    result = run_llm_judge("run-1", _input(), runtime_config={"profile":"locomo_qa@1"}, urlopen=opener)
+    assert result.passed is True
+
+
 def test_llm_judge_does_not_fall_back_to_string_matching(monkeypatch):
     monkeypatch.delenv("MEMORY_BENCH_JUDGE_API_KEY", raising=False)
     monkeypatch.delenv("MEMORY_BENCH_JUDGE_BASE_URL", raising=False)

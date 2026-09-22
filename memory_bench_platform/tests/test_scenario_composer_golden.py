@@ -214,3 +214,29 @@ def test_scenario_rejects_duplicate_episode_ids():
     payload["samples"].append(payload["samples"][0])
     with pytest.raises(ValueError, match="sample_id values must be unique"):
         BenchmarkScenario.model_validate(payload)
+
+
+@pytest.mark.parametrize("integration", ["backend_direct", "agent_plugin"])
+def test_qa_sessions_are_isolated_across_checkpoints_and_runs(integration):
+    scenario = _scenario()
+    # The same question ID is valid at different checkpoints.
+    for sample in scenario.samples:
+        for event in sample.timeline:
+            if event.evaluation:
+                for question in event.evaluation.questions:
+                    question.question_id = "same-question"
+    binding = _binding(integration)
+    plan = compose_run_plan(scenario, binding)
+    keys = [step["inputs"]["metadata"]["session_key"] for step in plan["steps"]
+            if step["operator_kind"] == "agent"
+            and step["inputs"].get("metadata", {}).get("question_id")]
+    assert len(keys) >= 2 and len(set(keys)) == len(keys)
+    scopes = {step["inputs"]["metadata"]["scope_id"] for step in plan["steps"]
+              if step["operator_kind"] == "agent"}
+    assert scopes == {"run-golden:sample-1"}
+    binding.run_id = "another-run"
+    other = compose_run_plan(scenario, binding)
+    other_keys = [step["inputs"]["metadata"]["session_key"] for step in other["steps"]
+                  if step["operator_kind"] == "agent"
+            and step["inputs"].get("metadata", {}).get("question_id")]
+    assert set(keys).isdisjoint(other_keys)

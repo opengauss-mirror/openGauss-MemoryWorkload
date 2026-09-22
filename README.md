@@ -518,3 +518,8 @@ PYTHONPATH=. pytest -q
 
 测试文件通过项目路径定位 Skill、工具脚本和 Fixture，不依赖特定机器上的绝对路径。
 LoCoMo 数据不随测试包隐式提供，验证和正式运行时应显式传入 `--data-path`。
+
+### oGMemory + OpenClaw 插件模式
+
+使用原生 `afterTurn` 写入和 `compose` 召回，支持测试阶段控制和样本隔离。
+准备方法、阈值行为与运行限制见 [适配说明](memory_bench_platform/skills/memory_plugins/openclaw-ogmemory/SKILL.md)。

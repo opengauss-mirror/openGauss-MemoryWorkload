@@ -163,9 +163,18 @@ def build_openclaw_http_request(request: dict) -> tuple[str, dict[str, str], dic
 
     payload = {
         "model": f"openclaw/{agent_id}",
-        "input": build_openclaw_message(request),
+        "input": [
+            {"type": "message", "role": str(message.get("role", "user")),
+             "content": str(message.get("content", ""))}
+            for message in request.get("messages", [])
+        ],
         "stream": False,
     }
+    if request.get("attachments"):
+        payload["input"].append({"type": "message", "role": "user", "content":
+            "Attachments:\n" + "\n".join(str(x) for x in request["attachments"])})
+    if request.get("system_prompt"):
+        payload["instructions"] = str(request["system_prompt"])
     trace_metadata = {
         key: metadata[key]
         for key in ("run_id", "case_id", "step_id", "user_id", "session_id")
@@ -238,17 +247,21 @@ def run_openclaw_http(request: dict) -> dict:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OpenClaw HTTP {exc.code}: {detail}") from exc
     duration_ms = int((time.monotonic() - started) * 1000)
+    if payload.get("error") or payload.get("status") in {"failed", "cancelled", "incomplete"}:
+        raise RuntimeError("OpenClaw response failed or incomplete; inspect Gateway logs")
     text = extract_openclaw_response_text(payload)
     metadata = request.get("metadata", {})
-    configured_session_id = metadata.get("session_id")
     configured_session_key = metadata.get("session_key")
-    resolved_session_id = (
-        str(configured_session_id)
-        if configured_session_id
-        else session_id_from_key(str(configured_session_key))
-        if configured_session_key
-        else ""
-    )
+    agent_id = str(metadata.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID") or "main")
+    gateway_key = headers.get("X-OpenClaw-Session-Key", "").lower()
+    if gateway_key and not gateway_key.startswith("agent:"):
+        gateway_key = f"agent:{agent_id.lower()}:{gateway_key}"
+    # Gateway allocates a UUID; the CLI's deterministic hash is not its session ID.
+    resolved_session_id = ""
+    state_dir = Path(os.environ.get("OPENCLAW_STATE_DIR") or Path.home() / ".openclaw")
+    store = state_dir / "agents" / agent_id / "sessions/sessions.json"
+    if store.is_file() and gateway_key:
+        resolved_session_id = str(json.loads(store.read_text()).get(gateway_key, {}).get("sessionId") or "")
     return {
         "status": "ok",
         "agent": "openclaw",
@@ -262,7 +275,7 @@ def run_openclaw_http(request: dict) -> dict:
             "session_handle": {
                 "session_id": resolved_session_id,
                 "session_key": str(configured_session_key or ""),
-                "gateway_session_key": str(configured_session_key or ""),
+                "gateway_session_key": gateway_key,
             },
         },
         "turns": [{"text": text}] if text else [],
@@ -316,6 +329,7 @@ def main() -> None:
         "agent": "openclaw",
         "transport": "cli",
         "command": cmd,
+        "stderr": proc.stderr,
         "request": request,
         "raw": payload,
         "output": {

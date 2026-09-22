@@ -1,0 +1,31 @@
+kind: memory_plugin
+id: openclaw-ogmemory
+version: 0.2.0
+agent: openclaw
+memory: ogmemory
+entry:
+  runner: scripts/run_lifecycle.py
+runtime:
+  actions: [validate, prepare, set_phase, before_agent, after_agent, wait_ready, finalize]
+capabilities:
+  auto_capture: true
+  auto_recall: true
+  qa_read_only: true
+  namespace_isolation: true
+  extraction_trigger: agent_native_after_turn
+  commit:
+    supported: false
+    required_after_ingest: false
+  readiness:
+    supported: true
+    scoped_by_operation: true
+  outputs:
+    wait_ready: [state]
+phases:
+  ingest: {capture: true, recall: false}
+  qa: {capture: false, recall: true}
+integration:
+  protocol_version: memory-plugin/1
+lifecycle:
+  phases: [ingest, qa]
+  actions: [validate, prepare, set_phase, before_agent, after_agent, wait_ready, finalize]

@@ -1,3 +1,5 @@
+Question date: {question_date}. Interpret relative times in the generated answer and gold answer as of this date, not the machine's current date.
+
 Your task is to label an answer to a question as CORRECT or WRONG.
 Be generous with semantically equivalent wording. For time questions, accept equivalent dates or time periods even when formatting differs.
 

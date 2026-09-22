@@ -104,8 +104,9 @@ def test_openclaw_http_runner_puts_large_context_in_request_body(monkeypatch):
     assert resolve_transport() == "http"
     assert url == "http://127.0.0.1:38789/v1/responses"
     assert body["model"] == "openclaw/main"
-    assert large_context.strip() in body["input"]
-    assert len(body["input"]) > 300000
+    assert body["input"] == [{"type": "message", "role": "user", "content": large_context}]
+    assert body["instructions"] == "Use recalled evidence only."
+    assert "System instructions:" not in str(body["input"])
     assert headers["X-OpenClaw-Session-Key"] == "run-1:qa:q1"
     assert headers["X-OpenClaw-Model"] == "openai/gpt-5.6-luna"
     assert headers["Authorization"] == "Bearer secret-token"
@@ -172,3 +173,104 @@ def test_openclaw_http_runner_extracts_responses_api_text():
     }
 
     assert extract_openclaw_response_text(payload) == "answer from OpenClaw"
+
+
+def test_http_preserves_message_roles_and_keeps_instructions_separate():
+    request = {"system_prompt": "Question date: 2023-06-27. Follow these instructions.",
+               "messages": [{"role": "user", "content": "First question"},
+                            {"role": "assistant", "content": "First answer"},
+                            {"role": "user", "content": "Next question"}],
+               "metadata": {"agent_id": "main"}}
+    _, _, body = build_openclaw_http_request(request)
+    assert body["instructions"] == request["system_prompt"]
+    assert [m["role"] for m in body["input"]] == ["user", "assistant", "user"]
+    assert body["input"][-1]["content"] == "Next question"
+
+
+def test_http_reads_actual_gateway_uuid_and_rejects_missing_mapping(monkeypatch, tmp_path):
+    import json
+    import pytest
+    from io import BytesIO
+    from types import SimpleNamespace
+    from skills.agents.openclaw.scripts import run_task as runner
+    monkeypatch.setenv("OGMEM_PLUGIN_STATE_FILE", str(tmp_path / "phase.json"))
+    monkeypatch.setenv("OGMEM_GATEWAY_CONTAINER", "test-gateway")
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    store = tmp_path / "agents/main/sessions/sessions.json"
+    store.parent.mkdir(parents=True)
+    store.write_text(json.dumps({"agent:main:run:session": {"sessionId": "actual-uuid"}}))
+    monkeypatch.setattr(runner.urllib.request, "urlopen", lambda *a, **k: BytesIO(b'{"status":"completed","output_text":"ok"}'))
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
+    request = {"messages": [{"role": "user", "content": "Hello"}],
+               "metadata": {"agent_id": "main", "session_key": "run:session",
+                             "memory_integration": "agent_plugin", "memory_plugin_id": "openclaw-ogmemory"}}
+    output = runner.run_openclaw_http(request)["output"]
+    assert output["session_id"] == "actual-uuid"
+    assert output["session_handle"]["gateway_session_key"] == "agent:main:run:session"
+    store.write_text('{}')
+    assert runner.run_openclaw_http(request)["output"]["session_id"] == ""
+
+
+def test_http_failed_payload_is_not_a_successful_answer(monkeypatch):
+    import pytest
+    from io import BytesIO
+    from skills.agents.openclaw.scripts import run_task as runner
+    monkeypatch.setattr(runner.urllib.request, "urlopen", lambda *a, **k: BytesIO(b'{"status":"failed","error":{"message":"bad"}}'))
+    with pytest.raises(RuntimeError, match="failed or incomplete"):
+        runner.run_openclaw_http({"metadata": {"agent_id": "main"}, "messages": []})
+
+
+import pytest
+
+
+@pytest.mark.parametrize("transport", ["cli", "http"])
+@pytest.mark.parametrize("binding", [
+    {"memory_integration": "backend_direct", "memory_plugin_id": None},
+    {"memory_integration": "agent_plugin", "memory_plugin_id": "openclaw-openviking"},
+    {},
+])
+def test_unrelated_binding_ignores_stale_ogmemory_environment(monkeypatch, tmp_path, capsys, transport, binding):
+    import io
+    import json
+    from types import SimpleNamespace
+    from skills.agents.openclaw.scripts import run_task as runner
+
+    # A deleted old runtime must not be opened, nor its container logs queried.
+    monkeypatch.setenv("OGMEM_PLUGIN_STATE_FILE", str(tmp_path / "deleted-runtime/phase.json"))
+    monkeypatch.setenv("OPENCLAW_TRANSPORT", transport)
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("OGMEM_GATEWAY_CONTAINER", raising=False)
+    request = {"system_prompt": "Answer from evidence", "messages": [{"role": "user", "content": "Q"}],
+               "metadata": {"agent_id": "main", "session_key": "new-run:qa", "local": True, **binding}}
+    monkeypatch.setattr(runner.sys, "stdin", io.StringIO(json.dumps(request)))
+    def execute(cmd, **kwargs):
+        assert transport == "cli", "HTTP run must not execute Docker plugin checks"
+        return SimpleNamespace(stdout='{"output_text":"ok"}', stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", execute)
+    monkeypatch.setattr(runner, "build_openclaw_command", lambda req: ["openclaw"])
+    monkeypatch.setattr(runner.urllib.request, "urlopen", lambda *a, **kw:
+                        io.BytesIO(b'{"status":"completed","output_text":"ok"}'))
+    runner.main()
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+
+@pytest.mark.parametrize("mode,plugin", [
+    ("backend_direct", None),
+    ("agent_plugin", "openclaw-ogmemory"),
+    ("agent_plugin", "openclaw-openviking"),
+])
+def test_agent_operator_uses_runtime_binding_not_task_metadata(mode, plugin):
+    from memory_bench_platform.protocol import StepRecord, WorkflowRuntimeContext
+    from memory_bench_platform.workflow_operators import _execute_agent
+    context = WorkflowRuntimeContext(run_id="run", run_dir="/tmp/run", benchmark_id="locomo",
+        agent_id="openclaw", memory_integration=mode, memory_plugin_id=plugin)
+    step = StepRecord(step_id="qa", case_id="case", name="answer", operator_kind="agent",
+        inputs={"messages": [{"role": "user", "content": "Q"}],
+                "metadata": {"memory_integration": "agent_plugin", "memory_plugin_id": "stale-plugin"}})
+    seen = []
+    def invoke(agent, task):
+        seen.append(task.metadata)
+        return {"status": "ok", "turns": [{"text": "answer"}]}
+    _execute_agent(step, "openclaw", invoke, context)
+    assert seen[0]["memory_integration"] == mode
+    assert seen[0]["memory_plugin_id"] == plugin

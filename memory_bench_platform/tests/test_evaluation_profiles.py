@@ -122,4 +122,4 @@ def test_official_benchmark_profile_rejects_silent_scenario_override():
     governance = resolve_evaluation_governance(manifest, scenario)
     assert governance["official"] is False
     assert governance["override_reason"] == "ablation"
-    assert governance["judge_prompt_profile"] == "locomo_qa@1"
+    assert governance["judge_prompt_profile"] == "locomo_qa@2"

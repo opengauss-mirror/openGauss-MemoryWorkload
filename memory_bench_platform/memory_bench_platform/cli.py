@@ -29,6 +29,7 @@ from .evaluation_profiles import resolve_evaluation_governance
 from .benchmark_scenario import RunBinding
 from .compatibility import resolve_compatibility
 from .composer import compose_run_plan
+from .answer_prompts import load_answer_prompt, snapshot_prompts, finalize_prompt_models
 from .loader import load_agent_skill, load_all_skills, load_benchmark_skill, load_trace_skill
 from .paths import SKILLS_ROOT
 from .planner import RunPlanRequest, build_run_plan
@@ -693,12 +694,17 @@ def _prepare_native_cases(
                 raise ValueError(
                     f"runtime is incompatible with benchmark scenario: {missing}"
                 )
+            phase = "answer_prompt"
+            skill_dir = SKILLS_ROOT / "benchmarks" / args.benchmark
+            answer_prompt = load_answer_prompt(skill_dir, bundle.benchmark)
             phase = "composer"
             cases_payload = compose_run_plan(
                 scenario,
                 binding,
                 compatibility.resolved_capabilities,
+                answer_prompt=answer_prompt,
             )
+            snapshot_prompts(run_dir, answer_prompt, skill_dir, bundle.benchmark, args.memory_integration)
             storage.write_json_record(
                 run_dir,
                 "records/composed_run_plan.json",
@@ -1514,6 +1520,7 @@ def main(argv: list[str] | None = None) -> None:
         run_dir,
         _extract_case_result_rows(cases, judge_results, workflow_output["step_results"]),
     )
+    finalize_prompt_models(run_dir)
     analyze_run(run_dir)
     print(str(run_dir))
 

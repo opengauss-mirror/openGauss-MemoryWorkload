@@ -49,9 +49,9 @@ execution:
 judging:
   mode: external
   type: llm
-  profile: locomo_qa@1
+  profile: locomo_qa@2
   extractor: qa_answer
-  prompt_template: evaluation/llm_judge_prompt.txt
+  prompt_template: evaluation/llm_judge_prompt_v2.txt
   api_format: openai
   timeout_seconds: 60
   env:
@@ -73,3 +73,8 @@ evaluation:
   minimum_coverage: 1.0
   minimum_checkpoint_ready_rate: 1.0
   maximum_runtime_failure_rate: 0.0
+
+answering:
+  profile: locomo_answer@2
+  prompt_template: prompts/answer_v2.txt
+  required_fields: [question, question_date]

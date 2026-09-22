@@ -33,9 +33,9 @@ def test_build_run_contract_exposes_three_skill_runtime_contract():
     assert contract["memory_runtime"]["runner"] == "scripts/run_operation.py"
     assert contract["memory_runtime"]["supported_actions"] == ["ingest", "flush", "status", "recall"]
     judge_runtime = contract["judge_runtime"]
-    assert judge_runtime["profile"] == "locomo_qa@1"
+    assert judge_runtime["profile"] == "locomo_qa@2"
     assert judge_runtime["extractor"] == "qa_answer"
-    assert judge_runtime["prompt_template"] == "evaluation/llm_judge_prompt.txt"
+    assert judge_runtime["prompt_template"] == "evaluation/llm_judge_prompt_v2.txt"
     assert "Gold answer: {gold_answer}" in judge_runtime["prompt_template_text"]
     assert contract["evaluation_validity"] == {
         "minimum_coverage": 1.0,

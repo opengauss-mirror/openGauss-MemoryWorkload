@@ -63,3 +63,8 @@ evaluation:
   minimum_coverage: 1.0
   minimum_checkpoint_ready_rate: 1.0
   maximum_runtime_failure_rate: 0.0
+
+answering:
+  profile: longmemeval_answer@1
+  prompt_template: prompts/answer_v1.txt
+  required_fields: [question, question_date]
