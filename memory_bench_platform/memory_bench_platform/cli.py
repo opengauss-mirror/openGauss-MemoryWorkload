@@ -62,6 +62,25 @@ from .versioning import build_external_runner_env, build_version_selection
 from .workflow import execute_cases
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _execution_options(args, configured=None) -> ExecutionSpec:
+    values = dict(configured or {})
+    for name in ("qa_concurrency", "judge_concurrency"):
+        value = getattr(args, name, None)
+        if value is not None:
+            values[name] = value
+    spec = ExecutionSpec(**values)
+    if getattr(args, "memory_integration", "backend_direct") == "agent_plugin" and spec.qa_concurrency != 1:
+        raise ValueError("agent_plugin requires --qa-concurrency 1; use --judge-concurrency for parallel grading")
+    return spec
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memory-bench")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -115,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--smoke-gate")
     p_run.add_argument("--version-override", action="append", default=[])
     add_trace_arguments(p_run)
+    for command_parser in (p_plan, p_run):
+        command_parser.add_argument("--qa-concurrency", type=_positive_int, default=None,
+            help="Concurrent backend_direct QA cases per checkpoint (default: 1)")
+        command_parser.add_argument("--judge-concurrency", type=_positive_int, default=None,
+            help="Concurrent Judges for either integration mode (default: 1)")
 
     p_validate = sub.add_parser("validate")
     p_validate.add_argument("--benchmark")
@@ -774,6 +798,11 @@ def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command in {"run", "plan-run"}:
+        try:
+            _execution_options(args)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.command == "list-skills":
         loaded = load_all_skills(SKILLS_ROOT)
@@ -887,6 +916,7 @@ def main(argv: list[str] | None = None) -> None:
             _validate_installed_trace_protocols(planned_trace)
             planned_contract["trace_runtime"] = sanitized_trace_config(planned_trace)
         payload["run_contract"] = planned_contract
+        payload["execution_spec"] = _execution_options(args).model_dump(mode="json")
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
@@ -900,6 +930,10 @@ def main(argv: list[str] | None = None) -> None:
         args.memory_integration,
     )
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
+    if entrypoint.entrypoint_kind == "external_runner" and any(
+        getattr(args, name, None) not in (None, 1) for name in ("qa_concurrency", "judge_concurrency")
+    ):
+        parser.error("QA/Judge concurrency options require a native Workload entrypoint")
     source_kind = (
         "external_benchmark_runner"
         if entrypoint.entrypoint_kind == "external_runner"
@@ -1233,7 +1267,13 @@ def main(argv: list[str] | None = None) -> None:
             for item in cases_payload.get("cases", [])
         ]
         steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
-        execution_spec = ExecutionSpec(**cases_payload.get("execution_spec", {}))
+        execution_spec = _execution_options(args, cases_payload.get("execution_spec", {}))
+        cases_payload["execution_spec"] = execution_spec.model_dump(mode="json")
+        run_record.config.update(qa_concurrency=execution_spec.qa_concurrency,
+                                 judge_concurrency=execution_spec.judge_concurrency)
+        storage.write_run_record(run_dir, run_record)
+        storage.write_json_record(run_dir, "records/execution_spec.json", cases_payload["execution_spec"])
+        storage.write_json_record(run_dir, "records/composed_run_plan.json", cases_payload)
     except Exception as exc:
         _archive_run_failure(
             storage=storage,

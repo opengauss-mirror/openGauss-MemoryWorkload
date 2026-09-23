@@ -413,7 +413,7 @@ def run(request):
                                   "scope_id": inputs.get("scope_id", state.get("scope_id") if state.get("owner") == owner else None),
                                   "output": output, "at": time.time()}) + "\n")
     return {"protocol_version": "memory-plugin/1", "status": "ok", "state": "completed",
-            "operation": {}, "output": output, "metrics": [], "artifacts": artifacts, "error": {}}
+            "operation": output.get("operation", {}), "output": output, "metrics": [], "artifacts": artifacts, "error": {}}
 
 
 def main():

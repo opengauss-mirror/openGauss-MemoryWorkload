@@ -430,3 +430,61 @@ def test_readiness_requires_compact_receipt(runtime):
     run("prepare", scope_id="run:a")
     with pytest.raises(ValueError, match="successful compact"):
         run("wait_ready", scope_id="run:a", session_handle={"session_id": "buffered"})
+
+
+@pytest.mark.parametrize("compacted", [True, False])
+def test_commit_through_framework_subprocess_protocol(runtime, tmp_path, monkeypatch, compacted):
+    import hashlib
+    import os
+    import sys
+    from memory_bench_platform.integration import run_memory_plugin_task
+    from memory_bench_platform.protocol import MemoryPluginTaskInput, WorkflowRuntimeContext
+
+    state, module, run = runtime
+    run("prepare", scope_id="run:a")
+    data = json.loads(state.read_text())
+    data.update(gateway_ready=True,
+                config_sha256=hashlib.sha256(state.with_name("openclaw.json").read_bytes()).hexdigest())
+    module.save(state, data)
+    monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state.parent / "state"))
+    monkeypatch.setenv("OGMEM_GATEWAY_CONTAINER", "dedicated")
+    # Exercise the real lifecycle JSON subprocess and framework validation;
+    # replace only the external Docker/Gateway boundary.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text(f"#!{sys.executable}\n" + """import json, os, sys
+from pathlib import Path
+runtime = str(Path(os.environ["OGMEM_PLUGIN_STATE_FILE"]).parent)
+if sys.argv[1:] == ["inspect", "dedicated"]:
+    print(json.dumps([{"Config": {"Labels": {"memory-bench.runtime": runtime}},
+                       "Mounts": [{"Source": runtime}]}]))
+else:
+    assert sys.argv[1:7] == ["exec", "dedicated", "openclaw", "gateway", "call", "sessions.compact"]
+    key = json.loads(sys.argv[sys.argv.index("--params") + 1])["key"]
+    print(json.dumps({"ok": True, "compacted": """ + repr(compacted) + """, "key": key}))
+""")
+    docker.chmod(0o700)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    result = run_memory_plugin_task("openclaw-ogmemory", MemoryPluginTaskInput(
+        task_id="commit-history", action="commit", idempotency_key="commit-history",
+        scope_id="run:a", checkpoint_id="checkpoint",
+        runtime_context=WorkflowRuntimeContext(run_id="run", run_dir=str(tmp_path / "run"),
+            benchmark_id="locomo", agent_id="openclaw", memory_integration="agent_plugin",
+            memory_plugin_id="openclaw-ogmemory"),
+        inputs={"scope_id": "run:a", "session_handle": {
+            "session_id": "native-id", "gateway_session_key": "agent:main:ingest"}}))
+    if not compacted:
+        assert result.status == "failed"
+        assert "did not confirm compaction" in result.error["message"]
+        assert "task_id" not in result.operation
+        return
+    assert result.status == "ok"
+    assert result.operation == result.output["operation"]
+    assert result.operation["task_id"] == "compact-" + module.digest("run:a:native-id")
+    assert result.operation["session_id"] == "native-id"
+    assert result.operation["gateway_session_key"] == "agent:main:ingest"
+    assert result.operation["checkpoint_id"] == "checkpoint"
+    assert result.operation["scope_id"] == "run:a"
+    assert result.operation["compact_completed"] is True

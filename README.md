@@ -519,6 +519,39 @@ PYTHONPATH=. pytest -q
 测试文件通过项目路径定位 Skill、工具脚本和 Fixture，不依赖特定机器上的绝对路径。
 LoCoMo 数据不随测试包隐式提供，验证和正式运行时应显式传入 `--data-path`。
 
+### QA 与 Judge 并发
+
+原生 Workload 支持以下可选参数，默认值均为 `1`，保持串行执行：
+
+```bash
+# backend_direct：同一 checkpoint 内并发 QA，同时并发评分
+python -m memory_bench_platform.cli run \
+  --benchmark locomo --agent openclaw --memory-backend ogmemory \
+  --memory-integration backend_direct --data-path /path/to/locomo.json \
+  --qa-concurrency 4 --judge-concurrency 4 --run-id ogmem-direct-parallel
+
+# agent_plugin：Agent 调用仍串行，回答完成后异步进入评分队列
+python -m memory_bench_platform.cli run \
+  --benchmark locomo --agent openclaw --memory-backend ogmemory \
+  --memory-integration agent_plugin --data-path /path/to/locomo.json \
+  --judge-concurrency 4 --run-id ogmem-plugin-parallel-judge
+```
+
+命令沿用各适配器的模型、后端和独立 runtime 配置；可将 `ogmemory` 换为
+`openviking` 或 `mem0`。也可在 scenario 的 `execution_spec` 中设置
+`qa_concurrency` / `judge_concurrency`，显式 CLI 参数优先。
+
+- 仅具有独立 session 的标准 QA case 在同一 sample/checkpoint 内并发；每题内部仍先召回、后回答。
+- 历史写入、compact 和 readiness 保持顺序；下一 checkpoint 或 sample 开始前等待全部 QA 和评分结束。
+- `agent_plugin` 不接受大于 `1` 的 `--qa-concurrency`；此阶段没有并发调用共享插件 runtime。
+- Judge 队列独立且提交数量有界，某题评分失败保留原始回答并记为未评分，不丢弃其他结果。
+- 完成顺序不影响最终报告排序。`records/execution_spec.json` 和 run 配置记录并发设置；
+  `records/case-progress/` 在每题执行及评分结束后原子保存进度，异常中断后可用于排查，
+  尚不提供自动续跑。
+- 这些参数不控制外部 benchmark runner，也不会自动提高 Gateway/模型服务的并发上限。
+  回答和 Judge 共用模型接口时，两队列会竞争同一额度，建议先用 `2` 或 `4`，按限流情况调整。
+  比较耗时应使用运行起止时间；并发任务耗时之和不是总墙钟时间。
+
 ### oGMemory + OpenClaw 插件模式
 
 关闭自动 `afterTurn` 写入，通过原生 `sessions.compact` 提交历史，使用 `compose` 召回；支持测试阶段控制和样本隔离。
