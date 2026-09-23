@@ -6,26 +6,27 @@ memory: ogmemory
 entry:
   runner: scripts/run_lifecycle.py
 runtime:
-  actions: [validate, prepare, set_phase, before_agent, after_agent, wait_ready, finalize]
+  actions: [validate, prepare, set_phase, before_agent, after_agent, commit, wait_ready, finalize]
 capabilities:
-  auto_capture: true
+  auto_capture: true  # Native transcript capture is performed by commit/compact.
   auto_recall: true
   qa_read_only: true
   namespace_isolation: true
-  extraction_trigger: agent_native_after_turn
+  extraction_trigger: agent_native_compact
   commit:
-    supported: false
-    required_after_ingest: false
+    supported: true
+    required_after_ingest: true
   readiness:
     supported: true
     scoped_by_operation: true
   outputs:
+    commit: [operation.task_id]
     wait_ready: [state]
 phases:
-  ingest: {capture: true, recall: false}
+  ingest: {capture: false, recall: false}
   qa: {capture: false, recall: true}
 integration:
   protocol_version: memory-plugin/1
 lifecycle:
   phases: [ingest, qa]
-  actions: [validate, prepare, set_phase, before_agent, after_agent, wait_ready, finalize]
+  actions: [validate, prepare, set_phase, before_agent, after_agent, commit, wait_ready, finalize]

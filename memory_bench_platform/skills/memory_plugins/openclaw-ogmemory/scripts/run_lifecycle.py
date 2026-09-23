@@ -1,4 +1,4 @@
-"""memory-plugin/1 lifecycle using native oGMemory capture/recall switches."""
+"""memory-plugin/1 lifecycle using native oGMemory compact and recall."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -44,6 +44,7 @@ def prepare_runtime(source_config, upstream, destination, api_url, runtime_path=
                     ignore=shutil.ignore_patterns("node_modules", ".git", "__pycache__"))
     entry = {"mode": "remote", "memoryApiBaseUrl": api_url,
              "autoCapture": False, "autoRecall": False,
+             "compactTakeoverEnabled": True, "shortTermIndexMode": "async",
              "prefetchEnabled": False, "toolResultExternalizationEnabled": False,
              "toolResultFirstViewExternalizationEnabled": False, "traceCaptureContent": False}
     if os.environ.get("OGMEM_API_KEY"):
@@ -73,7 +74,7 @@ def prepare_runtime(source_config, upstream, destination, api_url, runtime_path=
         "upstream_plugin_sha256": hashlib.sha256((upstream / "index.js").read_bytes()).hexdigest(),
         "upstream_schema_sha256": hashlib.sha256((upstream / "openclaw.plugin.json").read_bytes()).hexdigest(),
         "phase_control": "native_autoCapture_autoRecall",
-        "extraction_trigger": "agent_native_after_turn"})
+        "extraction_trigger": "agent_native_compact"})
     return target
 
 
@@ -102,7 +103,8 @@ def configure(path, config, state, phase):
     entry.update(state.get("identity", {}))
     if state.get("identity"):
         entry["authAccountId"] = state["identity"]["accountId"]
-    entry.update(autoCapture=phase == "ingest", autoRecall=phase == "qa")
+    entry.update(autoCapture=False, autoRecall=phase == "qa",
+                 compactTakeoverEnabled=True, shortTermIndexMode="async")
     save(path.with_name("openclaw.json"), config)
     # Mark the new state usable only after the dedicated Gateway has loaded it.
     save(path, {**state, "phase": phase, "gateway_ready": False})
@@ -145,12 +147,46 @@ def wait_gateway(config):
     raise TimeoutError("Dedicated OpenClaw Gateway did not become ready")
 
 
+def commit(path, state, inputs):
+    """Invoke the native context engine on the actual Gateway transcript."""
+    if state.get("phase") != "ingest" or inputs.get("scope_id") != state["scope_id"]:
+        raise ValueError("Compact requires the active ingest scope")
+    if os.environ.get("OPENCLAW_TRANSPORT") != "http":
+        raise ValueError("Native compact requires the dedicated HTTP Gateway")
+    if not state.get("gateway_ready") or state.get("config_sha256") != hashlib.sha256(path.with_name("openclaw.json").read_bytes()).hexdigest():
+        raise ValueError("oGMemory Gateway has not loaded the active config")
+    handle = inputs.get("session_handle") or {}
+    sid, key = handle.get("session_id"), handle.get("gateway_session_key")
+    if not sid or not key:
+        raise ValueError("Compact requires the actual Gateway session ID and key")
+    # Run the CLI inside the owned container, using its existing config/auth.
+    proc = subprocess.run(["docker", "exec", gateway_container(path), "openclaw",
+        "gateway", "call", "sessions.compact", "--params", json.dumps({"key": key}),
+        "--json", "--timeout", "600000"], check=True, capture_output=True,
+        text=True, timeout=630)
+    text = proc.stdout.strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        result = json.loads(text[text.find("{"):text.rfind("}") + 1])
+    if not isinstance(result, dict) or result.get("ok") is not True or result.get("compacted") is not True:
+        raise RuntimeError("Native sessions.compact did not confirm compaction")
+    if result.get("key") != key:
+        raise RuntimeError("Native compact returned a different Gateway session key")
+    operation = {"task_id": "compact-" + digest(state["scope_id"] + ":" + sid),
+                 "session_id": sid, "gateway_session_key": key,
+                 "scope_id": state["scope_id"], "compact_completed": True}
+    return {"operation": operation, "compact_result": result,
+            "extraction_trigger": "agent_native_compact"}
+
+
 def wait_ready(base, state, inputs):
     if inputs.get("scope_id") != state["scope_id"]:
         raise ValueError("Readiness scope does not match active episode")
-    sid = (inputs.get("session_handle") or {}).get("session_id")
-    if not sid:
-        raise ValueError("Native agent session_handle.session_id is required")
+    operation = inputs.get("operation") or {}
+    sid = operation.get("session_id")
+    if not sid or operation.get("compact_completed") is not True or operation.get("scope_id") != state["scope_id"]:
+        raise ValueError("Readiness requires a successful compact operation for the active scope")
     identity = state["identity"]
     body = {"sessionId": sid, "timeoutSeconds": 1, "drainOutbox": False, "waitOutbox": False}
     timeout = float(inputs.get("timeout_seconds", 600))
@@ -162,7 +198,7 @@ def wait_ready(base, state, inputs):
     def remaining():
         budget = deadline - time.monotonic()
         if budget <= 0:
-            raise TimeoutError("Native capture/indexing did not settle before deadline")
+            raise TimeoutError("Native compact/indexing did not settle before deadline")
         return budget
 
     def request(path, payload, **kwargs):
@@ -175,22 +211,18 @@ def wait_ready(base, state, inputs):
         idle = request("/api/v1/call/wait_until_idle", body)
         # Do not call GET session first: that endpoint can create an empty session.
         if idle.get("reason") == "session_not_found":
-            raise RuntimeError("Native capture session missing; inspect OpenClaw/backend logs")
+            raise RuntimeError("Native compact session missing; inspect OpenClaw/backend logs")
         if idle.get("idle") is True:
             session = request("/api/v1/sessions/" + urllib.parse.quote(sid, safe=""),
                               {}, method="GET")
             if int(session.get("message_count", 0)) <= 0 and int(session.get("commit_count", 0)) <= 0:
-                raise RuntimeError("Native capture has no accepted history")
+                raise RuntimeError("Native compact has no accepted history")
             if int(session.get("commit_count", 0)) == 0:
-                # An idle buffer does not prove extraction; preserve native threshold behavior.
-                remaining()
-                return {"session_id": sid, "history_archived": False,
-                        "reason": "buffered_without_archive", "session": session,
-                        "backend_result": idle}
+                raise RuntimeError("Native compact has no archived history")
             drained = request("/api/v1/call/wait_until_idle",
                               {**body, "drainOutbox": True})
             if drained.get("reason") == "session_not_found" or int((drained.get("drain") or {}).get("failed", 0)):
-                raise RuntimeError("Captured session missing or indexing failed")
+                raise RuntimeError("Compacted session missing or indexing failed")
             settled = request("/api/v1/call/wait_until_idle",
                               {**body, "waitOutbox": True})
             outbox = settled.get("outbox") or {}
@@ -199,14 +231,13 @@ def wait_ready(base, state, inputs):
             if settled.get("idle") is True and "total" in outbox and int(outbox["total"]) == 0:
                 remaining()
                 return {"session_id": sid, "history_archived": True, "session": session,
-                        "backend_result": settled, "extraction_trigger": "agent_native_after_turn"}
+                        "backend_result": settled, "extraction_trigger": "agent_native_compact"}
         time.sleep(min(interval, remaining()))
 
 
 def check_ogmemory_hook_errors(text, phase=None):
     failures = [line for line in text.splitlines()
-                if "[og-memory]" in line and any(marker in line.lower() for marker in ("http ", "failed", "compose returned null"))
-                and not (phase == "ingest" and "HTTP 503 from after_turn" in line and '"status":"processing"' in line)]
+                if "[og-memory]" in line and any(marker in line.lower() for marker in ("http ", "failed", "compose returned null"))]
     if failures:
         details = [m.group(0) for line in failures
                    if (m := re.search(r"HTTP (?:[0-9]+ from )?[a-z_]+|compose returned null|failed", line, re.I))]
@@ -247,7 +278,8 @@ def before_agent(path, config, state, request):
     if metadata.get("scope_id") != state.get("scope_id"):
         raise ValueError("oGMemory runtime scope does not match this task")
     entry = config["plugins"]["entries"][PLUGIN]["config"]
-    if (entry.get("autoCapture") is not (phase == "ingest")
+    if (entry.get("autoCapture") is not False
+            or entry.get("compactTakeoverEnabled") is not True
             or entry.get("autoRecall") is not (phase == "qa")
             or any(entry.get(k) != v for k, v in state["identity"].items())
             or entry.get("authAccountId") != state["identity"]["accountId"]):
@@ -343,10 +375,13 @@ def run(request):
                          "userId": "mbp-user-" + suffix, "agentId": "mbp-agent-" + suffix}}
         configure(path, config, state, "ingest")
         provenance = path.with_name("provenance.json")
+        provenance_data = json.loads(provenance.read_text()) if provenance.exists() else {}
+        provenance_data["extraction_trigger"] = "agent_native_compact"
+        save(provenance, provenance_data)
         output = {"scope_id": scope, "identity": state["identity"],
-                  "extraction_trigger": "agent_native_after_turn",
+                  "extraction_trigger": "agent_native_compact",
                   "runtime_version": os.environ.get("OGMEM_RUNTIME_VERSION", "unrecorded"),
-                  "provenance": json.loads(provenance.read_text()) if provenance.exists() else {}}
+                  "provenance": provenance_data}
     elif action == "finalize":
         configure(path, config, {**state, "active": False}, "inactive")
         output = {"inactive": True}
@@ -365,7 +400,9 @@ def run(request):
             if phase not in ("ingest", "qa"):
                 raise ValueError("phase must be ingest or qa")
             configure(path, config, state, phase)
-            output = {"phase": phase, "autoCapture": phase == "ingest", "autoRecall": phase == "qa"}
+            output = {"phase": phase, "autoCapture": False, "autoRecall": phase == "qa"}
+        elif action == "commit":
+            output = commit(path, state, inputs)
         elif action == "wait_ready":
             output = wait_ready(entry["config"]["memoryApiBaseUrl"], state, inputs)
         else:

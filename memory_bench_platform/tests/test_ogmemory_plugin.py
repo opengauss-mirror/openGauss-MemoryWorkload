@@ -57,7 +57,7 @@ def test_native_configuration_phases_isolation_and_finalize(runtime):
     run("prepare", scope_id="run:a")
     identity_a = json.loads(state.read_text())["identity"]
     assert entry(state)["authAccountId"] == identity_a["accountId"]
-    assert entry(state)["autoCapture"] is True and entry(state)["autoRecall"] is False
+    assert entry(state)["autoCapture"] is False and entry(state)["autoRecall"] is False
     run("set_phase", phase="qa")
     assert entry(state)["autoCapture"] is False and entry(state)["autoRecall"] is True
     assert entry(state)["userId"] == identity_a["userId"]
@@ -106,12 +106,12 @@ def test_wait_uses_native_session_and_checks_index(runtime, monkeypatch):
             return {"message_count": 2, "commit_count": 1, "pending_tokens": 0}
         return {"idle": True, "reason": "idle", "drain": {"failed": 0}, "outbox": {"total": 0}}
     monkeypatch.setattr(module, "backend", backend)
-    result = run("wait_ready", scope_id="run:a", session_handle={"session_id": "native-id"})
+    result = run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "native-id"})
     assert result["output"]["history_archived"] is True
     assert len(calls) == 4 and calls[0][1]["sessionId"] == "native-id"
     assert all(c[2] == identity for c in calls)
     with pytest.raises(ValueError, match="scope"):
-        run("wait_ready", scope_id="wrong", session_handle={"session_id": "native-id"})
+        run("wait_ready", scope_id="wrong", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "native-id"})
 
 
 @pytest.mark.parametrize("kind", ["missing", "empty", "index_failure", "unsupported"])
@@ -125,7 +125,7 @@ def test_no_false_readiness(runtime, monkeypatch, kind):
                 "outbox": {"total": 0, "supported": kind != "unsupported"}}
     monkeypatch.setattr(module, "backend", backend)
     with pytest.raises(RuntimeError):
-        run("wait_ready", scope_id="run:a", session_handle={"session_id": "native"})
+        run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "native"})
 
 
 def test_short_history_is_buffered_not_reported_as_extracted(runtime, monkeypatch):
@@ -134,16 +134,15 @@ def test_short_history_is_buffered_not_reported_as_extracted(runtime, monkeypatc
         calls.append(path)
         return {"message_count": 2, "commit_count": 0, "pending_tokens": 40} if kw.get("method") == "GET" else {"idle": True}
     monkeypatch.setattr(module, "backend", backend)
-    result = run("wait_ready", scope_id="run:a", session_handle={"session_id": "short"})
-    assert result["output"]["history_archived"] is False
-    assert result["output"]["reason"] == "buffered_without_archive"
+    with pytest.raises(RuntimeError, match="no archived history"):
+        run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "short"})
     assert len(calls) == 2
 
 
 def test_timeout_and_gateway_rejection(runtime, monkeypatch):
     _, module, run = runtime; run("prepare", scope_id="run:a")
     with pytest.raises(TimeoutError):
-        run("wait_ready", scope_id="run:a", session_handle={"session_id": "native"}, timeout_seconds=0)
+        run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "native"}, timeout_seconds=0)
     monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
     with pytest.raises(ValueError, match="OGMEM_GATEWAY_CONTAINER"):
         run("validate")
@@ -173,7 +172,7 @@ def test_gateway_control_rejects_unowned_container(runtime, monkeypatch):
         module.gateway_container(state)
 
 
-def test_plugin_resolves_and_plan_waits_on_native_capture():
+def test_plugin_resolves_and_plan_commits_before_waiting():
     bundle = resolve_run_skill_bundle("longmemeval", "openclaw", "ogmemory", "agent_plugin")
     scenario = BenchmarkScenario.model_validate({"benchmark_id": "longmemeval", "samples": [{
         "sample_id": "a", "timeline": [
@@ -187,8 +186,11 @@ def test_plugin_resolves_and_plan_waits_on_native_capture():
     assert compatibility.compatible
     plan = compose_run_plan(scenario, binding, compatibility.resolved_capabilities)
     waits = [s for s in plan["steps"] if s["inputs"].get("action") == "wait_ready"]
-    assert len(waits) == 1 and "session_handle" in waits[0]["inputs"]
-    assert not any(s["inputs"].get("action") == "commit" for s in plan["steps"])
+    commits = [s for s in plan["steps"] if s["inputs"].get("action") == "commit"]
+    assert len(waits) == len(commits) == 1
+    assert "session_handle" in commits[0]["inputs"]
+    assert waits[0]["inputs"]["operation"] == {"$ref": f"steps.{commits[0]['step_id']}.output.operation"}
+    assert commits[0]["step_id"] in waits[0]["depends_on"]
 
 
 @pytest.mark.parametrize("failure", ["scope", "local", "phase", "hook", "missing_plugin", None])
@@ -301,12 +303,10 @@ def test_qa_requires_current_session_success_receipt(runtime, monkeypatch, kind)
 
 
 @pytest.mark.parametrize("phase", ["ingest", "qa"])
-def test_processing_exception_is_ingest_only(phase):
+def test_after_turn_processing_is_no_longer_expected(phase):
     module = load()
     text = '[og-memory] HTTP 503 from after_turn: {"status":"processing"}'
-    if phase == "ingest": module.check_ogmemory_hook_errors(text, phase)
-    else:
-        with pytest.raises(RuntimeError): module.check_ogmemory_hook_errors(text, phase)
+    with pytest.raises(RuntimeError): module.check_ogmemory_hook_errors(text, phase)
 
 
 @pytest.mark.parametrize("metadata, expected", [
@@ -366,7 +366,7 @@ def test_readiness_rejects_success_after_deadline(runtime, monkeypatch, slow_cal
         return {"idle": True, "outbox": {"total": 0}}
     monkeypatch.setattr(module, "backend", backend)
     with pytest.raises(TimeoutError):
-        run("wait_ready", scope_id="run:a", session_handle={"session_id": "s"}, timeout_seconds=0.5)
+        run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "s"}, timeout_seconds=0.5)
     assert len(calls) == slow_call
 
 
@@ -381,6 +381,52 @@ def test_readiness_sleep_is_limited_to_remaining_budget(runtime, monkeypatch):
         clock[0] += seconds
     monkeypatch.setattr(module.time, "sleep", sleep)
     with pytest.raises(TimeoutError):
-        run("wait_ready", scope_id="run:a", session_handle={"session_id": "s"},
+        run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "s"},
             timeout_seconds=0.5, interval_seconds=2)
     assert sleeps == [0.5]
+
+
+@pytest.mark.parametrize("kind", ["ok", "false", "wrong_key", "failed", "missing_handle", "wrong_scope", "qa", "stale_config"])
+def test_commit_uses_native_gateway_transcript(runtime, monkeypatch, kind):
+    import hashlib
+    from types import SimpleNamespace
+    state, module, run = runtime
+    run("prepare", scope_id="run:a")
+    data = json.loads(state.read_text())
+    data.update(gateway_ready=True, config_sha256=hashlib.sha256(state.with_name("openclaw.json").read_bytes()).hexdigest())
+    if kind == "qa": data["phase"] = "qa"
+    if kind == "stale_config": data["config_sha256"] = "stale"
+    module.save(state, data)
+    monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state.parent / "state"))
+    monkeypatch.setattr(module, "gateway_container", lambda path: "dedicated")
+    calls = []
+    def compact(cmd, **kw):
+        calls.append(cmd)
+        assert cmd[:7] == ["docker", "exec", "dedicated", "openclaw", "gateway", "call", "sessions.compact"]
+        assert json.loads(cmd[cmd.index("--params") + 1]) == {"key": "agent:main:ingest"}
+        assert kw["timeout"] == 630
+        return SimpleNamespace(stdout="plugin loaded\n" + json.dumps({"ok": kind != "failed",
+            "compacted": kind != "false", "key": "other" if kind == "wrong_key" else "agent:main:ingest"}))
+    monkeypatch.setattr(module.subprocess, "run", compact)
+    inputs = {"scope_id": "wrong" if kind == "wrong_scope" else "run:a",
+              "session_handle": {} if kind == "missing_handle" else {
+                  "session_id": "native-id", "gateway_session_key": "agent:main:ingest"}}
+    if kind != "ok":
+        with pytest.raises((ValueError, RuntimeError)): run("commit", **inputs)
+        if kind in ("missing_handle", "wrong_scope", "qa", "stale_config"): assert not calls
+        return
+    result = run("commit", **inputs)["output"]
+    assert result["operation"]["session_id"] == "native-id"
+    assert result["operation"]["compact_completed"] is True
+    assert result["extraction_trigger"] == "agent_native_compact"
+    monkeypatch.setattr(module, "backend", lambda *a, **kw:
+        {"commit_count": 1} if kw.get("method") == "GET" else {"idle": True, "outbox": {"total": 0}})
+    assert run("wait_ready", scope_id="run:a", operation=result["operation"])["output"]["history_archived"]
+
+
+def test_readiness_requires_compact_receipt(runtime):
+    _, _, run = runtime
+    run("prepare", scope_id="run:a")
+    with pytest.raises(ValueError, match="successful compact"):
+        run("wait_ready", scope_id="run:a", session_handle={"session_id": "buffered"})

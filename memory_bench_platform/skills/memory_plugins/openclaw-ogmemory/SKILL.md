@@ -7,11 +7,14 @@
 
 | 阶段 | autoCapture | autoRecall |
 |---|---|---|
-| ingest | true | false |
+| ingest | false | false |
 | QA | false | true |
 | 初始化 / finalize | false | false |
 
-- 历史通过原生 `afterTurn` 自动写入，QA 通过 `assemble/compose` 召回。
+- 历史先保存在独立 OpenClaw session 的 transcript 中；Workload 的 `commit` 步骤通过
+  专用 Gateway 的 `sessions.compact` 调用原生 context engine，完成历史写入与归档。
+  `autoCapture=false` 跳过 `ingest` / `afterTurn` 的自动写入；QA 通过 `assemble/compose` 召回。
+- 明确开启原生 `compactTakeoverEnabled`，使用 `shortTermIndexMode=async`，不修改插件源码。
 - 基准测试使用 HTTP `/v1/responses`：回答/写入指令放 `instructions`，用户内容放 `input`。
   指令不再拼入检索文本。带基准指令的任务不支持 CLI `--message` 回退。
 - `run_lifecycle.py` 更新专用配置、重启专用 Docker Gateway 并等待就绪，再记录已加载的配置哈希。
@@ -19,16 +22,14 @@
 - HTTP 会话 ID 从 Gateway 的 `sessions.json` 读取，不使用 CLI 的哈希值代替。
 - 每个 run + sample 使用独立 account/user/agent，同时设置匹配的 `authAccountId`。
   历史与 QA 使用相同记忆身份，每个问题使用独立 OpenClaw session。
-- 原生插件不再注入 `wait=true`。历史输入结束后先等待后台空闲，再核对实际 session 的
-  message_count / commit_count；已归档历史还必须等待 outbox 清空。缺失/空会话、索引错误
-  和超时不能当作成功。
-- 未归档历史记录 `history_archived=false, reason=buffered_without_archive`，不强制 compact。
-  这通常是输入未达到后端阈值；仅凭此结果不能区分所有抽取失败，需结合后端日志。
-  idle / commit_count 也不能证明抽取内容的质量。
-- 不修改后端 `memory.after_turn_threshold`（测试可配置为 200）。本模式不主动 compact；
-  Agent 运行期间若检测到原生 hook 错误，则拒绝把该次调用作为有效结果。
-  超长输入仍可能触发 OpenClaw 原生 compact，不能把这类运行标成纯 afterTurn 对比。
-  正在抽取时的 `after_turn` 503 processing 交给后续 readiness 检查处理。
+- 每个历史 session 必须获得 `sessions.compact` 的成功结果；使用 Agent 返回的实际
+  session ID 和 Gateway session key，不根据输入猜测会话，也不直接调用后端接口补写历史。
+  compact 通过容器内 CLI 连接同一个 Gateway，RPC 超时 600 秒、子进程超时 630 秒。
+- readiness 使用本次 compact 的 operation 核对 scope/session，确认 commit_count > 0、
+  后台空闲且 outbox 清空后才进入 QA。缺失/空会话、未归档历史、索引错误和超时都判失败；
+  不再接受 `buffered_without_archive`。归档成功仍不代表抽取内容一定正确。
+- 不依赖后端 `memory.after_turn_threshold`；`after_turn` 的 503 processing 不再作为
+  ingest 阶段的预期例外忽略。超长历史仍可能提前触发 OpenClaw 自带的 compact。
 - `autoCapture=false` 不是全局只读：显式 compact、session_end 的已有缓冲清理仍是原生行为。
   工具禁用、工具结果外置关闭、trace 内容采集关闭；测试后端应关闭 skill sedimentation。
   QA 前完成历史就绪检查，不复用历史 OpenClaw session。
@@ -77,7 +78,7 @@ docker run -d --name "$OGMEM_GATEWAY_CONTAINER" --network host \
 路径替换为同一个绝对路径；标签和挂载用于确认该容器属于此专用 runtime。
 `OGMEM_PLUGIN_STATE_FILE` 和 `OPENCLAW_STATE_DIR` 使用 Workload 所在主机可见路径。
 Gateway 仅绑定 loopback，并使用准备命令生成的 token；配置自动重载和心跳关闭，
-由生命周期在阶段边界明确重启。此 HTTP 模式不需要 `OPENCLAW_BIN` 包装脚本。
+由生命周期在阶段边界明确重启。此 HTTP 模式不需要 `OPENCLAW_BIN` 包装脚本；容器内须有支持 `sessions.compact` 的 `openclaw` CLI。
 容器用户 UID 应与专用目录所有者一致，否则 OpenClaw 可能拒绝插件。不得指向用户日常配置。
 
 ## 运行
@@ -91,12 +92,12 @@ python -m memory_bench_platform.cli run \
 
 LongMemEval 用 `--benchmark longmemeval --data-path /path/to/longmemeval.json`。
 评分分别使用 `LOCOMO_*` / `LONGMEMEVAL_*` 的 API_KEY、BASE_URL、METRIC_MODEL。
-Agent 模型来自专用 OpenClaw 配置，抽取模型和阈值来自后端；judge 配置不替换它们。
+Agent 模型来自专用 OpenClaw 配置，抽取模型来自后端；judge 配置不替换它们。
 数据集公共 ingest / QA 提示词保持不变。`backend_direct` 不受此适配修改影响。
 
 ## 日志与清理
 
-`phase.json.events.jsonl` 记录生命周期、身份和后端就绪检查，不再伪装为原生 hook 回执。
+`phase.json.<run-owner-hash>.events.jsonl` 按运行记录生命周期、身份和后端就绪检查，不再伪装为原生 hook 回执。
 `provenance.json` 记录插件代码和 schema 哈希。Workload 归档输入、回答和 readiness 结果；
 后端日志用于确认模型抽取错误及内容质量。finalize 关闭两个开关并归档生命周期日志。
 插件通过可选的 `before_agent` / `after_agent` 生命周期操作检查每次 Agent 调用。
