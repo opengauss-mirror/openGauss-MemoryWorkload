@@ -395,6 +395,79 @@ def test_config_archive_identifies_skill_and_version_without_endpoint(tmp_path, 
     assert "secret://endpoint" not in json.dumps(archive)
 
 
+@pytest.mark.parametrize("mutation", ["append", "replace"])
+def test_source_mutation_during_setup_does_not_change_replayed_snapshot(tmp_path, monkeypatch, memory_adapter, mutation):
+    import hashlib
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    original = (tmp_path / "add.jsonl").read_bytes()
+    seen = []
+    def invoke(skill, request, **kwargs):
+        if request.action == "ingest":
+            seen.append(request.inputs["raw_request"]["messages"][0]["content"])
+        return MemoryTaskOutput(status="ok", state="completed", operation={"session_id": "s"})
+    monkeypatch.setattr(integration, "run_memory_task", invoke)
+    start = InstanceRuntime.start
+    def mutate_after_snapshot(self):
+        if mutation == "append":
+            with (tmp_path / "add.jsonl").open("a") as stream:
+                stream.write(json.dumps({"request": {"messages": [{"role": "user", "content": "LATE"}]}}) + "\n")
+        else:
+            (tmp_path / "add.jsonl").write_text(json.dumps({"request": {
+                "messages": [{"role": "user", "content": "REPLACED"}]}}) + "\n")
+        start(self)
+    monkeypatch.setattr(InstanceRuntime, "start", mutate_after_snapshot)
+    out = tmp_path / "out"
+    report = run_multi_user(load_config(path), out, "r")
+    archived = json.loads((out / "run_config.json").read_text())["workloads"]["w"]["files"]["add"]
+    assert report["status"] == "completed"
+    assert seen == ["PRIVATE_BODY", "PRIVATE_BODY"]
+    assert archived == {"sha256": hashlib.sha256(original).hexdigest(), "size_bytes": len(original)}
+
+
+def test_changed_invalid_source_is_rejected_before_output_or_target_writes(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    path, _ = config_file(tmp_path)
+    config = load_config(path)
+    (tmp_path / "add.jsonl").write_text('{"request": {"messages": []}}\ninvalid-json\n')
+    calls = []
+    monkeypatch.setattr(integration, "run_memory_task", lambda *args, **kwargs: calls.append(args))
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="invalid JSON"):
+        run_multi_user(config, out, "r")
+    assert not out.exists()
+    assert not calls
+
+
+def test_workload_copy_is_private_outside_report_and_removed_after_run(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import Replay, run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **k: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    original = Replay.records
+    snapshots = []
+    def inspect(self, user, operation):
+        copy = getattr(self.config.workloads[user.workload], operation + "_file")
+        snapshots.append(copy)
+        assert copy.parent.stat().st_mode & 0o777 == 0o700
+        assert copy.stat().st_mode & 0o777 == 0o400
+        assert not copy.is_relative_to(self.output_dir)
+        yield from original(self, user, operation)
+    monkeypatch.setattr(Replay, "records", inspect)
+    run_multi_user(load_config(path), tmp_path / "out", "r")
+    assert snapshots
+    assert all(not copy.exists() for copy in snapshots)
+
+
 def test_unused_instance_without_installed_skill_does_not_abort_snapshot(tmp_path, monkeypatch, memory_adapter):
     from memory_bench_platform import integration
     from memory_bench_platform.multi_user_config import load_config

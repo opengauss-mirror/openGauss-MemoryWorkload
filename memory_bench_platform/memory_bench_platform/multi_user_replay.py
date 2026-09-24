@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
+import tempfile
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -12,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import integration
-from .multi_user_config import MultiUserConfig, identity, preflight, replay_module
+from .multi_user_config import MultiUserConfig, identity, preflight, replay_module, validate_agent_request
 from .multi_user_report import RequestEvent, summarize, write_reports
 from .multi_user_runtime import InstanceRuntime
 from .protocol import RenderedTaskInput
@@ -53,6 +55,31 @@ def _snapshot(config, run_id):
         "users": {u.id: {"user_id": identity(run_id, u.id), "instance": u.instance,
                          "workload": u.workload, "controls": config.controls_for(u).model_dump()}
                   for u in config.users}}
+
+
+def _snapshot_workloads(config: MultiUserConfig, directory: Path) -> MultiUserConfig:
+    frozen = config.model_copy(deep=True)
+    copies = {}
+    for workload in frozen.workloads.values():
+        for operation in ("add", "search"):
+            field = operation + "_file"
+            source = getattr(workload, field)
+            if source not in copies:
+                target = directory / f"{len(copies)}.jsonl"
+                with source.open("rb") as original, target.open("xb") as snapshot:
+                    shutil.copyfileobj(original, snapshot)
+                copies[source] = target
+            target = copies[source]
+            count = 0
+            for record in replay_module().iter_replay_records(target, operation, "preflight"):
+                count += 1
+                if frozen.mode == "openclaw":
+                    validate_agent_request(record.request, operation)
+            if not count:
+                raise ValueError("workload files must not be empty")
+            target.chmod(0o400)
+            setattr(workload, field, target)
+    return frozen
 
 
 class Replay:
@@ -307,34 +334,36 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
     from .multi_user_config import Alias
     TypeAdapter(Alias).validate_python(run_id)
     environments = preflight(config)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=False)
-    (output_dir / "run_config.json").write_text(json.dumps(_snapshot(config, run_id), indent=2), encoding="utf-8")
-    replay = Replay(config, output_dir, run_id, environments)
-    try:
-        with (output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
-            for name, runtime in replay.runtimes.items():
-                started = time.monotonic()
-                try:
-                    runtime.start()
-                    runtime.set_phase("ingest")
-                except Exception:
-                    runtime.state = "setup_failed"
-                finally:
-                    replay.setup_ms[name] = (time.monotonic()-started)*1000
-            replay.phase("add", stream)
-            if config.mode == "openclaw": replay.phase("drain", stream)
-            for runtime in replay.runtimes.values():
-                if runtime.state == "ready":
-                    try: runtime.set_phase("qa")
-                    except Exception: runtime.state = "phase_failed"
-            replay.phase("search", stream)
-    except BaseException:
-        replay.interrupted = True
-        raise
-    finally:
-        for runtime in reversed(list(replay.runtimes.values())):
-            try: runtime.stop()
-            except Exception: runtime.cleanup_failed = True
-        report = write_reports(output_dir, replay.report())
-    return report
+    with tempfile.TemporaryDirectory(prefix="memory-bench-workloads-") as temporary:
+        config = _snapshot_workloads(config, Path(temporary))
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=False)
+        (output_dir / "run_config.json").write_text(json.dumps(_snapshot(config, run_id), indent=2), encoding="utf-8")
+        replay = Replay(config, output_dir, run_id, environments)
+        try:
+            with (output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
+                for name, runtime in replay.runtimes.items():
+                    started = time.monotonic()
+                    try:
+                        runtime.start()
+                        runtime.set_phase("ingest")
+                    except Exception:
+                        runtime.state = "setup_failed"
+                    finally:
+                        replay.setup_ms[name] = (time.monotonic()-started)*1000
+                replay.phase("add", stream)
+                if config.mode == "openclaw": replay.phase("drain", stream)
+                for runtime in replay.runtimes.values():
+                    if runtime.state == "ready":
+                        try: runtime.set_phase("qa")
+                        except Exception: runtime.state = "phase_failed"
+                replay.phase("search", stream)
+        except BaseException:
+            replay.interrupted = True
+            raise
+        finally:
+            for runtime in reversed(list(replay.runtimes.values())):
+                try: runtime.stop()
+                except Exception: runtime.cleanup_failed = True
+            report = write_reports(output_dir, replay.report())
+        return report
