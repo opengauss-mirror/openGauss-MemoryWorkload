@@ -307,6 +307,34 @@ def test_completed_ingest_is_not_polled(dataset_dir: Path, tmp_path: Path):
     assert actions == ["ingest", "recall"]
 
 
+@pytest.mark.parametrize("operation", ["add", "search"])
+@pytest.mark.parametrize("concurrency", [1, 2])
+@pytest.mark.parametrize("bad_row", ["PRIVATE_INVALID_JSON", "42", '{"request": []}'])
+def test_replay_preflights_both_files_before_any_memory_call(
+    dataset_dir: Path, tmp_path: Path, operation: str, concurrency: int, bad_row: str
+):
+    module = _module()
+    path = dataset_dir / f"openmem_{operation}_sample.jsonl"
+    # Place the bad row beyond the initial worker batch to reproduce partial writes.
+    path.write_text(path.read_text(encoding="utf-8") * 3 + bad_row + "\n", encoding="utf-8")
+    calls = []
+
+    def invoke(memory_id, request, *, timeout_seconds=None):
+        calls.append(request.action)
+        return _output(module, operation={"session_id": "s"}, output={"count": 0})
+
+    config = _config(module, dataset_dir, tmp_path,
+                     add_concurrency=concurrency, search_concurrency=concurrency)
+    with pytest.raises(ValueError) as exc:
+        module.execute_replay(config, invoke)
+
+    assert calls == []
+    assert path.name in str(exc.value)
+    assert "line 4" in str(exc.value)
+    assert "PRIVATE_INVALID_JSON" not in str(exc.value)
+    assert not config.output_dir.exists()
+
+
 def test_completed_ingest_requires_session_id(dataset_dir: Path, tmp_path: Path):
     module = _module()
 

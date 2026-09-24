@@ -527,6 +527,8 @@ memory-bench run \
 
 执行顺序固定为 `add → drain → search`：全部 add 请求及其异步状态轮询结束后才开始 search。分离的 add/search 文件没有统一时间线，因此无法重建生产环境中的读写交错时序，第一版也不复刻请求间隔。
 
+回放入口会先逐行完整预检 add/search 两个文件；任一文件存在非法 JSON 或请求结构时，在调用目标系统和创建回放产物前失败，错误只包含文件名、行号及错误类别。预检不把整个数据集加载到内存，但增加一次读取和解析；预检及回放期间请保持输入文件不变。
+
 以下环境变量控制回放；括号内为默认值：
 
 - `MEMORY_BENCH_REPLAY_ADD_CONCURRENCY`（`1`）和 `MEMORY_BENCH_REPLAY_SEARCH_CONCURRENCY`（`1`）
