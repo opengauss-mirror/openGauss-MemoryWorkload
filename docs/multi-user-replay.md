@@ -100,14 +100,14 @@ users:
 
 映射仅支持 user_id、conversation_id、add.messages（消息仅 role/content，role 为 user/assistant/system）及 search.query。filters、memory_limit_number 等未知字段会在预检时报错，不能静默丢弃。本模式不是 OpenMem HTTP 等价回放。
 
-插件 prepare、ingest/qa 阶段切换、finalize 每实例各执行一次；本轮命名空间对该实例所有用户一致，用户依靠不同 agent 的记忆作用域隔离。测试期间需独占实例配置，不能同时跑另一个 benchmark 或生产会话。配置必须明确 endpoint/config/state 路径；同实例请复用同一实例 ID，不要用别名重复配置。
+插件 prepare、ingest/qa 阶段切换、finalize 每实例各执行一次；命名空间包含 run_id 和实例 ID，同一实例的用户依靠不同 agent 的记忆作用域隔离。测试期间需独占实例配置，不能同时跑另一个 benchmark 或生产会话。配置必须明确 endpoint/config/state 路径；同实例请复用同一实例 ID，不要用别名重复配置。若提供 `OPENCLAW_GATEWAY_BASE_URL`，运行时也会将 `OPENCLAW_GATEWAY_URL` 设为同一地址，避免继承的父进程地址覆盖实例配置。
 
 ### 隔离探针契约
 
 探针由接入者提供，收到 stdin JSON：
 
 ```json
-{"schema":"multi-user-isolation-probe/1","run_id":"multi-example","namespace":"replay-...","users":[{"user_id":"replay-...","agent_id":"bench-user-a"}]}
+{"schema":"multi-user-isolation-probe/1","run_id":"multi-example","instance_id":"claw-a","namespace":"replay-...","users":[{"user_id":"replay-...","agent_id":"bench-user-a"}]}
 ```
 
 它必须实际验证对应 agent 的写入与检索作用域（例如写入用户专属哨兵并交叉检索），成功时退出 0，并输出：
@@ -116,7 +116,7 @@ users:
 {"isolated":true,"identity_mode":"agent","run_id":"multi-example","agent_ids":["bench-user-a"],"write_scope_verified":true,"read_scope_verified":true}
 ```
 
-agent_ids 必须恰好覆盖本实例配置用户。退出 0、不同 session、不同请求头都不足以通过验证；不要用输出固定成功 JSON 的空脚本替代探针。探针在插件 prepare 后、实际负载前执行，使用同一实例环境，失败则该实例用户标记 setup_failed。其他实例继续运行。探针结果是接入者证据契约，不是平台自动实现的隔离验证；仅固定全局 userId 且无法证明 agent 作用域的插件不支持共享实例独立用户测试。
+agent_ids 必须恰好覆盖本实例配置用户。探针应使用输入中的实例 ID 和 namespace 验证作用域，也需针对可能连接同一租户的其他实例检查跨实例串读。退出 0、不同 session、不同请求头都不足以通过验证；不要用输出固定成功 JSON 的空脚本替代探针。探针在插件 prepare 后、实际负载前执行，使用同一实例环境，失败则该实例用户标记 setup_failed。其他实例继续运行。探针结果是接入者证据契约，不是平台自动实现的隔离验证；仅固定全局 userId 且无法证明 agent 作用域的插件不支持共享实例独立用户测试。
 
 ## 托管实例
 
@@ -143,7 +143,7 @@ Memory 适配器的 runtime_context.run_dir 同样放在报告目录之外，并
 
 全局 add → drain → search，所有用户完成写入后再进入检索。backend_direct 的 add 耗时包含异步状态轮询；OpenClaw 分开记录 Agent 接收耗时与原生 compact/精确任务 drain 耗时。sleep、全局队列清空等弱证据不视为精确就绪。单请求失败不停止其他用户；已有部分写入的用户标记 partially_written。
 
-每用户最多一个在途请求，每实例 max_inflight 和全局 max_workers 都生效。速率是每用户请求开始间隔的上限（0 不限速）；不会复刻源文件的生产时间间隔，也不重放原始 add/search 交错顺序。
+每用户最多一个在途请求，每实例 max_inflight 和全局 max_workers 都生效。速率是每用户请求开始间隔的下限（0 不限速），最后一条请求后不再额外等待；不会复刻源文件的生产时间间隔，也不重放原始 add/search 交错顺序。JSONL 按行读取并及时关闭文件，不会为每个用户长期占用文件描述符。
 
 当 max_workers 不小于活跃实例数时，为每个实例保留至少一个执行槽，避免慢实例占满线程池；其他槽可供实例共享。worker 数少于活跃实例数时每实例最多占一个槽，实例之间仍需轮流等待，因此建议 max_workers 至少等于实例数。OpenClaw 的 HTTP 200 还会检查业务状态和 Responses 输出结构，failed/incomplete 或空对象不能计为成功。
 
@@ -151,8 +151,8 @@ Memory 适配器的 runtime_context.run_dir 同样放在报告目录之外，并
 
 - request_events.jsonl：增量写入，匿名身份、实例、请求 ID、操作、源行号、输入 hash/字节数、排队时间、调用时间、状态和数值结果数。
 - user_summary.json/csv、instance_summary.json/csv：分用户/实例的请求数、成功率、超时、QPS、p50/p95/p99/max。
-- summary.json、report.html：整体及分用户结果；analyze-run 严格验证报告、事件关联和重算指标后重新渲染。
-- run_config.json：脱敏绑定、各用户控制项、输入文件指纹与 model_mode，不保存原始路径、请求、回答、凭据或私有端点。
+- summary.json、report.html：整体及分用户结果（整体 QPS 使用共同阶段窗口）；analyze-run 严格验证报告、事件关联和重算指标后重新渲染。
+- run_config.json：脱敏绑定、各用户控制项、输入文件指纹、model_mode、适配器/插件标识与可用版本，不保存原始路径、请求、回答、凭据或私有端点。
 
 用户 QPS 使用该用户的实际活跃窗口；实例与整体 QPS 使用共同阶段窗口。QPS 分子包含成功和失败请求；延迟分位数也包含失败，必须结合成功率解读。分位数从原始事件计算，绝不平均各用户分位数。OpenClaw Agent 端到端延迟不能与记忆 API 延迟混作同一指标。
 

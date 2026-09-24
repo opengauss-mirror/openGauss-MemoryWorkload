@@ -21,8 +21,7 @@ def execute(args, argv=None):
         config = load_config(Path(args.workload_config))
         if (config.mode == "openclaw" and args.agent != "openclaw") or (config.mode == "backend_direct" and args.agent != "none"):
             raise ValueError("mode/agent mismatch: use openclaw or none respectively")
-        arguments = sys.argv[1:] if argv is None else argv
-        if any(a == "--memory-integration" or a.startswith("--memory-integration=") for a in arguments):
+        if getattr(args, "memory_integration_explicit", False):
             expected = "agent_plugin" if config.mode == "openclaw" else "backend_direct"
             if args.memory_integration != expected:
                 raise ValueError("mode/memory-integration mismatch")

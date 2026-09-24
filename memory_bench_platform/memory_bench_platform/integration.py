@@ -534,6 +534,11 @@ def _validate_memory_action_output(action: str, result: MemoryTaskOutput) -> Non
 def _validate_memory_plugin_action_output(action: str, result: MemoryPluginTaskOutput) -> None:
     if result.status != "ok":
         return
+    if (action == "flush" and result.state == "completed"
+            and result.operation.get("state") == "completed"
+            and result.output.get("compacted") is True
+            and result.output.get("completed") is True):
+        return
     required = {
         "commit": {"operation.task_id"},
         "flush": {"operation.task_id"},

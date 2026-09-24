@@ -71,10 +71,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--benchmark", required=True)
     p_plan.add_argument("--agent", required=True)
     p_plan.add_argument("--memory-backend")
+    class ExplicitIntegration(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, values)
+            namespace.memory_integration_explicit = True
+
     p_plan.add_argument(
         "--memory-integration",
         choices=["backend_direct", "agent_plugin"],
         default="backend_direct",
+        action=ExplicitIntegration,
     )
     p_plan.add_argument("--hardware-profile")
     plan_data = p_plan.add_mutually_exclusive_group()
@@ -108,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--memory-integration",
         choices=["backend_direct", "agent_plugin"],
         default="backend_direct",
+        action=ExplicitIntegration,
     )
     p_run.add_argument("--hardware-profile")
     run_data = p_run.add_mutually_exclusive_group()

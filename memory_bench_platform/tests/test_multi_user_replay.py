@@ -107,6 +107,343 @@ def test_openclaw_probe_cannot_pass_on_exit_code_alone(tmp_path):
         runtime.probe_isolation()
 
 
+def test_openclaw_namespace_is_distinct_across_instances(tmp_path, monkeypatch):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.protocol import MemoryPluginTaskOutput
+    path, data = config_file(tmp_path, mode="openclaw")
+    data["instances"]["j"] = dict(data["instances"]["i"])
+    data["users"][1].update(instance="j", agent_id="alice")
+    path.write_text(yaml.safe_dump(data))
+    config = load_config(path)
+    prepared = {}
+    def plugin(skill, request, **kwargs):
+        if request.action == "prepare": prepared[request.task_id.split(":")[0]] = request.inputs["namespace"]
+        return MemoryPluginTaskOutput(status="ok", state="completed")
+    monkeypatch.setattr(integration, "run_memory_plugin_task", plugin)
+    monkeypatch.setattr(InstanceRuntime, "probe_isolation", lambda self: None)
+    runtimes = [InstanceRuntime(name, config.instances[name], {}, "run", tmp_path,
+                [u for u in config.users if u.instance == name]) for name in ("i", "j")]
+    try:
+        for runtime in runtimes: runtime.start()
+        assert prepared["i"] != prepared["j"]
+        assert all(runtime.namespace == prepared[runtime.name] for runtime in runtimes)
+    finally:
+        for runtime in runtimes: runtime.stop()
+
+
+def test_probe_receives_instance_scoped_namespace(tmp_path, monkeypatch):
+    from subprocess import CompletedProcess
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    path, data = config_file(tmp_path, mode="openclaw")
+    data["instances"]["j"] = dict(data["instances"]["i"])
+    data["users"][1].update(instance="j", agent_id="alice")
+    path.write_text(yaml.safe_dump(data))
+    config = load_config(path)
+    seen = []
+    def command(self, argv, timeout, payload=None, capture=False):
+        seen.append(payload)
+        return CompletedProcess(argv, 0, json.dumps({
+            "isolated": True, "identity_mode": "agent", "run_id": self.run_id,
+            "agent_ids": [u.agent_id for u in self.users],
+            "write_scope_verified": True, "read_scope_verified": True}))
+    monkeypatch.setattr(InstanceRuntime, "command", command)
+    for name in ("i", "j"):
+        runtime = InstanceRuntime(name, config.instances[name], {}, "run", tmp_path,
+            [u for u in config.users if u.instance == name])
+        runtime.probe_isolation()
+        assert seen[-1]["instance_id"] == name
+        assert seen[-1]["namespace"] == runtime.namespace
+    assert seen[0]["namespace"] != seen[1]["namespace"]
+
+
+def test_openclaw_base_url_overrides_inherited_gateway_url(tmp_path, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config, preflight
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.protocol import RenderedTaskInput
+    calls = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            calls.append(self.server.server_port)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"output":[]}')
+    servers = [ThreadingHTTPServer(("127.0.0.1", 0), Handler) for _ in range(2)]
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
+    for thread in threads: thread.start()
+    try:
+        monkeypatch.setenv("OPENCLAW_GATEWAY_URL", f"http://127.0.0.1:{servers[0].server_port}")
+        path, data = config_file(tmp_path, mode="openclaw")
+        data["instances"]["i"]["environment"] = {
+            "OPENCLAW_GATEWAY_BASE_URL": f"http://127.0.0.1:{servers[1].server_port}",
+            "OPENCLAW_CONFIG_PATH": "claw.json", "OPENCLAW_STATE_DIR": "state"}
+        path.write_text(yaml.safe_dump(data))
+        config = load_config(path)
+        runtime = InstanceRuntime("i", config.instances["i"], preflight(config)["i"], "r", tmp_path, config.users)
+        request = RenderedTaskInput(task_id="t", messages=[{"role": "user", "content": "hi"}],
+                                    metadata={"agent_id": "alice", "session_id": "s"})
+        integration.run_agent_task("openclaw", request, environment=runtime.environment, timeout_seconds=5)
+        assert calls == [servers[1].server_port]
+    finally:
+        for server in servers: server.shutdown(); server.server_close()
+        for thread in threads: thread.join()
+
+
+def test_completed_compact_without_task_id_is_accepted_but_pending_is_not():
+    from memory_bench_platform.integration import _validate_memory_plugin_action_output
+    from memory_bench_platform.protocol import MemoryPluginTaskOutput
+    complete = MemoryPluginTaskOutput(status="ok", state="completed",
+        operation={"id": "compact:s", "task_id": "", "state": "completed"},
+        output={"compacted": True, "completed": True})
+    _validate_memory_plugin_action_output("flush", complete)
+    pending = complete.model_copy(update={"operation": {"state": "running"},
+                                          "output": {"compacted": True, "completed": False}})
+    with pytest.raises(ValueError): _validate_memory_plugin_action_output("flush", pending)
+
+
+def test_plugin_idempotency_distinguishes_phase_and_session(tmp_path, monkeypatch):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import Instance
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.protocol import MemoryPluginTaskOutput
+    runtime = InstanceRuntime("i", Instance(kind="openclaw", healthcheck_command=[sys.executable],
+        isolation_probe_command=[sys.executable]), {}, "run", tmp_path, [])
+    keys = {}
+    def plugin(skill, request, **kwargs):
+        operation = request.inputs.get("operation", {})
+        keys.setdefault((request.action, request.inputs.get("phase") or request.inputs.get("session_id") or operation.get("id")),
+                        []).append(request.idempotency_key)
+        return MemoryPluginTaskOutput(status="ok", state="completed")
+    monkeypatch.setattr(integration, "run_memory_plugin_task", plugin)
+    for action, inputs in (("set_phase", {"phase": "ingest"}), ("set_phase", {"phase": "qa"}),
+                           ("flush", {"session_id": "one"}), ("flush", {"session_id": "two"}),
+                           ("flush", {"session_id": "one"}),
+                           ("wait_settle", {"operation": {"id": "compact:one", "state": "completed"}}),
+                           ("wait_settle", {"operation": {"id": "compact:two", "state": "completed"}})):
+        runtime.plugin(action, inputs)
+    assert len({values[0] for values in keys.values()}) == 6
+    assert keys[("flush", "one")] == [keys[("flush", "one")][0]] * 2
+
+
+def test_single_request_rate_limit_does_not_extend_phase(tmp_path, monkeypatch, memory_adapter):
+    import time
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, data = config_file(tmp_path)
+    data["users"] = data["users"][:1]
+    data["defaults"] = {"add_rate": 2}
+    path.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **k: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    started = time.monotonic()
+    report = run_multi_user(load_config(path), tmp_path / "out", "r")
+    assert report["phase_windows_ms"]["add"] < 300
+    assert time.monotonic() - started < 0.45
+
+
+def test_ready_fast_user_does_not_wait_for_slow_future(tmp_path, monkeypatch, memory_adapter):
+    import time
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, data = config_file(tmp_path)
+    data["max_workers"] = 2
+    data["instances"]["i"]["environment"] = {"TARGET": "slow"}
+    data["instances"]["j"] = {**data["instances"]["i"], "environment": {"TARGET": "fast"}}
+    data["users"][1]["instance"] = "j"
+    data["users"][1]["workload"] = "fast"
+    data["users"][1]["controls"] = {"add_rate": 100}
+    data["workloads"]["fast"] = {**data["workloads"]["w"], "add_file": "fast.jsonl"}
+    (tmp_path / "fast.jsonl").write_text((tmp_path / "add.jsonl").read_text() * 4)
+    path.write_text(yaml.safe_dump(data))
+    fast_starts = []
+    def invoke(skill, request, *, environment, **kwargs):
+        if request.action == "ingest":
+            if environment["TARGET"] == "fast": fast_starts.append(time.monotonic())
+            else: time.sleep(0.3)
+        return MemoryTaskOutput(status="ok", state="completed", operation={"session_id": "s"})
+    monkeypatch.setattr(integration, "run_memory_task", invoke)
+    run_multi_user(load_config(path), tmp_path / "out", "r")
+    assert len(fast_starts) == 4
+    assert max(b-a for a, b in zip(fast_starts, fast_starts[1:])) < 0.045
+
+
+def test_many_users_do_not_hold_one_file_descriptor_each(tmp_path):
+    import subprocess
+    from memory_bench_platform.multi_user_config import load_config
+    path, data = config_file(tmp_path)
+    data["users"] = [{"id": f"u{n}", "workload": "w", "instance": "i"} for n in range(80)]
+    data["max_workers"] = 1
+    path.write_text(yaml.safe_dump(data))
+    (tmp_path / "add.jsonl").write_text((tmp_path / "add.jsonl").read_text() * 4)
+    script = """
+import resource, sys
+from types import SimpleNamespace
+from pathlib import Path
+from memory_bench_platform import integration
+from memory_bench_platform.multi_user_config import load_config
+from memory_bench_platform.multi_user_replay import run_multi_user
+from memory_bench_platform.protocol import MemoryTaskOutput
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(48, hard), hard))
+integration.get_memory_manifest = lambda _: SimpleNamespace(
+    capabilities={'raw_request_protocols':['openmem-v1']},
+    runtime={'actions':['ingest','status','recall']}, entry=SimpleNamespace(runner='fake'))
+integration.run_memory_task = lambda *a, **k: MemoryTaskOutput(
+    status='ok', state='completed', operation={'session_id':'s'})
+assert run_multi_user(load_config(Path(sys.argv[1])), Path(sys.argv[2]), 'r')['overall']['add']['count'] == 320
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(path), str(tmp_path / "out")],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr[-1000:]
+
+
+def test_timed_out_probe_kills_its_child_process(tmp_path):
+    import subprocess
+    import time
+    from memory_bench_platform.multi_user_config import Instance
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    runtime = InstanceRuntime("i", Instance(kind="memory", memory_skill="fake",
+        healthcheck_command=[sys.executable]), {}, "run", tmp_path, [])
+    marker = tmp_path / "orphan-wrote.txt"
+    child = "import pathlib,sys,time; time.sleep(.4); pathlib.Path(sys.argv[1]).write_text('orphan')"
+    parent = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]]); time.sleep(30)"
+    with pytest.raises(subprocess.TimeoutExpired):
+        runtime.command([sys.executable, "-c", parent, str(marker), child], .1, capture=True)
+    runtime.stop()
+    time.sleep(.5)
+    assert not marker.exists()
+
+
+def test_check_cleanup_does_not_mask_original_exception_when_group_exits(tmp_path, monkeypatch):
+    import subprocess
+    from memory_bench_platform import multi_user_runtime
+    from memory_bench_platform.multi_user_config import Instance
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    runtime = InstanceRuntime("i", Instance(kind="memory", memory_skill="fake",
+        healthcheck_command=[sys.executable]), {}, "run", tmp_path, [])
+    class ExitedProcess:
+        pid = 12345
+        def communicate(self, **kwargs):
+            raise ValueError("original check failure")
+    monkeypatch.setattr(multi_user_runtime.subprocess, "Popen", lambda *a, **k: ExitedProcess())
+    def no_group(*args):
+        raise ProcessLookupError("already exited")
+    monkeypatch.setattr(multi_user_runtime.os, "killpg", no_group)
+    with pytest.raises(ValueError, match="original check failure"):
+        runtime.command([sys.executable], 1)
+
+
+def test_interrupted_during_setup_produces_importable_empty_events(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_report import import_report
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    path, _ = config_file(tmp_path)
+    def interrupt(self): raise KeyboardInterrupt()
+    monkeypatch.setattr(InstanceRuntime, "start", interrupt)
+    out = tmp_path / "out"
+    with pytest.raises(KeyboardInterrupt): run_multi_user(load_config(path), out, "r")
+    assert (out / "request_events.jsonl").read_text() == ""
+    assert import_report(out)["status"] == "interrupted"
+
+
+def test_abbreviated_explicit_integration_conflict_is_rejected(tmp_path, memory_adapter):
+    from memory_bench_platform.cli import main
+    path, _ = config_file(tmp_path)
+    with pytest.raises(SystemExit, match="preflight failed"):
+        main(["plan-run", "--benchmark", "production-http-replay", "--agent", "none",
+              "--workload-config", str(path), "--memory-integ", "agent_plugin"])
+
+
+def test_config_archive_identifies_skill_and_version_without_endpoint(tmp_path, monkeypatch, memory_adapter):
+    from types import SimpleNamespace
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, data = config_file(tmp_path)
+    data["instances"]["i"]["environment"] = {"PRIVATE_ENDPOINT": "secret://endpoint"}
+    data["instances"]["j"] = {**data["instances"]["i"], "memory_skill": "other"}
+    data["users"][1]["instance"] = "j"
+    path.write_text(yaml.safe_dump(data))
+    def manifest(skill):
+        return SimpleNamespace(version={"fake": "1.0", "other": "2.0"}[skill],
+            capabilities={"raw_request_protocols": ["openmem-v1"]},
+            runtime={"actions": ["ingest", "status", "recall"]},
+            entry=SimpleNamespace(runner="fake"))
+    monkeypatch.setattr(integration, "get_memory_manifest", manifest)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    archive = json.loads((out / "run_config.json").read_text())
+    assert archive["instances"]["i"]["memory_skill"] == "fake"
+    assert archive["instances"]["i"]["skill_version"] == "1.0"
+    assert archive["instances"]["j"]["memory_skill"] == "other"
+    assert archive["instances"]["j"]["skill_version"] == "2.0"
+    assert "secret://endpoint" not in json.dumps(archive)
+
+
+def test_unused_instance_without_installed_skill_does_not_abort_snapshot(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    path, data = config_file(tmp_path)
+    data["instances"]["unused"] = {**data["instances"]["i"], "memory_skill": "not-installed"}
+    path.write_text(yaml.safe_dump(data))
+    manifest = integration.get_memory_manifest
+    def installed_only(skill):
+        if skill == "not-installed": raise ValueError("unknown skill")
+        return manifest(skill)
+    monkeypatch.setattr(integration, "get_memory_manifest", installed_only)
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    assert json.loads((out / "run_config.json").read_text())["instances"]["unused"] == {
+        "kind": "memory", "deployment": "external", "max_inflight": 8,
+        "memory_skill": "not-installed", "skill_version": None}
+
+
+def test_openclaw_archive_records_agent_and_plugin_versions(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import _snapshot
+    path, _ = config_file(tmp_path, mode="openclaw")
+    monkeypatch.setattr(integration, "get_memory_plugin_manifest", lambda _: SimpleNamespace(version="plugin-v1"))
+    monkeypatch.setattr(integration, "get_agent_manifest", lambda _: SimpleNamespace(version="agent-v2"))
+    instance = _snapshot(load_config(path), "r")["instances"]["i"]
+    assert instance["plugin_id"] == "openclaw-openviking"
+    assert instance["skill_version"] == "plugin-v1"
+    assert instance["agent_skill"] == "openclaw"
+    assert instance["agent_version"] == "agent-v2"
+
+
+def test_html_renders_overall_shared_window_qps(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    out = tmp_path / "out"
+    report = run_multi_user(load_config(path), out, "r")
+    page = (out / "report.html").read_text()
+    assert "<h2>Overall</h2>" in page
+    assert f'<td>{report["overall"]["add"]["qps"]}</td>' in page
+
+
 @pytest.fixture
 def memory_adapter(monkeypatch):
     from types import SimpleNamespace

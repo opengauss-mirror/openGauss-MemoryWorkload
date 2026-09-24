@@ -144,6 +144,11 @@ def write_reports(output_dir: Path, report: dict):
                 for operation, metrics in summary["operations"].items():
                     writer.writerow({"id": key, "operation": operation, **metrics})
     rows = []
+    overall_rows = []
+    for operation, metrics in clean["overall"].items():
+        values = [operation, metrics["count"], metrics["success_rate"],
+                  metrics["qps"], metrics["p95_ms"]]
+        overall_rows.append("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in values) + "</tr>")
     for key, user in clean["users"].items():
         for operation, metrics in user["operations"].items():
             values = [key, user["instance_id"], user["status"], operation,
@@ -152,6 +157,9 @@ def write_reports(output_dir: Path, report: dict):
     body = ("<!doctype html><meta charset='utf-8'><title>Multi-user replay</title>"
             f"<h1>{html.escape(clean['run_id'])}</h1><p>{clean['status']} · {clean['latency_kind']}</p>"
             "<p>Internal stages, quality, token metrics and hardware: unavailable.</p>"
+            "<h2>Overall</h2><table><tr><th>Operation</th><th>Requests</th><th>Success rate</th>"
+            "<th>QPS</th><th>P95 ms</th></tr>" + "".join(overall_rows) + "</table>"
+            "<h2>Users</h2>"
             "<table><tr><th>User</th><th>Instance</th><th>Status</th><th>Operation</th>"
             "<th>Requests</th><th>Success rate</th><th>QPS</th><th>P95 ms</th></tr>"
             + "".join(rows) + "</table>")

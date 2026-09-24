@@ -208,6 +208,10 @@ def preflight(config: MultiUserConfig) -> dict[str, dict[str, str]]:
             endpoint = env.get("OPENCLAW_GATEWAY_URL") or env.get("OPENCLAW_GATEWAY_BASE_URL")
             if not endpoint or not env.get("OPENCLAW_CONFIG_PATH") or not env.get("OPENCLAW_STATE_DIR"):
                 raise ValueError("OpenClaw requires explicit endpoint, config path and state directory")
+            # The runner prefers GATEWAY_URL over BASE_URL; pin both in the
+            # child so an inherited parent setting cannot change the target.
+            env["OPENCLAW_GATEWAY_URL"] = endpoint
+            env["OPENCLAW_GATEWAY_BASE_URL"] = endpoint
             for key in ("OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR"):
                 env[key] = str((instance.cwd / env[key]).resolve())
             keys = (endpoint.rstrip("/"), env["OPENCLAW_CONFIG_PATH"], env["OPENCLAW_STATE_DIR"])

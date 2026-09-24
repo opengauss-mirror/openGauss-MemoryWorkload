@@ -31,11 +31,25 @@ def _snapshot(config, run_id):
                     size += len(chunk)
             files[operation] = {"sha256": digest.hexdigest(), "size_bytes": size}
         workloads[name] = {"format": workload.format, "files": files}
+    instances = {}
+    active_instances = {u.instance for u in config.users}
+    for name, instance in config.instances.items():
+        skill = None
+        if name in active_instances:
+            skill = (integration.get_memory_manifest(instance.memory_skill) if instance.kind == "memory"
+                     else integration.get_memory_plugin_manifest(instance.plugin_id))
+        instances[name] = {"kind": instance.kind, "deployment": instance.deployment,
+            "max_inflight": instance.max_inflight, "skill_version": getattr(skill, "version", None)}
+        if instance.kind == "memory":
+            instances[name]["memory_skill"] = instance.memory_skill
+        else:
+            agent = integration.get_agent_manifest("openclaw") if name in active_instances else None
+            instances[name].update(plugin_id=instance.plugin_id, agent_skill="openclaw",
+                                   agent_version=getattr(agent, "version", None))
     return {"schema": "multi-user-run/1", "run_id": run_id, "mode": config.mode,
         "model_mode": config.model_mode, "started_at": datetime.now(timezone.utc).isoformat(),
         "max_workers": config.max_workers, "workloads": workloads,
-        "instances": {name: {"kind": i.kind, "deployment": i.deployment, "max_inflight": i.max_inflight}
-                      for name, i in config.instances.items()},
+        "instances": instances,
         "users": {u.id: {"user_id": identity(run_id, u.id), "instance": u.instance,
                          "workload": u.workload, "controls": config.controls_for(u).model_dump()}
                   for u in config.users}}
@@ -56,7 +70,20 @@ class Replay:
     def records(self, user, operation):
         uid = identity(self.run_id, user.id)
         file = getattr(self.config.workloads[user.workload], operation + "_file")
-        for record in replay_module().iter_replay_records(file, operation, uid):
+        offset = 0
+        line_number = 0
+        while True:
+            # Each read closes its descriptor; users do not hold files open
+            # while waiting for another instance or a rate-limit deadline.
+            with file.open("rb") as stream:
+                stream.seek(offset)
+                line = stream.readline()
+                offset = stream.tell()
+            if not line:
+                return
+            line_number += 1
+            record = replay_module().parse_replay_record(
+                line.decode("utf-8"), file, operation, line_number, uid)
             request = {**record.request, "user_id": uid}
             if "conversation_id" in request:
                 request["conversation_id"] = identity(uid, str(request["conversation_id"]))
@@ -164,6 +191,7 @@ class Replay:
         ready_at = {u.id: started for u in users}
         inflight = {name: 0 for name in self.runtimes}
         remaining_users = {name: sum(u.instance == name for u in users) for name in self.runtimes}
+        buffered = {}
         futures = {}
         executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
         def collect(future):
@@ -188,14 +216,20 @@ class Replay:
                     if (len(futures) >= self.config.max_workers
                             or len(futures) >= available
                             or (active_instances > self.config.max_workers and inflight[user.instance] > 0)
-                            or inflight[user.instance] >= self.runtimes[user.instance].config.max_inflight
-                            or time.monotonic() < ready_at[user.id]):
+                            or inflight[user.instance] >= self.runtimes[user.instance].config.max_inflight):
                         pending.append(user)
                         continue
-                    record = next(queues[user.id], None)
+                    record = buffered.get(user.id)
+                    if record is None:
+                        record = next(queues[user.id], None)
                     if record is None:
                         remaining_users[user.instance] -= 1
                         continue
+                    if time.monotonic() < ready_at[user.id]:
+                        buffered[user.id] = record
+                        pending.append(user)
+                        continue
+                    buffered.pop(user.id, None)
                     eligible = ready_at[user.id]
                     rate = getattr(self.config.controls_for(user), operation + "_rate", 0)
                     ready_at[user.id] = time.monotonic() + (1/rate if rate else 0)
@@ -203,7 +237,10 @@ class Replay:
                     futures[future] = user
                     inflight[user.instance] += 1
                 if futures:
-                    done, _ = wait(futures, timeout=0.05, return_when=FIRST_COMPLETED)
+                    now = time.monotonic()
+                    next_due = min((ready_at[u.id] - now for u in pending
+                                    if u.id in buffered and ready_at[u.id] > now), default=0.05)
+                    done, _ = wait(futures, timeout=min(0.05, next_due), return_when=FIRST_COMPLETED)
                     for future in done: collect(future)
                 elif pending:
                     time.sleep(min(0.05, max(0, min(ready_at[u.id] for u in pending)-time.monotonic())))
@@ -275,16 +312,16 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
     (output_dir / "run_config.json").write_text(json.dumps(_snapshot(config, run_id), indent=2), encoding="utf-8")
     replay = Replay(config, output_dir, run_id, environments)
     try:
-        for name, runtime in replay.runtimes.items():
-            started = time.monotonic()
-            try:
-                runtime.start()
-                runtime.set_phase("ingest")
-            except Exception:
-                runtime.state = "setup_failed"
-            finally:
-                replay.setup_ms[name] = (time.monotonic()-started)*1000
         with (output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
+            for name, runtime in replay.runtimes.items():
+                started = time.monotonic()
+                try:
+                    runtime.start()
+                    runtime.set_phase("ingest")
+                except Exception:
+                    runtime.state = "setup_failed"
+                finally:
+                    replay.setup_ms[name] = (time.monotonic()-started)*1000
             replay.phase("add", stream)
             if config.mode == "openclaw": replay.phase("drain", stream)
             for runtime in replay.runtimes.values():

@@ -211,34 +211,35 @@ def iter_replay_records(
     source = Path(path)
     with source.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
-            try:
-                envelope = json.loads(line)
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise ValueError(f"{source.name}: line {line_number}: invalid JSON") from exc
-            if not isinstance(envelope, dict):
-                raise ValueError(f"{source.name}: line {line_number}: row must be an object")
-            request = envelope.get("request")
-            if not isinstance(request, dict):
-                raise ValueError(
-                    f"{source.name}: line {line_number}: request must be an object"
-                )
+            yield parse_replay_record(line, source, operation, line_number, run_id)
 
-            canonical = _canonical_request_bytes(request)
-            digest = hashlib.sha256(canonical).hexdigest()
-            replay_request = copy.deepcopy(request)
-            if replay_request.get("user_id") == "":
-                replay_request["user_id"] = f"replay-{run_id}"
 
-            yield ReplayRecord(
-                operation=operation,
-                line_number=line_number,
-                request_id=_request_id(operation, line_number, digest, run_id),
-                request=replay_request,
-                payload_sha256=digest,
-                payload_size_bytes=len(canonical),
-                top_level_fields=tuple(sorted(request)),
-                baseline=_baseline(envelope.get("response")),
-            )
+def parse_replay_record(line: str, source: Path, operation: Operation,
+                        line_number: int, run_id: str) -> ReplayRecord:
+    """Use one parser for sequential scans and seek-based multi-user reads."""
+    try:
+        envelope = json.loads(line)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"{source.name}: line {line_number}: invalid JSON") from exc
+    if not isinstance(envelope, dict):
+        raise ValueError(f"{source.name}: line {line_number}: row must be an object")
+    request = envelope.get("request")
+    if not isinstance(request, dict):
+        raise ValueError(f"{source.name}: line {line_number}: request must be an object")
+
+    canonical = _canonical_request_bytes(request)
+    digest = hashlib.sha256(canonical).hexdigest()
+    replay_request = copy.deepcopy(request)
+    if replay_request.get("user_id") == "":
+        replay_request["user_id"] = f"replay-{run_id}"
+
+    return ReplayRecord(
+        operation=operation, line_number=line_number,
+        request_id=_request_id(operation, line_number, digest, run_id),
+        request=replay_request, payload_sha256=digest,
+        payload_size_bytes=len(canonical), top_level_fields=tuple(sorted(request)),
+        baseline=_baseline(envelope.get("response")),
+    )
 
 
 def validate_dataset(path: Path) -> dict[str, Any]:
