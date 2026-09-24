@@ -624,6 +624,11 @@ def execute_replay(
     invoke_memory: Callable[..., MemoryTaskOutput],
 ) -> ReplaySummary:
     dataset = discover_dataset(config.data_path)
+    # Validate both complete files before submitting any writes. Keep inputs
+    # unchanged during replay; this streaming pass does not retain the dataset.
+    for operation, path in (("add", dataset.add_path), ("search", dataset.search_path)):
+        for _ in iter_replay_records(path, operation, config.run_id):
+            pass
     _write_run_config(config)
     add_events, add_elapsed_ms = _run_phase(
         iter_replay_records(dataset.add_path, "add", config.run_id),
