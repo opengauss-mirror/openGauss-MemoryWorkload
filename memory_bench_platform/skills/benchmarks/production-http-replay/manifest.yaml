@@ -1,0 +1,40 @@
+kind: benchmark
+id: production-http-replay
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  resolution_order:
+    - user_specified_official_version
+    - latest_official_release_tag
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  allowed_overrides:
+    - user_specified_official_version
+    - verified_fallback_release_tag
+    - historical_repro_release_tag
+  disallowed_defaults:
+    - dirty_worktree
+    - dev_build
+    - non_tag_commit
+  targets:
+    - name: production-http-replay
+      scope: benchmark_tooling
+      version_source: runtime_observed_only
+      record_runtime_version: true
+  record_runtime_version: true
+entry:
+  validator: scripts/validate.py
+dataset:
+  requires_data_path: true
+  input_format: openmem-jsonl-directory
+execution:
+  mode: production_replay
+  entrypoints:
+    replay:
+      external_runner: scripts/run_replay.py
+requirements:
+  memory:
+    actions: [ingest, status, recall]
+    raw_request_protocols: [openmem-v1]
+integration:
+  protocol_version: benchmark/1

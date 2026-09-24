@@ -109,6 +109,7 @@ skills/<type>/<skill-id>/
 - `skills/memories/`：Memory Backend Skill，例如 `openviking`。
 - `skills/smoke/`：最小链路验证 Skill，例如 `locomo-openclaw-openviking-minimal`。
 - `skills/analysis/`：结果诊断和分析 Skill，例如 LoCoMo small 链路诊断、OpenViking 写入诊断。
+- `skills/instrumentation/`：供 meta agent 阅读的指导型 Skill，例如 [memory-system-auto-instrumentation](memory_bench_platform/skills/instrumentation/memory-system-auto-instrumentation/SKILL.md) 及其可复制的 [meta-agent prompt](memory_bench_platform/skills/instrumentation/memory-system-auto-instrumentation/prompts/meta-agent.md)。这类 Skill 不由 Integration Skill loader 加载，也不需要 `manifest.yaml`。
 
 Benchmark Skill 负责：
 
@@ -500,6 +501,50 @@ version_policy:
 - 默认或覆盖后的版本选择结果
 - 实际运行时观测到的软件版本
 - 如果使用非 release build，必须在结论或分析报告中显式标注
+
+## 生产请求回放
+
+`production-http-replay` 从一个目录流式读取一份 add JSONL 和一份 search JSONL，将完整 OpenMem 请求通过 Memory Skill 边界映射为 `ingest`、`status`、`recall`。目标 Memory Skill 必须在 manifest 中声明 `capabilities.raw_request_protocols: [openmem-v1]`，并支持这三个 action。
+
+先校验目录和请求形状：
+
+```bash
+memory-bench validate \
+  --benchmark production-http-replay \
+  --data-path /path/to/add-and-search-directory
+```
+
+再使用兼容的 Memory Skill 回放：
+
+```bash
+memory-bench run \
+  --benchmark production-http-replay \
+  --entrypoint replay \
+  --agent generic-cli \
+  --memory-backend <openmem-v1-compatible-memory-skill> \
+  --data-path /path/to/add-and-search-directory
+```
+
+执行顺序固定为 `add → drain → search`：全部 add 请求及其异步状态轮询结束后才开始 search。分离的 add/search 文件没有统一时间线，因此无法重建生产环境中的读写交错时序，第一版也不复刻请求间隔。
+
+回放入口会先逐行完整预检 add/search 两个文件；任一文件存在非法 JSON 或请求结构时，在调用目标系统和创建回放产物前失败，错误只包含文件名、行号及错误类别。预检不把整个数据集加载到内存，但增加一次读取和解析；预检及回放期间请保持输入文件不变。
+
+以下环境变量控制回放；括号内为默认值：
+
+- `MEMORY_BENCH_REPLAY_ADD_CONCURRENCY`（`1`）和 `MEMORY_BENCH_REPLAY_SEARCH_CONCURRENCY`（`1`）
+- `MEMORY_BENCH_REPLAY_ADD_RATE`（`0`）和 `MEMORY_BENCH_REPLAY_SEARCH_RATE`（`0`），`0` 表示不限速
+- `MEMORY_BENCH_REPLAY_REQUEST_TIMEOUT_SECONDS`（`120`）
+- `MEMORY_BENCH_REPLAY_POLL_INTERVAL_SECONDS`（`1`）和 `MEMORY_BENCH_REPLAY_DRAIN_TIMEOUT_SECONDS`（`600`）
+- `MEMORY_BENCH_MODEL_MODE`（`real-model`），也接受 `replay-zero-delay`、`replay-with-delay`、`mock-fixed`
+- `MEMORY_BENCH_PERF_TRACE_PATH`：可选的内部 span JSONL，用于 `request_id` 关联覆盖率
+
+请求 ID 包含本轮 `run_id` 的哈希，幂等键沿用该请求 ID：同一轮重试保持稳定，不同轮回放相互隔离。目标系统打点需原样传递本轮请求 ID，历史轮次的 trace 不参与本轮匹配。
+
+异步写入的 drain 截止时间从 ingest 返回 accepted/running 后开始计算，包含轮询间隔和 status 调用；每次 status 使用请求超时与剩余 drain 时间的较小值。正常的零命中 search（`count=0`、`memories=[]`、`evidence_text=""`）计为成功。
+
+外部 runner 生成 `run_config.json`、`request_events.jsonl` 和 `production_replay_summary.json`，平台随后导入 case result、分析 JSON 和 HTML 报告。归档只保留 request ID、payload hash/大小/字段集合、状态、耗时、结果数量和关联统计，不保存 raw request、message、query、memory、凭据、私有 endpoint 或原始身份。关联不完整时结果标记为 exploratory，平台 run 状态为 partial，不生成可信的内部阶段归因结论。
+
+Runner 在读取可选 trace 前保存客户端事件。指定 trace 文件读取失败或 JSON 损坏时，保留请求统计并降级为 exploratory；汇总的 `attribution_error` 记录 `trace_read_error` 或 `trace_parse_error`，不包含原始异常内容。报告导入仅接受 add/search 指标、数值字段和计数分布，拒绝未知字段及嵌套业务内容。
 
 ## 开发和验证
 

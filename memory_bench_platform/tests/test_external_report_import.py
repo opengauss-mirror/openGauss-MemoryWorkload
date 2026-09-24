@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from memory_bench_platform.external_report_import import import_external_result
 
 
@@ -205,3 +207,193 @@ def test_import_external_result_fills_missing_csv_row_from_phase_meta(tmp_path: 
     assert result["summary"]["ungraded_count"] == 1
     assert result["case_results"][1]["label"] == "ungraded"
     assert result["case_results"][1]["case_id"] == "conv-1-q2"
+
+
+def _write_replay_summary(path: Path, **overrides):
+    payload = {
+        "schema": "production-replay-summary/1",
+        "run_id": "run-1",
+        "dataset_state": "partially_written",
+        "model_mode": "real-model",
+        "operations": {
+            "add": {"count": 2, "success": 1, "success_rate": 0.5},
+            "search": {
+                "count": 1,
+                "success": 1,
+                "success_rate": 1.0,
+                "non_empty_rate": 1.0,
+            },
+        },
+        "join_coverage": {
+            "client_requests": 3,
+            "missing_internal_traces": 1,
+            "duplicate_request_ids": 0,
+        },
+        "attribution_status": "exploratory",
+    }
+    payload.update(overrides)
+    (path / "production_replay_summary.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def _write_replay_events(path: Path, rows: list[dict]):
+    (path / "request_events.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+
+def test_import_external_result_reads_production_replay_contract(tmp_path: Path):
+    _write_replay_summary(tmp_path)
+    _write_replay_events(
+        tmp_path,
+        [
+            {
+                "request_id": "add-1",
+                "operation": "add",
+                "status": "ok",
+                "state": "completed",
+            },
+            {
+                "request_id": "add-2",
+                "operation": "add",
+                "status": "failed",
+                "state": "failed",
+                "error_type": "TimeoutError",
+            },
+            {
+                "request_id": "search-1",
+                "operation": "search",
+                "status": "ok",
+                "state": "completed",
+                "result_count": 2,
+            },
+        ],
+    )
+    imported = import_external_result(tmp_path)
+    assert imported["source"] == "production_http_replay"
+    assert imported["summary"]["total_questions"] == 3
+    assert imported["summary"]["total_correct"] == 2
+    assert imported["summary"]["run_validity"]["valid"] is False
+    assert imported["benchmark_diagnostics"]["dataset_state"] == "partially_written"
+
+
+def test_production_replay_import_requires_events_and_known_schema(tmp_path: Path):
+    _write_replay_summary(tmp_path)
+    with pytest.raises(FileNotFoundError, match="request_events.jsonl"):
+        import_external_result(tmp_path)
+
+    _write_replay_events(tmp_path, [])
+    _write_replay_summary(tmp_path, schema="unknown/1")
+    with pytest.raises(ValueError, match="unsupported production replay schema"):
+        import_external_result(tmp_path)
+
+
+def test_production_replay_import_rejects_malformed_and_duplicate_events(tmp_path: Path):
+    _write_replay_summary(tmp_path)
+    (tmp_path / "request_events.jsonl").write_text("not-json\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="line 1"):
+        import_external_result(tmp_path)
+
+    duplicate = {
+        "request_id": "same",
+        "operation": "add",
+        "status": "ok",
+        "state": "completed",
+    }
+    _write_replay_events(tmp_path, [duplicate, duplicate])
+    with pytest.raises(ValueError, match="duplicate request_id"):
+        import_external_result(tmp_path)
+
+
+@pytest.mark.parametrize("forbidden", ["raw_request", "messages", "query", "memories"])
+def test_production_replay_import_rejects_content_fields(
+    tmp_path: Path, forbidden: str
+):
+    _write_replay_summary(
+        tmp_path,
+        dataset_state="complete",
+        operations={
+            "add": {"count": 1, "success": 1},
+            "search": {"count": 0, "success": 0},
+        },
+    )
+    _write_replay_events(
+        tmp_path,
+        [
+            {
+                "request_id": "add-1",
+                "operation": "add",
+                "status": "ok",
+                "state": "completed",
+                forbidden: "secret",
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="forbidden event field"):
+        import_external_result(tmp_path)
+
+
+def test_production_replay_import_rejects_content_fields_in_summary(tmp_path: Path):
+    _write_replay_summary(
+        tmp_path,
+        dataset_state="complete",
+        operations={
+            "add": {"count": 1, "success": 1, "raw_request": "SUMMARY_SECRET"},
+            "search": {"count": 0, "success": 0},
+        },
+    )
+    _write_replay_events(
+        tmp_path,
+        [
+            {
+                "request_id": "add-1",
+                "operation": "add",
+                "status": "ok",
+                "state": "completed",
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="forbidden add summary field"):
+        import_external_result(tmp_path)
+
+
+@pytest.mark.parametrize("poison", [
+    {"operations": {"add": {"count": 0, "success": 0}, "search": {"count": 0, "success": 0},
+                    "raw_request": {"api_key": "PRIVATE_SENTINEL"}}},
+    {"operations": {"add": {"count": 0, "success": 0, "qps": {"query": "PRIVATE_SENTINEL"}},
+                    "search": {"count": 0, "success": 0}}},
+    {"operations": {"add": {"count": 0, "success": 0}, "search": {
+        "count": 0, "success": 0, "result_count_distribution": {"PRIVATE_SENTINEL": 1}}}},
+    {"operations": {"add": {"count": 0, "success": 0}, "search": {
+        "count": 0, "success": 0, "result_count_distribution": {"0": {"messages": "PRIVATE_SENTINEL"}}}}},
+    {"join_coverage": {"client_requests": {"api_key": "PRIVATE_SENTINEL"}}},
+    {"model_mode": {"messages": "PRIVATE_SENTINEL"}},
+    {"dataset_state": "PRIVATE_SENTINEL"},
+    {"attribution_status": "PRIVATE_SENTINEL"},
+    {"raw_request": "PRIVATE_SENTINEL"},
+])
+def test_replay_import_rejects_nested_content(tmp_path: Path, poison):
+    _write_replay_summary(tmp_path, **poison)
+    _write_replay_events(tmp_path, [{
+        "request_id": "add-1", "operation": "add", "status": "ok", "state": "completed",
+    }])
+    with pytest.raises(ValueError) as exc:
+        import_external_result(tmp_path)
+    assert "PRIVATE_SENTINEL" not in str(exc.value)
+
+
+@pytest.mark.parametrize("metric,value", [
+    ("count", True), ("success", "1"), ("qps", float("nan")),
+    ("p95_ms", float("inf")), ("p50_ms", -1), ("success_rate", 1.1),
+])
+def test_replay_import_rejects_invalid_metric_types(tmp_path: Path, metric, value):
+    _write_replay_summary(tmp_path, operations={
+        "add": {"count": 1, "success": 1, metric: value},
+        "search": {"count": 0, "success": 0},
+    })
+    _write_replay_events(tmp_path, [{
+        "request_id": "add-1", "operation": "add", "status": "ok", "state": "completed",
+    }])
+    with pytest.raises(ValueError):
+        import_external_result(tmp_path)

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from memory_bench_platform.integration import build_run_contract, get_memory_manifest, resolve_run_skill_bundle
 
@@ -182,3 +183,81 @@ def test_resolve_run_skill_bundle_rejects_incompatible_memory_unit(tmp_path: Pat
 
     with pytest.raises(ValueError, match="ingest_unit='session'"):
         resolve_run_skill_bundle("demo", "demo-agent", skills_root=skills)
+
+
+def test_resolve_run_skill_bundle_enforces_raw_protocol_and_actions(tmp_path: Path):
+    skills = tmp_path / "skills"
+    for kind, skill_id in (
+        ("benchmarks", "replay"),
+        ("agents", "agent"),
+        ("memories", "memory"),
+    ):
+        (skills / kind / skill_id).mkdir(parents=True)
+
+    policy = {
+        "default_selection": "latest_official_release_tag",
+        "resolution_order": ["latest_official_release_tag"],
+        "allowed_overrides": ["user_specified_official_version"],
+        "disallowed_defaults": ["dirty_worktree"],
+        "targets": [
+            {
+                "name": "runtime",
+                "scope": "runtime_dependency",
+                "version_source": "runtime_observed_only",
+            }
+        ],
+    }
+    benchmark = {
+        "kind": "benchmark",
+        "id": "replay",
+        "version": "0.1.0",
+        "version_policy": policy,
+        "entry": {"validator": "scripts/validate.py"},
+        "requirements": {
+            "memory": {
+                "actions": ["ingest", "status", "recall"],
+                "raw_request_protocols": ["openmem-v1"],
+            }
+        },
+    }
+    agent = {
+        "kind": "agent",
+        "id": "agent",
+        "version": "0.1.0",
+        "version_policy": policy,
+        "entry": {"runner": "scripts/run.py"},
+    }
+    memory = {
+        "kind": "memory",
+        "id": "memory",
+        "version": "0.1.0",
+        "version_policy": policy,
+        "entry": {"runner": "scripts/run.py"},
+        "capabilities": {"actions": ["ingest", "recall"]},
+    }
+    for kind, skill_id, payload in (
+        ("benchmarks", "replay", benchmark),
+        ("agents", "agent", agent),
+        ("memories", "memory", memory),
+    ):
+        (skills / kind / skill_id / "manifest.yaml").write_text(
+            yaml.safe_dump(payload), encoding="utf-8"
+        )
+
+    with pytest.raises(ValueError, match="raw request protocols: openmem-v1"):
+        resolve_run_skill_bundle("replay", "agent", "memory", skills_root=skills)
+
+    memory["capabilities"]["raw_request_protocols"] = ["openmem-v1"]
+    (skills / "memories" / "memory" / "manifest.yaml").write_text(
+        yaml.safe_dump(memory), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="memory actions: status"):
+        resolve_run_skill_bundle("replay", "agent", "memory", skills_root=skills)
+
+    memory["capabilities"]["actions"] = ["ingest", "status", "recall"]
+    (skills / "memories" / "memory" / "manifest.yaml").write_text(
+        yaml.safe_dump(memory), encoding="utf-8"
+    )
+    bundle = resolve_run_skill_bundle("replay", "agent", "memory", skills_root=skills)
+    assert bundle.memory is not None
+    assert bundle.memory.id == "memory"

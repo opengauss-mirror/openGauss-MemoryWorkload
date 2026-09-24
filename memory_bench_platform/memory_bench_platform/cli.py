@@ -1046,6 +1046,11 @@ def main(argv: list[str] | None = None) -> None:
                     "DATA_PATH": args.data_path or "",
                     "BENCHMARK_ID": args.benchmark,
                     "AGENT_ID": args.agent,
+                    "MEMORY_BACKEND": str(
+                        run_contract["selection"].get("memory_id") or ""
+                    ),
+                    "MEMORY_INTEGRATION": args.memory_integration,
+                    "RUN_DIR": str(run_dir),
                 }
             )
             env.update(build_external_runner_env(run_record.version_selection))

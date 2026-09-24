@@ -22,6 +22,27 @@ def test_locomo_manifest_marks_multi_turn_stateful_execution():
     )
 
 
+def test_production_http_replay_manifest_declares_raw_protocol_runner():
+    manifest = yaml.safe_load(
+        Path("skills/benchmarks/production-http-replay/manifest.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["dataset"]["requires_data_path"] is True
+    assert (
+        manifest["execution"]["entrypoints"]["replay"]["external_runner"]
+        == "scripts/run_replay.py"
+    )
+    assert manifest["requirements"]["memory"]["actions"] == [
+        "ingest",
+        "status",
+        "recall",
+    ]
+    assert manifest["requirements"]["memory"]["raw_request_protocols"] == [
+        "openmem-v1"
+    ]
+
+
 def test_longmemeval_manifest_declares_scenario_builder():
     manifest = yaml.safe_load(
         Path("skills/benchmarks/longmemeval/manifest.yaml").read_text(encoding="utf-8")

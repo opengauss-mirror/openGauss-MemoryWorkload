@@ -118,6 +118,7 @@ def run_json_script(
     args: list[str] | None = None,
     stdin_payload: dict | None = None,
     environment: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict:
     cmd = [sys.executable, str(script_path), *(args or [])]
     scoped_environment = {
@@ -132,6 +133,7 @@ def run_json_script(
         capture_output=True,
         check=True,
         env=scoped_environment,
+        timeout=timeout_seconds,
     )
     return json.loads(proc.stdout or "{}")
 
@@ -395,7 +397,12 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput) -> dict:
     )
 
 
-def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput:
+def run_memory_task(
+    skill_id: str,
+    request: MemoryTaskInput,
+    *,
+    timeout_seconds: float | None = None,
+) -> MemoryTaskOutput:
     manifest = get_memory_manifest(skill_id)
     manifest_path = _manifest_path("memories", skill_id)
     if not manifest.entry.runner:
@@ -404,6 +411,7 @@ def run_memory_task(skill_id: str, request: MemoryTaskInput) -> MemoryTaskOutput
         payload = run_json_script(
             _script_for_manifest(manifest_path, manifest.entry.runner),
             stdin_payload=request.model_dump(mode="json"),
+            timeout_seconds=timeout_seconds,
         )
     except json.JSONDecodeError as exc:
         raise ValueError(f"memory skill {skill_id} runner returned invalid JSON") from exc
@@ -500,11 +508,14 @@ def _require_runtime_fields(kind: str, action: str, payload: dict[str, Any], fie
 def _validate_memory_action_output(action: str, result: MemoryTaskOutput) -> None:
     if result.status != "ok":
         return
+    if action == "recall":
+        if not isinstance(result.output.get("evidence_text"), str):
+            raise ValueError("memory action 'recall' requires string output.evidence_text")
+        return
     required = {
         "ingest": {"operation.session_id"},
         "flush": {"operation.task_id"},
         "status": {"state"},
-        "recall": {"output.evidence_text"},
     }.get(action, set())
     _require_runtime_fields("memory", action, result.model_dump(mode="json"), required)
 
@@ -628,8 +639,37 @@ def _validate_run_skill_bundle(bundle: RunSkillBundle) -> None:
             f"but agent {bundle.agent.id} protocol_mode={protocol_mode!r}"
         )
 
+    memory_requirements = bundle.benchmark.requirements.get("memory", {})
+    required_actions = {str(item) for item in memory_requirements.get("actions", [])}
+    required_protocols = {
+        str(item) for item in memory_requirements.get("raw_request_protocols", [])
+    }
+
     if bundle.memory is None:
+        if required_actions or required_protocols:
+            raise ValueError(f"benchmark {bundle.benchmark.id} requires a memory backend")
         return
+
+    available_protocols = {
+        str(item)
+        for item in bundle.memory.capabilities.get("raw_request_protocols", [])
+    }
+    missing_protocols = sorted(required_protocols - available_protocols)
+    if missing_protocols:
+        raise ValueError(
+            f"memory {bundle.memory.id} does not support raw request protocols: "
+            + ", ".join(missing_protocols)
+        )
+
+    available_actions = {
+        str(item) for item in bundle.memory.capabilities.get("actions", [])
+    }
+    missing_actions = sorted(required_actions - available_actions)
+    if missing_actions:
+        raise ValueError(
+            f"memory {bundle.memory.id} does not support memory actions: "
+            + ", ".join(missing_actions)
+        )
 
     benchmark_ingest_unit = str(benchmark_execution.get("ingest_unit", "") or "").strip()
     memory_runtime_unit = str(bundle.memory.runtime.get("benchmark_unit", "") or "").strip()
