@@ -232,7 +232,7 @@ def extract_openclaw_response_text(payload: dict) -> str:
 
 def run_openclaw_http(request: dict) -> dict:
     url, headers, body = build_openclaw_http_request(request)
-    timeout_seconds = int(request.get("metadata", {}).get("timeout_seconds") or 600)
+    timeout_seconds = float(request.get("metadata", {}).get("timeout_seconds") or 600)
     http_request = urllib.request.Request(
         url,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
