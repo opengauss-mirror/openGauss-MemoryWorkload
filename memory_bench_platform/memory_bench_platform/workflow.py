@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from contextvars import copy_context
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import subprocess
 import time
 import urllib.request
@@ -67,13 +70,15 @@ def _execute_step_operator(
     )
 
 
-def execute_cases(
+def _execute_case(
     *,
     run_id: str,
     agent_id: str,
     memory_id: str | None = None,
     runtime_context: WorkflowRuntimeContext | None = None,
-    cases: list[CaseRecord],
+    case: CaseRecord,
+    case_execution_status: dict[str, str],
+    case_failure_kind: dict[str, str],
     steps: list[StepRecord],
     execution_spec: ExecutionSpec,
     run_dir: Path,
@@ -86,14 +91,6 @@ def execute_cases(
             agent_id=agent_id,
             memory_id=memory_id,
         )
-    validate_workflow(
-        cases=cases,
-        steps=steps,
-        execution_spec=execution_spec,
-        memory_id=memory_id,
-        memory_plugin_id=runtime_context.memory_plugin_id,
-    )
-
     steps_by_case: dict[str, list[StepRecord]] = {}
     for step in steps:
         steps_by_case.setdefault(step.case_id, []).append(step)
@@ -103,15 +100,14 @@ def execute_cases(
     judge_results: list[JudgeResult] = []
     metrics: list[MetricRecord] = []
     artifacts: list[ArtifactRecord] = []
-    case_execution_status: dict[str, str] = {}
-    case_failure_kind: dict[str, str] = {}
+    judge_job = None
 
     stdout_dir = run_dir / "artifacts" / "step-stdout"
     stderr_dir = run_dir / "artifacts" / "step-stderr"
     stdout_dir.mkdir(parents=True, exist_ok=True)
     stderr_dir.mkdir(parents=True, exist_ok=True)
 
-    for case in cases:
+    for case in [case]:
         case_step_results: list[StepResultRecord] = []
         results_by_step: dict[str, StepResultRecord] = {}
         unsatisfied_case_dependencies = [
@@ -292,14 +288,7 @@ def execute_cases(
                         gate_passed=operator_ok,
                         gate_detail=gate_detail,
                     )
-                except (
-                    subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired,
-                    FileNotFoundError,
-                    ValueError,
-                    urllib.error.URLError,
-                    urllib.error.HTTPError,
-                ) as exc:
+                except Exception as exc:
                     ended_at = _timestamp()
                     stderr_path.write_text(str(exc), encoding="utf-8")
                     final_result = StepResultRecord(
@@ -488,14 +477,7 @@ def execute_cases(
         if case.judge_mode == "none":
             continue
 
-        traces.append(
-            TraceEventRecord(
-                trace_id=f"{case.case_id}-judge-started",
-                case_id=case.case_id,
-                event_type="case_judge_started",
-                timestamp=_timestamp(),
-            )
-        )
+        judge_started_at = _timestamp()
         judge_input = JudgeInput(
             case_id=case.case_id,
             goal=case.goal,
@@ -536,24 +518,11 @@ def execute_cases(
                 score=None,
                 rationale="One or more hard gates failed before final judge.",
             )
-        elif case.judge_mode == "external":
-            judge_result = run_llm_judge(
-                run_id,
-                judge_input,
-                runtime_config=runtime_context.run_contract.get("judge_runtime", {}),
-            )
         else:
-            judge_result = run_builtin_judge(run_id, judge_input)
+            judge_job = judge_input
+            continue
         judge_results.append(judge_result)
-        traces.append(
-            TraceEventRecord(
-                trace_id=f"{case.case_id}-judge-finished",
-                case_id=case.case_id,
-                event_type="case_judge_finished",
-                timestamp=_timestamp(),
-                payload={"passed": judge_result.passed, "label": judge_result.label},
-            )
-        )
+        traces.extend(_judge_traces(case, judge_result, judge_started_at))
 
     return {
         "step_results": step_results,
@@ -561,4 +530,146 @@ def execute_cases(
         "judge_results": judge_results,
         "metrics": metrics,
         "artifacts": artifacts,
+        "_judge_job": judge_job,
+        "_execution_status": case_execution_status[case.case_id],
+        "_failure_kind": case_failure_kind.get(case.case_id),
     }
+
+
+_RESULT_FIELDS = ("step_results", "traces", "judge_results", "metrics", "artifacts")
+
+
+def _judge_case(run_id, case, judge_input, runtime_context):
+    started = _timestamp()
+    try:
+        if case.judge_mode == "external":
+            result = run_llm_judge(run_id, judge_input,
+                runtime_config=runtime_context.run_contract.get("judge_runtime", {}))
+        else:
+            result = run_builtin_judge(run_id, judge_input)
+    except Exception as exc:
+        # A single scoring failure must not discard already generated answers.
+        result = JudgeResult(judge_id=f"{case.case_id}-{case.judge_mode}", run_id=run_id,
+            case_id=case.case_id, passed=None, score=None, label="judge-error",
+            rationale=f"Judge failed ({type(exc).__name__}): {exc}")
+    return result, _judge_traces(case, result, started)
+
+
+def _judge_traces(case, result, started):
+    return [
+        TraceEventRecord(trace_id=f"{case.case_id}-judge-started", case_id=case.case_id,
+            event_type="case_judge_started", timestamp=started),
+        TraceEventRecord(trace_id=f"{case.case_id}-judge-finished", case_id=case.case_id,
+            event_type="case_judge_finished", timestamp=_timestamp(), payload={"passed": result.passed, "label": result.label}),
+    ]
+
+
+def _qa_group_key(case, steps, integration):
+    # Opt in only the composer's read-only QA shape, never arbitrary workflows.
+    if case.reference.get("evaluation_target") != "qa_answer" or case.capability != "memory/question-answering":
+        return None
+    sample, checkpoint = case.reference.get("sample_id"), case.reference.get("checkpoint_id")
+    if not sample or not checkpoint or not case.depends_on_cases:
+        return None
+    if integration == "backend_direct":
+        if len(steps) != 2 or steps[0].operator_kind != "memory" or steps[0].inputs.get("action") != "recall":
+            return None
+        if steps[1].operator_kind != "agent" or steps[1].depends_on != [steps[0].step_id]:
+            return None
+    elif len(steps) != 1 or steps[0].operator_kind != "agent":
+        return None
+    session = steps[-1].inputs.get("metadata", {}).get("session_key")
+    if not isinstance(session, str) or not session.strip():
+        return None
+    return (sample, checkpoint, tuple(case.depends_on_cases))
+
+
+def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
+                  runtime_context: WorkflowRuntimeContext | None = None,
+                  cases: list[CaseRecord], steps: list[StepRecord],
+                  execution_spec: ExecutionSpec, run_dir: Path) -> dict[str, list]:
+    runtime_context = runtime_context or WorkflowRuntimeContext(
+        run_id=run_id, run_dir=str(run_dir), benchmark_id="", agent_id=agent_id, memory_id=memory_id)
+    integration = runtime_context.memory_integration
+    if integration == "agent_plugin" and execution_spec.qa_concurrency != 1:
+        raise ValueError("agent_plugin requires qa_concurrency=1; Judge concurrency is supported")
+    validate_workflow(cases=cases, steps=steps, execution_spec=execution_spec,
+        memory_id=memory_id, memory_plugin_id=runtime_context.memory_plugin_id)
+    by_case = {case.case_id: [] for case in cases}
+    for step in steps:
+        by_case[step.case_id].append(step)
+    groups = []
+    keys = []
+    sessions = set()
+    for case in cases:
+        key = _qa_group_key(case, by_case[case.case_id], integration)
+        if key is not None and execution_spec.qa_concurrency > 1:
+            session = by_case[case.case_id][-1].inputs["metadata"]["session_key"].lower()
+            if session in sessions:
+                raise ValueError("Concurrent QA requires a unique session_key for every question")
+            sessions.add(session)
+        if key is not None and keys and key == keys[-1]:
+            groups[-1].append(case)
+        else:
+            groups.append([case])
+            keys.append(key)
+    outputs, statuses, failures = {}, {}, {}
+    progress = run_dir / "records" / "case-progress"
+    progress.mkdir(parents=True, exist_ok=True)
+
+    def archive(case, output):
+        target = progress / (hashlib.sha256(case.case_id.encode()).hexdigest() + ".json")
+        payload = {"case_id": case.case_id, "execution_status": output["_execution_status"],
+                   "judge_pending": output["_judge_job"] is not None,
+                   **{key: [item.model_dump(mode="json") for item in output[key]] for key in _RESULT_FIELDS}}
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(target)
+
+    with ThreadPoolExecutor(max_workers=execution_spec.qa_concurrency) as qa_pool, \
+         ThreadPoolExecutor(max_workers=execution_spec.judge_concurrency) as judge_pool:
+        for group in groups:
+            # Drain both pools at checkpoint/sample boundaries, before any writes.
+            remaining = iter(group)
+            pending = {}
+            qa_active = 0
+            capacity = (1 if execution_spec.qa_concurrency == execution_spec.judge_concurrency == 1
+                        else execution_spec.qa_concurrency + execution_spec.judge_concurrency * 2)
+            exhausted = False
+            while pending or not exhausted:
+                while not exhausted and qa_active < execution_spec.qa_concurrency and len(pending) < capacity:
+                    case = next(remaining, None)
+                    if case is None:
+                        exhausted = True
+                        break
+                    future = qa_pool.submit(copy_context().run, _execute_case, run_id=run_id, agent_id=agent_id, memory_id=memory_id,
+                        runtime_context=runtime_context, case=case, steps=by_case[case.case_id],
+                        case_execution_status=dict(statuses), case_failure_kind=dict(failures),
+                        execution_spec=execution_spec, run_dir=run_dir)
+                    pending[future] = ("qa", case)
+                    qa_active += 1
+                if not pending:
+                    continue
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    kind, case = pending.pop(future)
+                    if kind == "qa":
+                        qa_active -= 1
+                        output = future.result()
+                        outputs[case.case_id] = output
+                        statuses[case.case_id] = output["_execution_status"]
+                        if output["_failure_kind"]:
+                            failures[case.case_id] = output["_failure_kind"]
+                        archive(case, output)
+                        if output["_judge_job"] is not None:
+                            judge = judge_pool.submit(copy_context().run, _judge_case, run_id, case, output["_judge_job"], runtime_context)
+                            pending[judge] = ("judge", case)
+                    else:
+                        result, traces = future.result()
+                        output = outputs[case.case_id]
+                        output["judge_results"].append(result)
+                        output["traces"].extend(traces)
+                        output["_judge_job"] = None
+                        archive(case, output)
+    # Stable report order is independent of completion order.
+    return {key: [item for case in cases for item in outputs[case.case_id][key]] for key in _RESULT_FIELDS}

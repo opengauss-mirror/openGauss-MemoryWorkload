@@ -195,6 +195,8 @@ class TraceEventRecord(BaseModel):
 class ExecutionSpec(BaseModel):
     case_mode: Literal["single_path", "dag"] = "single_path"
     max_parallel_steps: int = 1
+    qa_concurrency: int = Field(default=1, gt=0)
+    judge_concurrency: int = Field(default=1, gt=0)
     fail_fast: bool = True
     default_retry_limit: int = 0
     default_timeout_seconds: int | None = None

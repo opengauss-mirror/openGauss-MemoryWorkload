@@ -24,7 +24,7 @@ The point of the question is to ask about something one user should know about t
 The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
 Question: Do you remember what I got the last time I went to Hawaii?
 Gold answer: A shell necklace
-The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT.
+Accept semantically equivalent answers and additional information that does not contradict the gold answer. The generated answer must correctly state the core facts required by the question. Merely discussing the same topic is insufficient. Any contradiction of the gold answer's core facts must be graded WRONG.
 
 For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
 
