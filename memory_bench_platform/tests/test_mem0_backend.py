@@ -78,3 +78,21 @@ def test_missing_write_acknowledgement_is_not_success():
 def test_unknown_profile_fails_before_http():
     result, calls = invoke("recall", {"query": "Where?"}, {"results": []}, {"MEM0_HTTP_PROFILE": "cloud"})
     assert result["state"] == "failed" and calls == []
+
+
+@pytest.mark.parametrize("inputs", [
+    {"node_limit": 0}, {"top_k": 0}, {"node_limit": 0, "top_k": 10},
+    {"node_limit": -1}, {"top_k": 1001}, {"node_limit": None}, {"top_k": ""},
+])
+def test_invalid_recall_limit_does_not_fall_back_or_send_http(inputs):
+    result, calls = invoke("recall", {"query": "Where?", **inputs}, {"results": []}, {"MEM0_TOP_K": "8"})
+    assert result["status"] == "failed" and calls == []
+
+
+@pytest.mark.parametrize("inputs,env,expected", [
+    ({}, {}, 20), ({}, {"MEM0_TOP_K": "8"}, 8), ({"top_k": 9}, {}, 9),
+    ({"node_limit": 1, "top_k": 9}, {}, 1), ({"node_limit": 1000}, {}, 1000),
+])
+def test_recall_limit_defaults_precedence_and_boundaries(inputs, env, expected):
+    result, calls = invoke("recall", {"query": "Where?", **inputs}, {"results": []}, env)
+    assert result["status"] == "ok" and calls[0][1]["top_k"] == expected

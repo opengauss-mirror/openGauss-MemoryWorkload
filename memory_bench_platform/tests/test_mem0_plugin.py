@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +31,11 @@ def runtime(tmp_path, monkeypatch):
         "OPENCLAW_GATEWAY_TOKEN": config["gateway"]["auth"]["token"]}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(plugin, "gateway_container", lambda path: "dedicated")
-    monkeypatch.setattr(plugin.time, "sleep", lambda seconds: None)
+    clock = [0.0]
+    def sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(plugin, "time", SimpleNamespace(
+        time=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep))
     restarts = []
     def configure(path, config, state, phase):
         config["plugins"]["entries"][plugin.PLUGIN]["config"].update(
@@ -62,11 +67,11 @@ def test_package_phase_identity_receipts(runtime, monkeypatch):
     check = life("before_agent", agent_request=request())["output"]
     with pytest.raises(ValueError, match="unfinished"):
         life("set_phase", phase="qa")
-    monkeypatch.setattr(plugin, "logs", lambda *args: "openclaw-mem0: auto-captured 2 memories")
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kwargs: "openclaw-mem0: auto-captured 2 memories")
     assert finish(life, check)["output"]["memory_count"] == 2
     life("set_phase", phase="qa")
     check = life("before_agent", agent_request=request("qa", "qa-1"))["output"]
-    monkeypatch.setattr(plugin, "logs", lambda *args: "openclaw-mem0: injecting 2 memories into context")
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kwargs: "openclaw-mem0: injecting 2 memories into context")
     assert finish(life, check)["output"]["checked"]
     entry = json.loads((root / "openclaw.json").read_text())["plugins"]["entries"][plugin.PLUGIN]["config"]
     assert not entry["autoCapture"] and entry["autoRecall"]
@@ -94,7 +99,7 @@ def test_missing_hook_and_stale_receipt(runtime, monkeypatch):
     _, _, life, _ = runtime
     life("set_phase", phase="qa")
     check = life("before_agent", agent_request=request("qa"))["output"]
-    monkeypatch.setattr(plugin, "logs", lambda *args: "")
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kwargs: "")
     with pytest.raises(RuntimeError, match="No positive native"): finish(life, check)
     with pytest.raises(ValueError, match="context mismatch"): finish(life, {**check, "nonce": "old"})
     with pytest.raises(ValueError, match="Parallel"): life("before_agent", agent_request=request("qa"))
@@ -144,3 +149,59 @@ def test_restart_applies_native_switches_and_failure_stays_unready(runtime, monk
     monkeypatch.setattr(plugin.subprocess, "run", fail)
     with pytest.raises(OSError): native_configure(path, config, state, "ingest")
     assert json.loads(path.read_text())["gateway_ready"] is False
+
+
+@pytest.mark.parametrize("second_log,error", [
+    ("openclaw-mem0: injecting 2 memories into context", None),
+    ("openclaw-mem0: recall timed out\nopenclaw-mem0: injecting 2 memories into context", "exceeded its deadline"),
+    ("openclaw-mem0: recall failed: unavailable", "hook failed"),
+])
+def test_qa_waits_for_delayed_logs_without_accepting_failed_recall(runtime, monkeypatch, second_log, error):
+    _, _, life, _ = runtime
+    life("set_phase", phase="qa")
+    check = life("before_agent", agent_request=request("qa"))["output"]
+    calls = []
+    def delayed(container, since, *, timeout):
+        calls.append((since, timeout))
+        return "" if len(calls) == 1 else second_log
+    monkeypatch.setattr(plugin, "logs", delayed)
+    if error:
+        with pytest.raises(RuntimeError, match=error): finish(life, check)
+    else:
+        assert finish(life, check)["output"]["memory_count"] == 2
+    assert len(calls) == 2 and all(since == check["log_since"] for since, _ in calls)
+    assert 0 < calls[1][1] < calls[0][1] == 1
+
+
+@pytest.mark.parametrize("late_success", [False, True])
+def test_qa_log_wait_is_bounded_and_rejects_success_after_deadline(runtime, monkeypatch, late_success):
+    root, _, life, _ = runtime
+    provenance = json.loads((root / "provenance.json").read_text())
+    provenance["timeout_seconds"] = 300
+    (root / "provenance.json").write_text(json.dumps(provenance))
+    life("set_phase", phase="qa")
+    check = life("before_agent", agent_request=request("qa"))["output"]
+    calls = []
+    def delayed(container, since, *, timeout):
+        calls.append(timeout)
+        if late_success:
+            plugin.time.sleep(timeout)
+            return "openclaw-mem0: injecting 2 memories into context"
+        return ""
+    monkeypatch.setattr(plugin, "logs", delayed)
+    start = plugin.time.monotonic()
+    with pytest.raises(RuntimeError, match="No positive native"): finish(life, check)
+    assert plugin.time.monotonic() - start == pytest.approx(3)
+    assert calls[0] == 3 and all(0 < timeout <= 3 for timeout in calls)
+    assert len(calls) == 1 if late_success else len(calls) > 1
+    assert json.loads((root / "phase.json").read_text())["pending"] == check
+
+
+def test_log_read_uses_remaining_subprocess_budget(monkeypatch):
+    seen = {}
+    def read_logs(args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(stdout="", stderr="")
+    monkeypatch.setattr(plugin.subprocess, "run", read_logs)
+    plugin.logs("dedicated", "0", timeout=0.25)
+    assert seen["timeout"] == 0.25

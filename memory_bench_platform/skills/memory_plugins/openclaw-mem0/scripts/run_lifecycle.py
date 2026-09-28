@@ -110,9 +110,9 @@ def gateway_container(path):
     return name
 
 
-def logs(container, since):
+def logs(container, since, *, timeout=20):
     result = subprocess.run(["docker", "logs", "--timestamps", "--since", str(since), container],
-                            check=True, capture_output=True, text=True, timeout=20)
+                            check=True, capture_output=True, text=True, timeout=timeout)
     return "\n".join(sorted((result.stdout + "\n" + result.stderr).splitlines()))
 
 
@@ -307,16 +307,19 @@ def dispatch(request, path, config):
             operation = "ingest" if pending["phase"] == "ingest" else "recall"
             receipt = path.parent / "receipts" / f"{pending['nonce']}-{operation}.json"
             timeout = json.loads(path.with_name("provenance.json").read_text())["timeout_seconds"]
-            deadline = time.monotonic() + timeout
             container = gateway_container(path)
+            # Allow brief Docker log visibility lag without extending native recall.
+            deadline = time.monotonic() + (min(timeout, 3) if pending["phase"] == "qa" else timeout)
             while True:
-                text = logs(container, pending["log_since"])
-                proof = native_receipt(text, pending["phase"])
-                if proof:
-                    break
-                if pending["phase"] == "qa" or time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise RuntimeError("No positive native Mem0 completion marker; empty results/skipped hooks cannot be verified by official 1.2.0")
-                time.sleep(1)
+                text = logs(container, pending["log_since"], timeout=min(20, remaining))
+                proof = native_receipt(text, pending["phase"])
+                if proof and time.monotonic() < deadline:
+                    break
+                interval = 0.2 if pending["phase"] == "qa" else 1
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
             data = {**pending, **proof, "session_id": handle["session_id"], "user_id": state["user_id"],
                     "verification": "exclusive_serial_gateway_log_window", "package_version": "1.2.0"}
             save(receipt, data)

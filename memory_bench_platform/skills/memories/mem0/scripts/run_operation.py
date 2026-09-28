@@ -52,7 +52,13 @@ def run_operation(request, *, environ=None, urlopen=None):
             query = inputs.get("query")
             if not isinstance(query, str) or not query.strip():
                 raise ValueError("recall requires nonempty query")
-            limit = int(inputs.get("node_limit") or inputs.get("top_k") or env.get("MEM0_TOP_K", "20"))
+            if "node_limit" in inputs:
+                raw_limit = inputs["node_limit"]
+            elif "top_k" in inputs:
+                raw_limit = inputs["top_k"]
+            else:
+                raw_limit = env.get("MEM0_TOP_K", "20")
+            limit = int(raw_limit)
             if not 1 <= limit <= 1000:
                 raise ValueError("Mem0 retrieval limit must be between 1 and 1000")
             body = {"query": query, "filters": {"user_id": user}}
