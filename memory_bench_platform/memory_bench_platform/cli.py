@@ -95,6 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list-skills")
 
+    p_deploy = sub.add_parser("deploy")
+    p_deploy.add_argument("--config", type=Path)
+    p_deploy.add_argument("--agent-config", action="append", default=[])
+    p_deploy.add_argument("--memory-config", action="append", default=[])
+    deploy_sub = p_deploy.add_subparsers(dest="deploy_action")
+    deploy_status = deploy_sub.add_parser("status")
+    deploy_status.add_argument("--deployment", required=True)
+    p_undeploy = sub.add_parser("undeploy")
+    p_undeploy.add_argument("--deployment", required=True)
+
     p_plan = sub.add_parser("plan-run")
     p_plan.add_argument("--benchmark", required=True)
     p_plan.add_argument("--agent", required=True)
@@ -135,8 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_trace_arguments(p_plan)
 
     p_run = sub.add_parser("run")
-    p_run.add_argument("--benchmark", required=True)
-    p_run.add_argument("--agent", required=True)
+    p_run.add_argument("--benchmark")
+    p_run.add_argument("--agent")
+    p_run.add_argument("--deployment")
+    p_run.add_argument("--combination")
+    p_run.add_argument("--pressure-test")
     p_run.add_argument("--memory-backend")
     p_run.add_argument(
         "--memory-integration",
@@ -819,6 +832,44 @@ def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command in {"deploy", "undeploy"} or (args.command == "run" and args.deployment):
+        from .deployment_docker import DockerClient
+        from .deployment_lifecycle import deploy, status, undeploy
+        from .deployment_run import run_deployment
+        docker = DockerClient()
+        try:
+            if args.command == "deploy" and args.deploy_action == "status":
+                checked = status(args.deployment, Path.cwd(), docker)
+                print(json.dumps({"ready": checked.ready, "drift": checked.drift,
+                                  "deployment": args.deployment}, ensure_ascii=False))
+                if not checked.ready:
+                    raise SystemExit(1)
+            elif args.command == "deploy":
+                if not args.config:
+                    parser.error("deploy requires --config")
+                state = deploy(args.config, Path.cwd(), docker, args.agent_config, args.memory_config)
+                print(json.dumps({"deployment": state.name, "ready": state.ready}, ensure_ascii=False))
+            elif args.command == "undeploy":
+                undeploy(args.deployment, Path.cwd(), docker)
+            else:
+                if args.pressure_test:
+                    parser.error("--pressure-test requires the separate multi-agent pressure implementation")
+                if args.combination and not args.deployment:
+                    parser.error("--combination requires --deployment")
+                conflicts = [name for name in ("benchmark", "agent", "memory_backend", "data_path", "workload_config", "entrypoint")
+                             if getattr(args, name, None)]
+                if conflicts or getattr(args, "memory_integration_explicit", False):
+                    parser.error("--deployment cannot be combined with manual run selection options")
+                rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker)
+                if rc:
+                    raise SystemExit(rc)
+        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            parser.error(str(exc))
+        return
+    if args.command == "run" and (not args.benchmark or not args.agent):
+        parser.error("run requires --benchmark and --agent unless --deployment is used")
+    if args.command == "run" and (args.combination or args.pressure_test):
+        parser.error("--combination and --pressure-test require --deployment")
     if args.command == "token-proxy":
         from .token_proxy import serve
         serve(args.config, args.audit_dir, args.port)
