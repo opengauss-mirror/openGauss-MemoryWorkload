@@ -23,9 +23,11 @@
 - `skill`：Agent 或 Memory Skill ID；向量库、图数据库和 Mock Server 无 Skill 要求。
 - `image.name`：Compose 使用的镜像名或 digest；`image.archive` 可选，为本地 tar 包。若给出 archive，先 `docker load`，随后验证所需镜像确实存在；若只给镜像名，交由 Docker 拉取或使用本地缓存。归档记录实际 image ID。
 - `container_port`、`endpoint_scheme`（默认 `http`，图数据库可指定 `bolt` 等）和必需的容器健康检查；宿主端口仅绑定回环地址，交给 Docker 分配空闲端口。部署后从 Docker 查询实际端口，不预测端口号。
-- 可选 `command`（容器启动程序及固定参数的 argv 数组）、`startup_args`（Agent/记忆系统的可变启动参数 argv 数组，默认空）、非敏感的 `environment`、从宿主环境读取的 `environment_from`、只读 `config_mounts`、持久化的 `state_mounts`。生成 Compose 时，有 `command` 则使用 `command + startup_args`；只有非空 `startup_args` 时将其作为镜像 ENTRYPOINT 的参数，并在创建容器前验证镜像确有 ENTRYPOINT；两者均为空时不生成 Compose `command`，保留镜像默认行为。实际启动 argv 还包括镜像 ENTRYPOINT。各参数作为独立 argv 元素，不经 shell。引用的宿主环境变量在部署前检查；实际值不写进生成的 Compose 文件或平台部署记录。启动参数会出现在 Compose 文件及容器元数据中，只能传非敏感值；凭据使用 `environment_from`。`state_mounts` 默认生成所属组合或共享记忆实例专属的 Docker volume；需要从宿主侧读取 OpenClaw state 的挂载可显式标记 `host_visible: true`，其目录放在所属部署目录内。
+- 可选 `command`（容器启动程序及固定参数的 argv 数组）、非敏感的 `environment`、从宿主环境读取的 `environment_from`、只读 `config_mounts`、可覆盖的 `config_files` 和持久化的 `state_mounts`。`command` 保持模板原值，不受 deploy 参数影响；未设置时保留镜像默认启动行为。引用的宿主环境变量在部署前检查；实际值不写进生成的 Compose 文件或平台部署记录。`state_mounts` 默认生成所属组合或共享记忆实例专属的 Docker volume；需要从宿主侧读取 OpenClaw state 的挂载可显式标记 `host_visible: true`，其目录放在所属部署目录内。
+- Agent 和记忆系统的 `config_files` 以唯一文件键声明 `source`、容器内绝对路径 `target`、`format`（首版 `json` 或 `yaml`）和非空 `parameters`。每个参数以唯一短名称声明指向现有字段的 RFC 6901 JSON Pointer `pointer` 和严格值类型 `type`（`string`、`integer`、`number`、`boolean`）。参数名在同一服务模板内唯一；同一文件中两个参数不得指向同一字段。`source` 是 YAML 目录下的文件，`target` 不得与其他配置或状态挂载重叠。平台只修改显式列出的参数，不创建缺失路径或改变字段类型；不提供通用文本替换、任意路径修改或启动参数修改。普通 `config_mounts` 保持原样、只读挂载，不接受字段覆盖。
+- 部署时先读取源配置，再为每个物理 Agent/记忆实例生成独立副本，应用该实例的 CLI 覆盖，最后只读挂载到 `target`。原始文件不修改；未覆盖的字段保持原值。共享记忆实例只有一份副本。生成目录权限为 0700，文件权限为 0600；部署前验证容器运行用户可读取挂载文件。状态和日志只记录参数名、来源及配置文件哈希，不回显配置内容或 CLI 值。覆盖参数只用于非敏感字段；凭据继续通过 `environment_from`，避免在命令行历史中留下凭据。源文件若含凭据，副本按敏感文件处理并在 `undeploy` 时清理。配置文件解析失败、字段不存在、类型不符或写入/挂载失败均在容器启动前报错。
 - Agent 和记忆系统模板的 `client.endpoint_env`：运行 Skill 所需的宿主侧 URL 环境变量名，例如 `OPENCLAW_GATEWAY_URL`、`MEM0_API_URL` 或 `OPENVIKING_API_URL`。`client.environment_from` 可传递运行 Skill 所需的凭据变量，但部署记录只保存变量名；向量库、图数据库和 Mock Server 模板不要求 `client`。
-- Agent 和记忆系统模板的 `verify.command` 与 `verify.expected_version`：健康检查通过后，在容器内执行只读命令。命令输出 JSON，包含 `version`、实际配置的 `endpoints` 和逐依赖的 `reachable` 布尔值；平台精确比较版本和本组合生成的地址，并要求每个声明的依赖可达。缺少命令或检查不符时，该组合不能进入 ready。向量库、图数据库和 Mock Server 以容器健康检查为最低要求，也可配置同样的版本检查。
+- Agent 和记忆系统模板的 `verify.command` 与 `verify.expected_version`：健康检查通过后，在容器内执行只读命令。命令输出 JSON，包含 `version`、实际配置的 `endpoints`、逐依赖的 `reachable` 布尔值，以及按模板参数名返回的 `effective_parameters`；平台精确比较版本、地址、可覆盖字段的生效值，并要求每个声明的依赖可达。核验输出仅用于进程内比较，不写入状态或日志。缺少命令或检查不符时，该组合不能进入 ready。向量库、图数据库和 Mock Server 以容器健康检查为最低要求，也可配置同样的版本检查。
 - 可选 `resources.cpus`、`resources.memory_mb` 和 `resources.numa_node`：前两项既作为容器限额，也参与启动前的 Docker 可用容量检查。NUMA 只在 Linux 主机显式启用；无法识别 NUMA 拓扑或资源不足时，在创建容器前失败。未指定资源时沿用 Docker 默认调度，不声称资源隔离。
 
 Mock Server 模板沿用镜像、环境变量、只读配置挂载、状态挂载、健康检查和资源字段，并以非空 `endpoints` 映射声明一个或多个命名监听端口、协议及 `model_mode`（`replay-zero-delay`、`replay-with-delay` 或 `mock-fixed`），例如 `chat` 和 `embedding`。每个端口仅在宿主回环地址发布。它不需要 Agent/Memory Skill，也不要求 `verify.command`；被测 Agent 或记忆系统通过 `service_endpoints` 引用 `mock.<端点名>`。平台为引用方生成 Mock 健康依赖，并在引用方的 `verify.command` 中检查实际指向及可达性。Mock 模板可挂载只读 trace 或模型响应文件；平台不解释其内容。
@@ -64,7 +66,13 @@ agents:
     skill: openclaw
     image: {name: "example/openclaw:tag", archive: ./images/openclaw.tar}
     command: [node, /app/server.js]
-    startup_args: [--log-level, info]
+    config_files:
+      runtime:
+        source: ./configs/openclaw.json
+        target: /runtime/openclaw.json
+        format: json
+        parameters:
+          log_level: {pointer: /logging/level, type: string}
     container_port: 18789
     healthcheck: [CMD, node, /app/healthcheck.js]
     service_endpoints: {MEMORY_URL: memory}
@@ -83,7 +91,13 @@ memories:
     skill: mem0
     image: {name: "example/mem0:tag", archive: ./images/mem0.tar}
     command: [python, /app/server.py]
-    startup_args: [--workers, "2"]
+    config_files:
+      runtime:
+        source: ./configs/mem0.yaml
+        target: /app/config.yaml
+        format: yaml
+        parameters:
+          workers: {pointer: /server/workers, type: integer}
     container_port: 8000
     healthcheck: [CMD, python, /app/healthcheck.py]
     state_mounts: [{target: /app/data}]
@@ -192,23 +206,23 @@ combinations:
 
 此片段展示替代映射，不是附加到上方示例的完整配置。共享实例测试与独立实例测试必须在报告中区分，不能把相同记忆镜像误当作相同物理实例。
 
-部署时可临时覆盖指定 Agent 或记忆实例的 `startup_args`，无需改 YAML：
+部署时可临时覆盖指定 Agent 或记忆实例的配置文件字段，无需修改源文件：
 
 ```bash
 memory-bench deploy --config deployment.yaml \
-  --agent-start-args 'claw-mem0=["--log-level","debug"]' \
-  --memory-start-args 'claw-mem0=["--workers","4"]'
+  --agent-config 'claw-mem0:log_level="debug"' \
+  --memory-config 'claw-mem0:workers=4'
 ```
 
-每个选项可重复用于不同实例，值为 `<实例 ID>=<JSON 字符串数组>`。Agent 实例 ID 始终是组合 ID；独立记忆实例 ID 也是组合 ID，共享记忆实例 ID 使用 `shared_memory_instances` 的键。一个 ID 只能覆盖一次；未知 ID、重复 ID、非字符串数组或不属于该角色的 ID 在任何容器启动前报错。命令行列表**整体替换**该实例从模板继承的 `startup_args`，`[]` 表示清空；未指定覆盖的实例保留 YAML 值。共享记忆实例只接受一份参数，不能从不同 Agent 组合分别覆盖。覆盖只对本次新部署生效；同名已存在的部署仍须先 `undeploy`，不能用重复 deploy 原地改容器。
+每个选项可重复，格式为 `<实例 ID>:<参数名>=<JSON 值>`，按第一个 `=` 分割，值使用 JSON 解析，以保留数字、布尔和字符串类型。Agent 实例 ID 始终是组合 ID；独立记忆实例 ID 也是组合 ID，共享记忆实例 ID 使用 `shared_memory_instances` 的键。同一实例的不同参数可以分别覆盖；同一参数重复、未知实例/参数、角色不符、JSON 无效、值类型不符均在任何容器启动前报错。共享记忆实例只接受一份物理实例配置，不允许从不同 Agent 组合分别修改。未指定覆盖的字段保留源文件值；覆盖只对本次新部署生效，同名已存在的部署仍须先 `undeploy`。
 
 ## 部署状态与生命周期
 
-`deploy` 先解析全部组合和压测映射、合并并校验启动参数覆盖、验证数据文件及 Skill 能力、检查镜像 archive 与环境引用，然后开始 Docker 操作。生成内容位于当前工作目录的 `.memory-bench/deployments/<name>/`，包括不含凭据的配置摘要、每个 project 的 Compose 文件和状态记录。解析后的完整启动 argv 和来源（YAML 或 CLI）进入配置指纹及部署记录；平台通过 Docker inspect 核对容器配置的 ENTRYPOINT/CMD，`verify.command` 继续核对服务实际版本、地址和依赖，`deploy status` 检测启动参数漂移。此目录应由 Git 忽略。部署名在该工作目录内唯一；同名已存在时不重建或覆盖，要求先显式清理。
+`deploy` 先解析全部组合和压测映射、校验配置字段覆盖、验证数据文件及 Skill 能力、检查镜像 archive 与环境引用，然后开始 Docker 操作。生成内容位于当前工作目录的 `.memory-bench/deployments/<name>/`，包括不含凭据的配置摘要、每个 project 的 Compose 文件、实例配置副本和状态记录。配置指纹包含源文件与生成副本的哈希、参数名和来源（源文件或 CLI），不保存 CLI 值；`deploy status` 复核副本哈希、容器挂载源路径和 `verify.command` 输出中的实际生效配置字段、版本、地址与依赖，以发现漂移。服务的 `verify.command` 必须输出每个可覆盖参数的实际生效值供平台比较；比较结果仅报告字段名和是否匹配，不回显值。无法核实实际生效值时不得标记 ready。此目录应由 Git 忽略。部署名在该工作目录内唯一；同名已存在时不重建或覆盖，要求先显式清理。
 
 在 Docker 操作前，按实际要创建的容器汇总 CPU/内存限额；共享实例的记忆容器和数据库只计一次，与 Docker 运行环境可用资源比较。明确声明的 NUMA 位置也在此时规划并检查。容量不足直接失败，不先启动部分组合。未声明的资源不计入可保证容量。镜像 archive 仅验证存在、可加载并含所需镜像名；本阶段不计算 SHA256，也不校验镜像架构。
 
-启动每个 project 后，等待其全部服务健康，执行版本、实际配置和依赖连通性核验。若 `seed.enabled: true`，在部署阶段按“临时提升向量库资源（若配置）→ seed → 索引/后端就绪轮询 → 恢复原始资源并核验 → 再次确认就绪”的顺序准备基线；共享记忆实例只做一次。若只启用 readiness，也在部署阶段确认现有数据已就绪。任何失败或中断都尝试恢复资源；恢复失败时不得标记 ready。记录 project 名、组合 ID、共享实例 ID（若有）、容器 ID、宿主回环端口、镜像 ID、资源限额、配置哈希、seed/就绪结果和创建时间。若任一组失败，停止并移除本次新建的所有 project 和数据卷，保留脱敏失败诊断。只有全部检查通过后才将部署状态标记为 ready。部署不运行 benchmark；只有明确启用 seed 时才写入共享基线数据，且每个新记忆实例只执行一次。
+启动每个 project 后，等待其全部服务健康，执行版本、实际配置和依赖连通性核验。若 `seed.enabled: true`，在部署阶段按“临时提升向量库资源（若配置）→ seed → 索引/后端就绪轮询 → 恢复原始资源并核验 → 再次确认就绪”的顺序准备基线；共享记忆实例只做一次。若只启用 readiness，也在部署阶段确认现有数据已就绪。任何失败或中断都尝试恢复资源；恢复失败时不得标记 ready。记录 project 名、组合 ID、共享实例 ID（若有）、容器 ID、宿主回环端口、镜像 ID、资源限额、配置哈希、seed/就绪结果和创建时间。若任一组失败，停止并移除本次新建的所有 project、数据卷和生成的配置副本，保留脱敏失败诊断。只有全部检查通过后才将部署状态标记为 ready。部署不运行 benchmark；只有明确启用 seed 时才写入共享基线数据，且每个新记忆实例只执行一次。
 
 `memory-bench deploy status --deployment <name>` 重新读取 Docker 实际状态，显示每组及共享实例的服务健康、端口、镜像 ID、资源限额、配置指纹和 seed/就绪状态；启用了 readiness 的实例重新执行只读就绪检查。容器缺失、被替换、镜像改变、配置核验或就绪检查失败时报告 drift，并给出非零退出码。状态输出不包含凭据。`run --deployment` 使用同一状态核验，不信任旧的 ready 标记，也不重新执行部署基线 seed。
 
@@ -240,4 +254,4 @@ memory-bench deploy --config deployment.yaml \
 
 ## 验证
 
-测试覆盖：严格 YAML 校验和路径解析；模板 `startup_args`、CLI 按实例整体替换及 `[]` 清空、共享记忆唯一覆盖、镜像 ENTRYPOINT 检查和实际 argv 漂移；archive 加载后镜像名校验；独立组合与共享记忆实例的 Compose project、卷、端口、容量只计一次和网络隔离，包括可选图数据库与 Mock Server 的地址注入、命名端口及健康依赖；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed/readiness/warmup 开关默认关闭，启用基线 seed 必须启用 readiness，共享实例 deploy 仅 seed 一次，run 按身份逐用户 seed 并按需 warmup，保留 workflow 的 checkpoint readiness；压测映射与适配器能力校验、实际 Agent→指定记忆实例路由探针、共享插件作用域、跨 target 并发与限流、有限回放和稳态检索、用户身份/正确性/隔离门槛、运行锁、部分失败和分层报告；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
+测试覆盖：严格 YAML 校验和路径解析；JSON/YAML 配置源文件、每实例副本、允许字段的类型化 CLI 覆盖、重复或未知字段拒绝、共享记忆唯一副本、配置挂载和实际生效值漂移；archive 加载后镜像名校验；独立组合与共享记忆实例的 Compose project、卷、端口、容量只计一次和网络隔离，包括可选图数据库与 Mock Server 的地址注入、命名端口及健康依赖；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed/readiness/warmup 开关默认关闭，启用基线 seed 必须启用 readiness，共享实例 deploy 仅 seed 一次，run 按身份逐用户 seed 并按需 warmup，保留 workflow 的 checkpoint readiness；压测映射与适配器能力校验、实际 Agent→指定记忆实例路由探针、共享插件作用域、跨 target 并发与限流、有限回放和稳态检索、用户身份/正确性/隔离门槛、运行锁、部分失败和分层报告；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
