@@ -12,3 +12,5 @@ ClusterBench/
 trace-replayer/
 data/
 .worktrees/
+
+.memory-bench/deployments/
