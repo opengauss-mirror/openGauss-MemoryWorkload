@@ -40,7 +40,7 @@ Mock Server 仅接入引用方所在的网络：Agent 引用时接入 `agent_net
 
 组合包含 `id`、`benchmark`、`agent`、`memory`、可选 `vector`、可选 `graph`、可选 `mock`、`memory_integration`、`data_path`、可选 `entrypoint` 和可选非敏感运行参数。benchmark 数据路径及 Skill 契约在部署前校验。组合的 `entrypoint` 必须是平台原生 scenario/case 入口；外部 runner 入口报错。`agent_plugin` 组合还必须能由现有 Skill 解析出对应的 Memory Plugin Skill。
 
-组合可选 `preparation`，包含容器内运行的 `seed`、`readiness`、`warmup` 命令，以及只针对该组向量库的 `seed_resource_boost`（临时 CPU/内存限额）。每条命令以 argv 数组和目标角色表示，不经 shell；未声明的步骤跳过。`readiness` 命令输出 `{"ready": true, "details": {...}}`，平台在期限内轮询并要求配置的连续成功次数。模板只提供执行机制，何为索引完成、如何构造基线数据由对应数据库/benchmark 脚本定义。
+组合可选 `preparation`。`seed` 和 `warmup` 各有 `enabled` 开关，默认 `false`；启用时必须提供目标服务角色和容器内 argv 命令。`seed_resource_boost` 可为该组向量库设置 seed 期间的临时 CPU/内存限额。`readiness` 有独立的 `enabled` 开关，默认 `false`；启用 seed 时必须同时启用 readiness，避免未完成索引就把部署标记为 ready。readiness 命令必须只读，输出 `{"ready": true, "details": {...}}`；平台在期限内轮询并要求配置的连续成功次数。各命令不经 shell；何为基线索引完成、如何构造基线数据由对应数据库/benchmark 脚本定义。此处的 readiness 检查部署基线；workflow 在每次写入后的 checkpoint readiness 仍属于 run，不能提前到 deploy。
 
 示意结构（字段值需匹配实际镜像和 Skill）：
 
@@ -107,6 +107,10 @@ combinations:
     mock: model-replay
     memory_integration: backend_direct
     data_path: ./data/locomo_small.json
+    preparation:
+      seed: {enabled: true, target: memory, command: [python, /app/seed_baseline.py]}
+      readiness: {enabled: true, target: memory, command: [python, /app/check_baseline_index.py], timeout_seconds: 300, consecutive_successes: 2}
+      warmup: {enabled: true, target: memory, command: [python, /app/warmup_isolated.py]}
   - id: claw-graphmem
     benchmark: locomo
     agent: claw
@@ -124,9 +128,9 @@ combinations:
 
 在 Docker 操作前，汇总每组声明的 CPU/内存限额，与 Docker 运行环境可用资源比较；明确声明的 NUMA 位置也在此时规划并检查。容量不足直接失败，不先启动部分组合。未声明的资源不计入可保证容量。镜像 archive 仅验证存在、可加载并含所需镜像名；本阶段不计算 SHA256，也不校验镜像架构。
 
-启动每组 project 后，等待其全部服务健康，执行版本、实际配置和依赖连通性核验，记录 project 名、组合 ID、容器 ID、宿主回环端口、镜像 ID、资源限额、配置哈希和创建时间。若任一组失败，停止并移除本次新建的所有 project 和数据卷，保留脱敏失败诊断。只有全部检查通过后才将部署状态标记为 ready。部署时不调用 benchmark，也不写入记忆。
+启动每组 project 后，等待其全部服务健康，执行版本、实际配置和依赖连通性核验。若 `seed.enabled: true`，在部署阶段按“临时提升向量库资源（若配置）→ seed → 索引/后端就绪轮询 → 恢复原始资源并核验 → 再次确认就绪”的顺序准备基线。若只启用 readiness，也在部署阶段确认现有数据已就绪。任何失败或中断都尝试恢复资源；恢复失败时不得标记 ready。记录 project 名、组合 ID、容器 ID、宿主回环端口、镜像 ID、资源限额、配置哈希、seed/就绪结果和创建时间。若任一组失败，停止并移除本次新建的所有 project 和数据卷，保留脱敏失败诊断。只有全部检查通过后才将部署状态标记为 ready。部署不运行 benchmark；只有明确启用 seed 时才写入基线数据，且每个新部署只执行一次。
 
-`memory-bench deploy status --deployment <name>` 重新读取 Docker 实际状态，显示每组服务健康、端口、镜像 ID、资源限额和配置指纹；容器缺失、被替换、镜像改变或配置核验失败时报告 drift，并给出非零退出码。状态输出不包含凭据。`run --deployment` 使用同一状态核验，不信任旧的 ready 标记。
+`memory-bench deploy status --deployment <name>` 重新读取 Docker 实际状态，显示每组服务健康、端口、镜像 ID、资源限额、配置指纹和 seed/就绪状态；启用了 readiness 的组合重新执行只读就绪检查。容器缺失、被替换、镜像改变、配置核验或就绪检查失败时报告 drift，并给出非零退出码。状态输出不包含凭据。`run --deployment` 使用同一状态核验，不信任旧的 ready 标记，也不重新 seed。
 
 提供 `memory-bench undeploy --deployment <name>`，仅停止状态记录中属于该部署的 Compose project，并移除这些 project 的数据卷及宿主可见状态目录。显式 `undeploy` 才删除成功部署的数据；`run` 不删除或重建容器。清理失败时保留状态记录和错误，便于重新执行清理。平台不操作记录之外的容器或卷。
 
@@ -138,10 +142,10 @@ combinations:
 
 若组合使用 Mock，run 记录被注入的 Mock 端点、对应消费方和各端点 `model_mode`，以区分真实模型与回放或固定响应；未配置 Mock 的组合不设置 Mock 端点，也不启动 Mock。Mock 的健康检查只证明服务可用，不代表回放内容匹配或计数正确；这些仍由相应测试的运行期校验判断。
 
-有 `preparation` 时，每组在测量前按以下顺序执行：临时提升向量库资源（若配置）→ seed → 索引/后端就绪轮询 → 恢复原始资源并核验 → 再次确认就绪 → warmup → 原生 workflow。任何失败或中断都在 `finally` 中尝试恢复资源；恢复不成功时该组不得开始测量，并在 run 目录保留恢复信息。seed、就绪和 warmup 的耗时与输出单独归档，不计入正式负载指标。warmup 必须使用与正式测试隔离的身份或数据范围，具体约束由组合的准备脚本实现并在报告中声明；平台不把一次 warmup 成功解释为记忆结果正确。
+若 `warmup.enabled: true`，每次 run 在状态/基线就绪复核通过后、正式 workflow 前执行该组合的 warmup；否则直接开始 workflow。warmup 的耗时与结构化结果归档在本次 run 中，不计入正式负载指标。warmup 必须使用与正式测试隔离的身份或数据范围，具体约束由组合的准备脚本实现并在报告中声明；平台不把一次 warmup 成功解释为记忆结果正确。seed 和基线索引构建属于部署阶段，run 不重复执行；正式 workflow 的逐次写入、commit 和 checkpoint readiness 继续在 run 中执行。重复运行同一部署若可能留下被测数据，比较实验应创建新部署以恢复相同基线。
 
 运行前健康检查证明服务可访问；实际用户/会话隔离和记忆写入正确性仍由 Skill 与 workflow gate 验证。相同镜像用于多个组合时，各组拥有独立记忆容器及所选向量库、图数据库、Mock Server 容器和数据卷，因此测试数据不会因跨组复用而混杂。
 
 ## 验证
 
-测试覆盖：严格 YAML 校验和路径解析；archive 加载后镜像名校验；多组合生成的 Compose project、卷、端口和依赖互不串用，包括可选图数据库与 Mock Server 的地址注入、命名端口、健康依赖及 Agent/存储网络隔离；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed、就绪、warmup 顺序及资源恢复；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
+测试覆盖：严格 YAML 校验和路径解析；archive 加载后镜像名校验；多组合生成的 Compose project、卷、端口和依赖互不串用，包括可选图数据库与 Mock Server 的地址注入、命名端口、健康依赖及 Agent/存储网络隔离；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed/readiness/warmup 开关默认关闭，启用 seed 必须启用 readiness，deploy 仅 seed 一次并等待基线索引、失败时恢复资源，run 每次按需 warmup 且保留 workflow 的 checkpoint readiness；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
