@@ -10,8 +10,6 @@ from test_deployment_lifecycle import RecordingDocker
 
 def test_run_deployment_routes_each_combination_and_summarizes(tmp_path, monkeypatch):
     path, raw = fixture_config(tmp_path)
-    for service in [*raw["agents"].values(), *raw["memories"].values()]:
-        service.pop("service_endpoints", None)
     path.write_text(yaml.safe_dump(raw))
     docker = RecordingDocker()
     deploy(path, tmp_path, docker)

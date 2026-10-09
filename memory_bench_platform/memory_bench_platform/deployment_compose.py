@@ -17,8 +17,13 @@ def required_resources(groups: tuple[DeploymentGroup, ...]) -> ResourceRequest:
     cpu = 0.0
     memory = 0
     for group in groups:
+        memory_mock_used = any(ref.startswith("mock.") for ref in group.memory_template.service_endpoints.values())
+        independent_agent_mock_used = not group.shared_memory_instance_id and any(
+            ref.startswith("mock.") for template in group.agents.values() for ref in template.service_endpoints.values())
         services = [*group.agents.values(), group.memory_template, group.vector_template, group.graph_template,
-                    group.memory_mock_template, *group.agent_mocks.values()]
+                    group.memory_mock_template if memory_mock_used or independent_agent_mock_used else None,
+                    *(mock for combo_id, mock in group.agent_mocks.items() if any(
+                        ref.startswith("mock.") for ref in group.agents[combo_id].service_endpoints.values()))]
         for service in services:
             if service and service.resources:
                 cpu += service.resources.cpus or 0.0
@@ -131,6 +136,12 @@ def render_project(group: DeploymentGroup, deployment_name: str,
             deps.append("mock_" + combo.id.replace("-", "_") if combo.id in group.agent_mocks else mock_memory_name)
         services[name] = _service(template, group.source_root, generated_mounts.get(name, []),
                                   [agent_networks[combo.id]], endpoint_vars(template, combo.id), deps, name, deployment_root)
+    used_mocks = set()
+    for rendered_service in services.values():
+        used_mocks.update(name for name in rendered_service.get("depends_on", {}) if name.startswith("mock"))
+    for name in tuple(services):
+        if name.startswith("mock") and name not in used_mocks:
+            del services[name]
     for name, service in services.items():
         for mount in service.get("volumes", []):
             if mount["type"] == "volume":

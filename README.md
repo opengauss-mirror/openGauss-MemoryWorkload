@@ -613,3 +613,7 @@ python -m memory_bench_platform.cli run \
 服务配置、接口差异及标准运行命令见 [Mem0 适配说明](memory_bench_platform/skills/memories/mem0/SKILL.md)。
 同时支持 OpenClaw `agent_plugin`：加载未经修改的官方 `@mem0/openclaw-mem0@1.2.0`，由原生 hook 捕获和召回，QA 关闭捕获。
 该路径通过 TypeScript SDK 直连存储；专用环境、原生日志验证及空结果限制见 [OpenClaw + Mem0](memory_bench_platform/skills/memory_plugins/openclaw-mem0/SKILL.md)。
+
+### Compose 一键部署与运行
+
+使用 `memory-bench deploy --config deployment.yaml` 部署 YAML 中的 Agent、记忆系统和可选数据库/Mock，再执行 `memory-bench run --deployment <name>` 跑现有平台原生 workflow。`deploy` 可用 `--agent-config`、`--memory-config` 为指定实例覆盖配置文件字段；`deploy status --deployment <name>` 检查漂移，`undeploy --deployment <name>` 清理部署资源。YAML 格式、共享实例和准备阶段开关见 [部署配置说明](docs/deployment-yaml.md)。

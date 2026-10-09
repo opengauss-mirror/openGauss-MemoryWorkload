@@ -9,7 +9,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .integration import resolve_benchmark_entrypoint
+from .integration import resolve_benchmark_entrypoint, resolve_run_skill_bundle
 from .paths import SKILLS_ROOT
 
 
@@ -221,10 +221,16 @@ def _validate_service(service: Service, root: Path, role: str):
         raise ValueError(f"{role} needs skill, client and verify")
     if not service.container_port and not service.endpoints:
         raise ValueError(f"{role} needs container_port or endpoints")
+    if service.container_port is not None and not 1 <= service.container_port <= 65535:
+        raise ValueError(f"invalid {role} port")
+    if any(not 1 <= endpoint.container_port <= 65535 for endpoint in service.endpoints.values()):
+        raise ValueError(f"invalid {role} endpoint port")
     targets = [m.target for m in service.config_mounts + service.state_mounts]
     names = set()
     for config_file in service.config_files.values():
         target = config_file.target
+        if not config_file.parameters:
+            raise ValueError("config_files parameters cannot be empty")
         if not target.startswith("/") or any(target == t or target.startswith(t.rstrip('/') + '/') or t.startswith(target.rstrip('/') + '/') for t in targets):
             raise ValueError(f"overlapping config target: {target}")
         targets.append(target)
@@ -235,15 +241,22 @@ def _validate_service(service: Service, root: Path, role: str):
             data = json.loads(source.read_text()) if config_file.format == "json" else yaml.safe_load(source.read_text())
         except (ValueError, yaml.YAMLError) as exc:
             raise ValueError(f"invalid config source: {source}") from exc
+        pointers = set()
         for name, parameter in config_file.parameters.items():
             if name in names or not _ID.fullmatch(name.replace('_', '-')):
                 raise ValueError(f"duplicate or invalid config parameter: {name}")
+            if parameter.pointer in pointers:
+                raise ValueError(f"duplicate config pointer: {parameter.pointer}")
+            pointers.add(parameter.pointer)
             names.add(name)
             value = _pointer_value(data, parameter.pointer)
             if not _type_matches(value, parameter.type):
                 raise ValueError(f"config pointer type mismatch: {name}")
     if service.image.archive is not None and not (root / service.image.archive).is_file():
         raise ValueError(f"missing image archive: {service.image.archive}")
+    for mount in service.config_mounts:
+        if mount.source is None or not (root / mount.source).exists():
+            raise ValueError(f"missing config mount source: {mount.source}")
 
 
 def load_deployment(path: Path) -> DeploymentConfig:
@@ -265,9 +278,12 @@ def load_deployment(path: Path) -> DeploymentConfig:
                 if not (skill_dir / "manifest.yaml").is_file():
                     raise ValueError(f"unknown {role} skill: {service.skill}")
     ids = set()
+    shared_names = set(config.shared_memory_instances)
     for combo in config.combinations:
         if not _ID.fullmatch(combo.id) or combo.id in ids:
             raise ValueError(f"duplicate or invalid combination ID: {combo.id}")
+        if combo.id in shared_names:
+            raise ValueError(f"combination ID conflicts with shared memory ID: {combo.id}")
         ids.add(combo.id)
         for label, ref, section in (("agent", combo.agent, config.agents), ("memory", combo.memory, config.memories),
                                     ("memory_instance", combo.memory_instance, config.shared_memory_instances),
@@ -280,6 +296,9 @@ def load_deployment(path: Path) -> DeploymentConfig:
         entry = resolve_benchmark_entrypoint(combo.benchmark, combo.entrypoint)
         if entry.entrypoint_kind not in ("case_builder", "scenario_builder"):
             raise ValueError(f"external benchmark entrypoint: {combo.entrypoint}")
+        memory_id = combo.memory or config.shared_memory_instances[combo.memory_instance].memory
+        resolve_run_skill_bundle(combo.benchmark, config.agents[combo.agent].skill,
+                                 config.memories[memory_id].skill, combo.memory_integration)
     for name, shared in config.shared_memory_instances.items():
         if not _ID.fullmatch(name) or shared.memory not in config.memories:
             raise ValueError(f"invalid shared memory instance: {name}")
@@ -287,6 +306,21 @@ def load_deployment(path: Path) -> DeploymentConfig:
                                     ("mock", shared.mock, config.mocks)):
             if ref and ref not in section:
                 raise ValueError(f"unknown shared {label}: {ref}")
+    for combo in config.combinations:
+        shared = config.shared_memory_instances.get(combo.memory_instance)
+        vector = shared.vector if shared else combo.vector
+        graph = shared.graph if shared else combo.graph
+        memory = config.memories[shared.memory if shared else combo.memory]
+        if vector and "vector" not in memory.service_endpoints.values():
+            raise ValueError(f"memory {memory.skill} does not reference configured vector")
+        if graph and "graph" not in memory.service_endpoints.values():
+            raise ValueError(f"memory {memory.skill} does not reference configured graph")
+        if combo.memory_integration == "agent_plugin" and "memory" not in config.agents[combo.agent].service_endpoints.values():
+            raise ValueError(f"agent {combo.agent} does not reference configured memory")
+        for consumer, mock_ref in ((config.agents[combo.agent], combo.mock), (memory, shared.mock if shared else combo.mock)):
+            for ref in consumer.service_endpoints.values():
+                if ref.startswith("mock.") and (not mock_ref or ref[5:] not in config.mocks[mock_ref].endpoints):
+                    raise ValueError(f"missing mock endpoint: {ref}")
     return config
 
 

@@ -76,8 +76,6 @@ class RecordingDocker:
 
 def test_deploy_status_detects_config_drift_and_undeploy(tmp_path):
     path, raw = fixture_config(tmp_path)
-    for service in [*raw["agents"].values(), *raw["memories"].values()]:
-        service.pop("service_endpoints", None)
     path.write_text(yaml.safe_dump(raw))
     docker = RecordingDocker()
     state = deploy(path, tmp_path, docker, ['claw-common:log_level="debug"'], ['mem0-common:workers=4'])
@@ -90,13 +88,33 @@ def test_deploy_status_detects_config_drift_and_undeploy(tmp_path):
     assert docker.removed_projects == set(state.projects.values())
 
 
+def test_source_config_change_is_reported_as_drift(tmp_path):
+    path, _ = fixture_config(tmp_path)
+    docker = RecordingDocker()
+    deploy(path, tmp_path, docker)
+    (tmp_path / "memory.yaml").write_text("server:\n  workers: 8\n")
+    checked = status("suite", tmp_path, docker)
+    assert not checked.ready
+    assert any("source config changed" in item for item in checked.drift)
+
+
+def test_undeploy_refuses_replaced_container(tmp_path):
+    path, _ = fixture_config(tmp_path)
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    group_key = next(iter(state.projects))
+    docker.containers[state.containers[group_key]["memory"]]["Id"] = "replacement"
+    with pytest.raises(DeploymentFailed, match="ownership"):
+        undeploy("suite", tmp_path, docker)
+    assert not docker.removed_projects
+
+
 def test_seed_failure_restores_resources_and_rolls_back(tmp_path):
     path, raw = fixture_config(tmp_path)
-    for service in [*raw["agents"].values(), *raw["memories"].values()]:
-        service.pop("service_endpoints", None)
     raw["vectors"] = {"v": {"image": {"name": "example/vector:1"}, "container_port": 1000,
                             "healthcheck": ["CMD", "true"], "resources": {"memory_mb": 100}}}
     raw["shared_memory_instances"]["mem0-common"]["vector"] = "v"
+    raw["memories"]["mem0"].setdefault("service_endpoints", {})["VECTOR_URI"] = "vector"
     raw["shared_memory_instances"]["mem0-common"]["preparation"] = {
         "seed": {"enabled": True, "target": "memory", "command": ["seed"]},
         "readiness": {"enabled": True, "target": "memory", "command": ["ready"]},
@@ -115,8 +133,6 @@ def test_seed_failure_restores_resources_and_rolls_back(tmp_path):
 
 def test_partial_compose_up_is_rolled_back(tmp_path):
     path, raw = fixture_config(tmp_path)
-    for service in [*raw["agents"].values(), *raw["memories"].values()]:
-        service.pop("service_endpoints", None)
     path.write_text(yaml.safe_dump(raw))
 
     class PartialDocker(RecordingDocker):

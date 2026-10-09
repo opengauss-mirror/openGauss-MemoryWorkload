@@ -50,7 +50,7 @@ def _resources_preflight(groups: tuple[DeploymentGroup, ...], docker: DockerClie
                     raise DeploymentFailed(f"NUMA node {node} is unavailable")
 
 
-def _service_templates(group: DeploymentGroup) -> dict[str, Service]:
+def _service_templates(group: DeploymentGroup, rendered: dict | None = None) -> dict[str, Service]:
     result = {"memory": group.memory_template}
     result.update({"agent_" + id_.replace("-", "_"): service for id_, service in group.agents.items()})
     for name, template in (("vector", group.vector_template), ("graph", group.graph_template)):
@@ -59,6 +59,8 @@ def _service_templates(group: DeploymentGroup) -> dict[str, Service]:
     if group.memory_mock_template:
         result["mock_memory" if group.shared_memory_instance_id else "mock"] = group.memory_mock_template
     result.update({"mock_" + id_.replace("-", "_"): template for id_, template in group.agent_mocks.items()})
+    if rendered is not None:
+        result = {name: template for name, template in result.items() if name in rendered["services"]}
     return result
 
 
@@ -161,7 +163,8 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
     groups = resolve_groups(config)
     _resources_preflight(groups, docker)
     for group in groups:
-        for service in _service_templates(group).values():
+        planned = render_project(group, config.name, {})
+        for service in _service_templates(group, planned).values():
             for var in [*service.environment_from.values(), *(service.client.environment_from.values() if service.client else ())]:
                 if var not in os.environ:
                     raise DeploymentFailed(f"missing host environment variable: {var}")
@@ -177,6 +180,10 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
         for group in groups:
             group_dir = directory / group.project_key
             group_dir.mkdir(mode=0o700)
+            for service in _service_templates(group).values():
+                for config_file in service.config_files.values():
+                    source = (group.source_root / config_file.source).resolve()
+                    state.source_hashes[str(source)] = _hash(source)
             mounts = prepare_instance_configs(group, group_dir / "configs")
             rendered = render_project(group, config.name, mounts, directory)
             for rendered_service in rendered["services"].values():
@@ -200,7 +207,7 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
             store.write_atomic(state)
             started.append((project, compose_file))
             docker.compose_up(project, compose_file, env=os.environ.copy())
-            for service_name, template in _service_templates(group).items():
+            for service_name, template in _service_templates(group, rendered).items():
                 cid = docker.compose_ps(project, compose_file, service_name)
                 if not cid:
                     raise DeploymentFailed(f"missing container: {service_name}")
@@ -239,13 +246,16 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
     for path, expected in state.config_hashes.items():
         if not Path(path).is_file() or _hash(Path(path)) != expected:
             drift.append(f"generated config changed: {Path(path).name}")
+    for path, expected in state.source_hashes.items():
+        if not Path(path).is_file() or _hash(Path(path)) != expected:
+            drift.append(f"source config changed: {Path(path).name}")
     try:
         config = load_deployment(config_path)
         groups = {g.project_key: g for g in resolve_groups(config)}
         for group_key, project in state.projects.items():
             group = groups[group_key]
             rendered = yaml.safe_load((store.directory(name) / group_key / "compose.yaml").read_text())
-            for service_name, template in _service_templates(group).items():
+            for service_name, template in _service_templates(group, rendered).items():
                 cid = state.containers[group_key][service_name]
                 if docker.compose_ps(project, store.directory(name) / group_key / "compose.yaml", service_name) != cid:
                     drift.append(f"container replaced: {service_name}")
@@ -267,6 +277,12 @@ def undeploy(name: str, cwd: Path, docker: DockerClient) -> None:
     store.acquire_lock(name)
     try:
         state = store.read(name)
+        for group_key, project in state.projects.items():
+            compose_file = store.directory(name) / group_key / "compose.yaml"
+            for service_name, expected_id in state.containers[group_key].items():
+                actual_id = docker.compose_ps(project, compose_file, service_name)
+                if actual_id and (actual_id != expected_id or docker.inspect(actual_id).get("Id") != expected_id):
+                    raise DeploymentFailed(f"resource ownership changed: {service_name}")
         for group_key, project in reversed(list(state.projects.items())):
             compose_file = store.directory(name) / group_key / "compose.yaml"
             docker.compose_down(project, compose_file)

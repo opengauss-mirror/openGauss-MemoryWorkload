@@ -25,7 +25,7 @@ def fixture_config(tmp_path):
         "claw": {**service, "skill": "openclaw", "service_endpoints": {"MEMORY_URL": "memory"},
                  "config_files": {"runtime": {"source": "./agent.json", "target": "/runtime/agent.json", "format": "json",
                                               "parameters": {"log_level": {"pointer": "/logging/level", "type": "string"}}}}},
-        "worker": {**service, "skill": "generic-cli", "client": {"endpoint_env": "WORKER_URL"},
+        "worker": {**service, "skill": "openclaw", "client": {"endpoint_env": "WORKER_URL"},
                    "service_endpoints": {"MEMORY_URL": "memory"}},
     }
     memories = {

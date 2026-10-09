@@ -26,6 +26,7 @@ class DeploymentState(BaseModel):
     image_ids: dict[str, str] = Field(default_factory=dict)
     ports: dict[str, dict[str, dict[str, int]]] = Field(default_factory=dict)
     config_hashes: dict[str, str] = Field(default_factory=dict)
+    source_hashes: dict[str, str] = Field(default_factory=dict)
     config_origins: dict[str, list[str]] = Field(default_factory=dict)
     owned_volumes: list[str] = Field(default_factory=list)
     owned_directories: list[str] = Field(default_factory=list)
