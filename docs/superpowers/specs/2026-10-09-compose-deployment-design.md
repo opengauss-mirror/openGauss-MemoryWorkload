@@ -23,7 +23,7 @@
 - `skill`：Agent 或 Memory Skill ID；向量库、图数据库和 Mock Server 无 Skill 要求。
 - `image.name`：Compose 使用的镜像名或 digest；`image.archive` 可选，为本地 tar 包。若给出 archive，先 `docker load`，随后验证所需镜像确实存在；若只给镜像名，交由 Docker 拉取或使用本地缓存。归档记录实际 image ID。
 - `container_port`、`endpoint_scheme`（默认 `http`，图数据库可指定 `bolt` 等）和必需的容器健康检查；宿主端口仅绑定回环地址，交给 Docker 分配空闲端口。部署后从 Docker 查询实际端口，不预测端口号。
-- 可选 `command`、非敏感的 `environment`、从宿主环境读取的 `environment_from`、只读 `config_mounts`、持久化的 `state_mounts`。引用的宿主环境变量在部署前检查；实际值不写进生成的 Compose 文件或平台部署记录。`state_mounts` 默认生成所属组合或共享记忆实例专属的 Docker volume；需要从宿主侧读取 OpenClaw state 的挂载可显式标记 `host_visible: true`，其目录放在所属部署目录内。
+- 可选 `command`（容器启动程序及固定参数的 argv 数组）、`startup_args`（Agent/记忆系统的可变启动参数 argv 数组，默认空）、非敏感的 `environment`、从宿主环境读取的 `environment_from`、只读 `config_mounts`、持久化的 `state_mounts`。生成 Compose 时，有 `command` 则使用 `command + startup_args`；只有非空 `startup_args` 时将其作为镜像 ENTRYPOINT 的参数，并在创建容器前验证镜像确有 ENTRYPOINT；两者均为空时不生成 Compose `command`，保留镜像默认行为。实际启动 argv 还包括镜像 ENTRYPOINT。各参数作为独立 argv 元素，不经 shell。引用的宿主环境变量在部署前检查；实际值不写进生成的 Compose 文件或平台部署记录。启动参数会出现在 Compose 文件及容器元数据中，只能传非敏感值；凭据使用 `environment_from`。`state_mounts` 默认生成所属组合或共享记忆实例专属的 Docker volume；需要从宿主侧读取 OpenClaw state 的挂载可显式标记 `host_visible: true`，其目录放在所属部署目录内。
 - Agent 和记忆系统模板的 `client.endpoint_env`：运行 Skill 所需的宿主侧 URL 环境变量名，例如 `OPENCLAW_GATEWAY_URL`、`MEM0_API_URL` 或 `OPENVIKING_API_URL`。`client.environment_from` 可传递运行 Skill 所需的凭据变量，但部署记录只保存变量名；向量库、图数据库和 Mock Server 模板不要求 `client`。
 - Agent 和记忆系统模板的 `verify.command` 与 `verify.expected_version`：健康检查通过后，在容器内执行只读命令。命令输出 JSON，包含 `version`、实际配置的 `endpoints` 和逐依赖的 `reachable` 布尔值；平台精确比较版本和本组合生成的地址，并要求每个声明的依赖可达。缺少命令或检查不符时，该组合不能进入 ready。向量库、图数据库和 Mock Server 以容器健康检查为最低要求，也可配置同样的版本检查。
 - 可选 `resources.cpus`、`resources.memory_mb` 和 `resources.numa_node`：前两项既作为容器限额，也参与启动前的 Docker 可用容量检查。NUMA 只在 Linux 主机显式启用；无法识别 NUMA 拓扑或资源不足时，在创建容器前失败。未指定资源时沿用 Docker 默认调度，不声称资源隔离。
@@ -63,6 +63,8 @@ agents:
   claw:
     skill: openclaw
     image: {name: "example/openclaw:tag", archive: ./images/openclaw.tar}
+    command: [node, /app/server.js]
+    startup_args: [--log-level, info]
     container_port: 18789
     healthcheck: [CMD, node, /app/healthcheck.js]
     service_endpoints: {MEMORY_URL: memory}
@@ -80,6 +82,8 @@ memories:
   mem0:
     skill: mem0
     image: {name: "example/mem0:tag", archive: ./images/mem0.tar}
+    command: [python, /app/server.py]
+    startup_args: [--workers, "2"]
     container_port: 8000
     healthcheck: [CMD, python, /app/healthcheck.py]
     state_mounts: [{target: /app/data}]
@@ -188,9 +192,19 @@ combinations:
 
 此片段展示替代映射，不是附加到上方示例的完整配置。共享实例测试与独立实例测试必须在报告中区分，不能把相同记忆镜像误当作相同物理实例。
 
+部署时可临时覆盖指定 Agent 或记忆实例的 `startup_args`，无需改 YAML：
+
+```bash
+memory-bench deploy --config deployment.yaml \
+  --agent-start-args 'claw-mem0=["--log-level","debug"]' \
+  --memory-start-args 'claw-mem0=["--workers","4"]'
+```
+
+每个选项可重复用于不同实例，值为 `<实例 ID>=<JSON 字符串数组>`。Agent 实例 ID 始终是组合 ID；独立记忆实例 ID 也是组合 ID，共享记忆实例 ID 使用 `shared_memory_instances` 的键。一个 ID 只能覆盖一次；未知 ID、重复 ID、非字符串数组或不属于该角色的 ID 在任何容器启动前报错。命令行列表**整体替换**该实例从模板继承的 `startup_args`，`[]` 表示清空；未指定覆盖的实例保留 YAML 值。共享记忆实例只接受一份参数，不能从不同 Agent 组合分别覆盖。覆盖只对本次新部署生效；同名已存在的部署仍须先 `undeploy`，不能用重复 deploy 原地改容器。
+
 ## 部署状态与生命周期
 
-`deploy` 先解析全部组合和压测映射、验证数据文件及 Skill 能力、检查镜像 archive 与环境引用，然后开始 Docker 操作。生成内容位于当前工作目录的 `.memory-bench/deployments/<name>/`，包括不含凭据的配置摘要、每个 project 的 Compose 文件和状态记录。此目录应由 Git 忽略。部署名在该工作目录内唯一；同名已存在时不重建或覆盖，要求先显式清理。
+`deploy` 先解析全部组合和压测映射、合并并校验启动参数覆盖、验证数据文件及 Skill 能力、检查镜像 archive 与环境引用，然后开始 Docker 操作。生成内容位于当前工作目录的 `.memory-bench/deployments/<name>/`，包括不含凭据的配置摘要、每个 project 的 Compose 文件和状态记录。解析后的完整启动 argv 和来源（YAML 或 CLI）进入配置指纹及部署记录；平台通过 Docker inspect 核对容器配置的 ENTRYPOINT/CMD，`verify.command` 继续核对服务实际版本、地址和依赖，`deploy status` 检测启动参数漂移。此目录应由 Git 忽略。部署名在该工作目录内唯一；同名已存在时不重建或覆盖，要求先显式清理。
 
 在 Docker 操作前，按实际要创建的容器汇总 CPU/内存限额；共享实例的记忆容器和数据库只计一次，与 Docker 运行环境可用资源比较。明确声明的 NUMA 位置也在此时规划并检查。容量不足直接失败，不先启动部分组合。未声明的资源不计入可保证容量。镜像 archive 仅验证存在、可加载并含所需镜像名；本阶段不计算 SHA256，也不校验镜像架构。
 
@@ -226,4 +240,4 @@ combinations:
 
 ## 验证
 
-测试覆盖：严格 YAML 校验和路径解析；archive 加载后镜像名校验；独立组合与共享记忆实例的 Compose project、卷、端口、容量只计一次和网络隔离，包括可选图数据库与 Mock Server 的地址注入、命名端口及健康依赖；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed/readiness/warmup 开关默认关闭，启用基线 seed 必须启用 readiness，共享实例 deploy 仅 seed 一次，run 按身份逐用户 seed 并按需 warmup，保留 workflow 的 checkpoint readiness；压测映射与适配器能力校验、实际 Agent→指定记忆实例路由探针、共享插件作用域、跨 target 并发与限流、有限回放和稳态检索、用户身份/正确性/隔离门槛、运行锁、部分失败和分层报告；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
+测试覆盖：严格 YAML 校验和路径解析；模板 `startup_args`、CLI 按实例整体替换及 `[]` 清空、共享记忆唯一覆盖、镜像 ENTRYPOINT 检查和实际 argv 漂移；archive 加载后镜像名校验；独立组合与共享记忆实例的 Compose project、卷、端口、容量只计一次和网络隔离，包括可选图数据库与 Mock Server 的地址注入、命名端口及健康依赖；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed/readiness/warmup 开关默认关闭，启用基线 seed 必须启用 readiness，共享实例 deploy 仅 seed 一次，run 按身份逐用户 seed 并按需 warmup，保留 workflow 的 checkpoint readiness；压测映射与适配器能力校验、实际 Agent→指定记忆实例路由探针、共享插件作用域、跨 target 并发与限流、有限回放和稳态检索、用户身份/正确性/隔离门槛、运行锁、部分失败和分层报告；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
