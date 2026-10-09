@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from . import token_usage, token_collectors
+
 import json
 from typing import Any, Callable
 import urllib.request
@@ -116,7 +118,7 @@ def _execute_agent(
     failure = failed_check("before_agent")
     if failure is not None:
         return failure
-    result = agent_runner(agent_id, rendered)
+    result = token_usage.capture_agent(agent_runner, agent_id, rendered)
     if not isinstance(result, dict):
         raise ValueError("agent runner returned a non-object response")
     if str(result.get("status") or "") not in {"ok", "failed"}:
@@ -224,6 +226,7 @@ def _execute_memory(
     )
     response = memory_runner(memory_id, request)
     payload = response.model_dump(mode="json")
+    token_collectors.observe(payload)
     unified_output = dict(payload.get("output", {}))
     unified_output["state"] = payload["state"]
     unified_output["operation"] = payload.get("operation", {})
@@ -255,6 +258,7 @@ def _execute_memory_plugin(
     )
     response = memory_plugin_runner(memory_plugin_id, request)
     payload = response.model_dump(mode="json")
+    token_collectors.observe(payload)
     unified_output = dict(payload.get("output", {}))
     unified_output["state"] = payload["state"]
     unified_output["operation"] = payload.get("operation", {}) or unified_output.get("operation", {})

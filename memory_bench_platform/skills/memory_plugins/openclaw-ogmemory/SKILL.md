@@ -7,13 +7,14 @@
 
 | 阶段 | autoCapture | autoRecall |
 |---|---|---|
-| ingest | false | false |
+| ingest | true | false |
 | QA | false | true |
 | 初始化 / finalize | false | false |
 
-- 历史先保存在独立 OpenClaw session 的 transcript 中；Workload 的 `commit` 步骤通过
-  专用 Gateway 的 `sessions.compact` 调用原生 context engine，完成历史写入与归档。
-  `autoCapture=false` 跳过 `ingest` / `afterTurn` 的自动写入；QA 通过 `assemble/compose` 召回。
+- ingest 开启原生 `autoCapture`，让历史消息进入后端 session 缓冲；必须配合下述后端高阈值配置，
+  避免 `afterTurn` 提前触发提取。Workload 的 `commit` 步骤通过专用 Gateway 的
+  `sessions.compact` 调用原生 context engine，触发提取与归档。QA 关闭 `autoCapture`，
+  使用新会话通过 `assemble/compose` 召回；不需要新增“只缓冲”插件开关。
 - 明确开启原生 `compactTakeoverEnabled`，使用 `shortTermIndexMode=async`，不修改插件源码。
 - 基准测试使用 HTTP `/v1/responses`：回答/写入指令放 `instructions`，用户内容放 `input`。
   指令不再拼入检索文本。带基准指令的任务不支持 CLI `--message` 回退。
@@ -28,8 +29,9 @@
 - readiness 使用本次 compact 的 operation 核对 scope/session，确认 commit_count > 0、
   后台空闲且 outbox 清空后才进入 QA。缺失/空会话、未归档历史、索引错误和超时都判失败；
   不再接受 `buffered_without_archive`。归档成功仍不代表抽取内容一定正确。
-- 不依赖后端 `memory.after_turn_threshold`；`after_turn` 的 503 processing 不再作为
-  ingest 阶段的预期例外忽略。超长历史仍可能提前触发 OpenClaw 自带的 compact。
+- 后端 `memory.after_turn_threshold` 必须大于单个历史 session 的实际累计缓冲 token；
+  插件 `commitTokenThreshold` 不能替代该后端配置。`after_turn` 的 503 processing 仍判失败。
+  高阈值不是永久禁用自动提取；超长历史也可能提前触发 OpenClaw 自带的 compact。
 - `autoCapture=false` 不是全局只读：显式 compact、session_end 的已有缓冲清理仍是原生行为。
   工具禁用、工具结果外置关闭、trace 内容采集关闭；测试后端应关闭 skill sedimentation。
   QA 前完成历史就绪检查，不复用历史 OpenClaw session。
@@ -61,6 +63,19 @@ unset OG_AUTH_ACCOUNT_ID MEMORY_BENCH_AGENT_LOCAL
 如需 API Key，生成配置前设置 `OGMEM_API_KEY`，Workload 保留相同值；后端授权应允许
 按测试 account 隔离。生命周期脚本会覆盖专用配置中的身份和开关，不依赖开关环境变量。
 后端地址必须同时能被 Workload 和 OpenClaw 访问。脚本不启动或修改后端。
+
+启动专用后端前配置，例如本轮短历史使用：
+
+```yaml
+memory:
+  after_turn_threshold: 100000
+```
+
+若后端 YAML 使用 `${OGMEM_AFTER_TURN_THRESHOLD}`，需将 `OGMEM_AFTER_TURN_THRESHOLD=100000`
+传入后端进程/容器；只在 Workload 进程设置环境变量不会生效。不要用 0 表示禁用，
+当前后端会回退到默认阈值。应检查 compact 前消息已缓冲、commit_count 为 0 且提取 LLM
+调用数没有增加，再确认 compact 后归档成功。该配置不解决插件与 OpenClaw 的版本兼容问题；
+例如本地 transcript 压缩边界写入失败仍需单独检查，不能仅凭后端归档成功认定全链路正常。
 
 启动支持原生 context engine 的 OpenClaw 镜像，例如：
 

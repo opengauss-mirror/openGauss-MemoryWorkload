@@ -103,7 +103,7 @@ def configure(path, config, state, phase):
     entry.update(state.get("identity", {}))
     if state.get("identity"):
         entry["authAccountId"] = state["identity"]["accountId"]
-    entry.update(autoCapture=False, autoRecall=phase == "qa",
+    entry.update(autoCapture=phase == "ingest", autoRecall=phase == "qa",
                  compactTakeoverEnabled=True, shortTermIndexMode="async")
     save(path.with_name("openclaw.json"), config)
     # Mark the new state usable only after the dedicated Gateway has loaded it.
@@ -278,7 +278,7 @@ def before_agent(path, config, state, request):
     if metadata.get("scope_id") != state.get("scope_id"):
         raise ValueError("oGMemory runtime scope does not match this task")
     entry = config["plugins"]["entries"][PLUGIN]["config"]
-    if (entry.get("autoCapture") is not False
+    if (entry.get("autoCapture") is not (phase == "ingest")
             or entry.get("compactTakeoverEnabled") is not True
             or entry.get("autoRecall") is not (phase == "qa")
             or any(entry.get(k) != v for k, v in state["identity"].items())
@@ -400,7 +400,7 @@ def run(request):
             if phase not in ("ingest", "qa"):
                 raise ValueError("phase must be ingest or qa")
             configure(path, config, state, phase)
-            output = {"phase": phase, "autoCapture": False, "autoRecall": phase == "qa"}
+            output = {"phase": phase, "autoCapture": phase == "ingest", "autoRecall": phase == "qa"}
         elif action == "commit":
             output = commit(path, state, inputs)
         elif action == "wait_ready":

@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from . import token_usage
 
 
 def write_summary(run_dir: Path, summary: dict) -> None:
+    if (run_dir / "records/token-usage").exists():
+        tokens = token_usage.best_effort(token_usage.rebuild, run_dir)
+        if tokens is not None:
+            summary.setdefault("resource_summary", {})["token_usage"] = {
+                "report": "reports/token_summary.json",
+                "records": "records/token_usage.jsonl",
+                **{k: v for k, v in tokens.items() if k not in {"breakdown", "limitations"}},
+            }
     reports_dir = run_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(summary, ensure_ascii=False, indent=2)

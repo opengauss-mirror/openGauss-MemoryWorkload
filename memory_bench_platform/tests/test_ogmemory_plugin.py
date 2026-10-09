@@ -57,7 +57,9 @@ def test_native_configuration_phases_isolation_and_finalize(runtime):
     run("prepare", scope_id="run:a")
     identity_a = json.loads(state.read_text())["identity"]
     assert entry(state)["authAccountId"] == identity_a["accountId"]
-    assert entry(state)["autoCapture"] is False and entry(state)["autoRecall"] is False
+    assert entry(state)["autoCapture"] is True and entry(state)["autoRecall"] is False
+    phase = run("set_phase", phase="ingest")["output"]
+    assert phase == {"phase": "ingest", "autoCapture": True, "autoRecall": False}
     run("set_phase", phase="qa")
     assert entry(state)["autoCapture"] is False and entry(state)["autoRecall"] is True
     assert entry(state)["userId"] == identity_a["userId"]

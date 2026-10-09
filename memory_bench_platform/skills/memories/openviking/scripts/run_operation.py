@@ -273,6 +273,8 @@ def _run_status(
             "task_id": task_id,
             "resource_id": resource_id,
             "backend_status": backend_status,
+            "task_result": {"token_usage": (task.get("result") or {}).get("token_usage", {})}
+            if isinstance(task.get("result"), dict) else {},
         },
         "metrics": [],
         "artifacts": [],
