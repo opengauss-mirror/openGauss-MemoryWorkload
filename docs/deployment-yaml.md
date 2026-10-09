@@ -62,7 +62,7 @@ combinations:
 
 `image.archive` 可省略；指定时先执行 `docker load`，再检查镜像名。当前不校验 archive SHA256 或架构。相对路径以部署 YAML 所在目录为基准。`config_files` 只支持 JSON/YAML、已有字段的 RFC 6901 路径，以及 `string`、`integer`、`number`、`boolean` 四种标量类型。每个物理实例的配置副本只读挂载到容器，原文件不变。生成目录默认位于当前工作目录的 `.memory-bench/deployments/<name>/`，清理部署时删除。
 
-可选的 `vectors`、`graphs`、`mocks` 与组合中的 `vector`、`graph`、`mock` 引用按需要创建。数据库模板使用与服务相同的 `image`、`container_port`、`healthcheck`、`state_mounts` 和 `resources` 字段。Mock 模板使用 `endpoints` 声明命名端口，例如 `chat`、`embedding`；只有被 `service_endpoints` 以 `mock.chat` 等名字引用时才启动。记忆系统引用向量库或图数据库时，必须声明对应 `service_endpoints`。Agent 插件模式须声明 `memory` 引用。宿主端口只绑定 127.0.0.1，部署后查询实际端口。
+可选的 `vectors`、`graphs`、`mocks` 与组合中的 `vector`、`graph`、`mock` 引用按需要创建。数据库模板使用与服务相同的 `image`、`container_port`、`healthcheck`、`state_mounts` 和 `resources` 字段。Mock 模板使用 `endpoints` 声明命名端口，例如 `chat`、`embedding`；被组合或共享记忆实例选中的 Mock 会启动，顶层未被选中的 Mock 模板不会启动。服务通过 `service_endpoints` 的 `mock.chat` 等名字接入其端点。记忆系统引用向量库或图数据库时，必须声明对应 `service_endpoints`。Agent 插件模式须声明 `memory` 引用。宿主端口只绑定 127.0.0.1，部署后查询实际端口。
 
 默认每个组合有独立 Agent、记忆实例和数据卷。若几个组合引用同一个 `shared_memory_instances` 键，它们共用一套记忆实例、数据库和数据卷；Agent 仍各自独立。共享实例的 CLI 配置覆盖只接受该共享实例 ID。`run --deployment` 默认依 YAML 顺序执行全部组合；`--combination` 只执行指定组合。共享实例的后续组合可看到前一组写入的数据，报告保留运行顺序和物理实例 ID。
 

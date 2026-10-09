@@ -85,6 +85,12 @@ def _verify_service(docker: DockerClient, container_id: str, template: Service,
         issues.append("container unhealthy")
     if inspect.get("Image") != expected_image:
         issues.append("image changed")
+    limits = rendered.get("deploy", {}).get("resources", {}).get("limits", {})
+    host_config = inspect.get("HostConfig", {})
+    if "cpus" in limits and host_config.get("NanoCpus") != round(float(limits["cpus"]) * 1_000_000_000):
+        issues.append("CPU limit changed")
+    if "memory" in limits and host_config.get("Memory") != int(str(limits["memory"]).rstrip("M")) * 1024**2:
+        issues.append("memory limit changed")
     actual_mounts = {(Path(m["Source"]).resolve(), m["Destination"]) for m in inspect.get("Mounts", []) if "Source" in m}
     for mount in rendered.get("volumes", []):
         if mount["type"] == "bind" and (Path(mount["source"]).resolve(), mount["target"]) not in actual_mounts:
@@ -130,13 +136,13 @@ def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], doc
                     raise DeploymentFailed("seed_resource_boost requires a vector with original resource limits")
                 docker.update_resources(vector_id, cpus=boost.cpus, memory_mb=boost.memory_mb)
                 boosted = True
-            docker.exec_json(containers[prep.seed.target], prep.seed.command)
+            docker.exec_json(containers[_target_service(group, prep.seed.target)], prep.seed.command)
             outcome["seed"] = True
         if prep.readiness.enabled:
             deadline = time.monotonic() + prep.readiness.timeout_seconds
             consecutive = 0
             while time.monotonic() < deadline:
-                result = docker.exec_json(containers[prep.readiness.target], prep.readiness.command)
+                result = docker.exec_json(containers[_target_service(group, prep.readiness.target)], prep.readiness.command)
                 consecutive = consecutive + 1 if result.get("ready") is True else 0
                 if consecutive >= prep.readiness.consecutive_successes:
                     outcome["readiness"] = True
@@ -149,10 +155,18 @@ def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], doc
             old = group.vector_template.resources
             docker.update_resources(vector_id, cpus=old.cpus, memory_mb=old.memory_mb)
     if boosted and prep.readiness.enabled:
-        result = docker.exec_json(containers[prep.readiness.target], prep.readiness.command)
+        result = docker.exec_json(containers[_target_service(group, prep.readiness.target)], prep.readiness.command)
         if result.get("ready") is not True:
             raise DeploymentFailed("baseline not ready after resource restoration")
     return outcome
+
+
+def _target_service(group: DeploymentGroup, target: str) -> str:
+    if target == "agent":
+        return "agent_" + group.combination_ids[0].replace("-", "_")
+    if target == "mock":
+        return "mock_memory" if group.shared_memory_instance_id else "mock"
+    return target
 
 
 def deploy(config_path: Path, cwd: Path, docker: DockerClient,
@@ -170,8 +184,7 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                     raise DeploymentFailed(f"missing host environment variable: {var}")
             if service.image.archive:
                 docker.load_image((group.source_root / service.image.archive).resolve(), service.image.name)
-            else:
-                docker.inspect_image(service.image.name)
+            # Compose may pull named images that are absent from the local cache.
     store = DeploymentStore(cwd)
     directory = store.create(config.name)
     state = DeploymentState(name=config.name, config_path=str(config.source_path), config_sha256=_hash(config.source_path))
@@ -188,7 +201,7 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
             rendered = render_project(group, config.name, mounts, directory)
             for rendered_service in rendered["services"].values():
                 for mount in rendered_service.get("volumes", []):
-                    if mount["type"] == "bind" and Path(mount["source"]).is_relative_to(directory / "state"):
+                    if mount["type"] == "bind" and Path(mount["source"]).is_relative_to(group_dir / "state"):
                         Path(mount["source"]).mkdir(parents=True, exist_ok=True, mode=0o700)
             compose_file = group_dir / "compose.yaml"
             compose_file.write_text(yaml.safe_dump(rendered, sort_keys=False))
@@ -262,9 +275,11 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
                     continue
                 drift.extend(f"{service_name}: {issue}" for issue in _verify_service(
                     docker, cid, template, rendered["services"][service_name], state.image_ids[cid]))
+                if _ports(docker.inspect(cid)) != state.ports[group_key][service_name]:
+                    drift.append(f"published ports changed: {service_name}")
             if group.preparation.readiness.enabled:
                 step = group.preparation.readiness
-                result = docker.exec_json(state.containers[group_key][step.target], step.command)
+                result = docker.exec_json(state.containers[group_key][_target_service(group, step.target)], step.command)
                 if result.get("ready") is not True:
                     drift.append(f"baseline not ready: {group_key}")
     except Exception as exc:

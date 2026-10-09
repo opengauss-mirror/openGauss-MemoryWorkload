@@ -32,3 +32,16 @@ def test_run_deployment_routes_each_combination_and_summarizes(tmp_path, monkeyp
     assert len(summaries) == 1
     assert len(json.loads(summaries[0].read_text())["combinations"]) == 2
 
+
+def test_shared_second_agent_warmup_targets_its_own_container(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["combinations"][1]["preparation"] = {"warmup": {"enabled": True, "target": "agent", "command": ["warmup"]}}
+    path.write_text(yaml.safe_dump(raw))
+    docker = RecordingDocker()
+    deploy(path, tmp_path, docker)
+    docker.exec_calls.clear()
+    assert run_deployment("suite", tmp_path, "worker-common", docker,
+                          lambda argv, *, env, cwd: 0) == 0
+    warmup_calls = [container for container, command in docker.exec_calls if command == ["warmup"]]
+    assert len(warmup_calls) == 1
+    assert warmup_calls[0].endswith("agent_worker_common")

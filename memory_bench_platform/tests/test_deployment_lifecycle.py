@@ -15,6 +15,7 @@ class RecordingDocker:
         self.specs = {}
         self.removed_projects = set()
         self.boosts = []
+        self.exec_calls = []
         self.fail_seed = False
 
     def info(self):
@@ -40,6 +41,10 @@ class RecordingDocker:
                 "Mounts": [{"Source": v["source"], "Destination": v["target"]}
                            for v in spec.get("volumes", []) if v["type"] == "bind"],
                 "Config": {"Env": [k + "=" + str(v) for k, v in spec.get("environment", {}).items()]},
+                "HostConfig": {
+                    "Memory": int(str(spec.get("deploy", {}).get("resources", {}).get("limits", {}).get("memory", "0M")).rstrip("M")) * 1024**2,
+                    "NanoCpus": round(float(spec.get("deploy", {}).get("resources", {}).get("limits", {}).get("cpus", 0)) * 1_000_000_000),
+                },
             }
             self.specs[container_id] = spec
 
@@ -54,6 +59,7 @@ class RecordingDocker:
         return self.containers[container]
 
     def exec_json(self, container, command, input_data=None):
+        self.exec_calls.append((container, command))
         if command == ["seed"] and self.fail_seed:
             raise RuntimeError("seed failed")
         if command == ["ready"]:
@@ -143,4 +149,5 @@ def test_partial_compose_up_is_rolled_back(tmp_path):
     docker = PartialDocker()
     with pytest.raises(DeploymentFailed):
         deploy(path, tmp_path, docker)
-    assert docker.removed_projects == {"mb_suite_mem0_common"}
+    assert len(docker.removed_projects) == 1
+    assert next(iter(docker.removed_projects)).startswith("mb_suite_mem0_common_")

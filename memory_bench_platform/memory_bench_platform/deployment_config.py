@@ -311,16 +311,49 @@ def load_deployment(path: Path) -> DeploymentConfig:
         vector = shared.vector if shared else combo.vector
         graph = shared.graph if shared else combo.graph
         memory = config.memories[shared.memory if shared else combo.memory]
+        agent = config.agents[combo.agent]
+        if agent.client.endpoint_env == memory.client.endpoint_env:
+            raise ValueError(f"client endpoint_env collision in {combo.id}")
         if vector and "vector" not in memory.service_endpoints.values():
             raise ValueError(f"memory {memory.skill} does not reference configured vector")
         if graph and "graph" not in memory.service_endpoints.values():
             raise ValueError(f"memory {memory.skill} does not reference configured graph")
-        if combo.memory_integration == "agent_plugin" and "memory" not in config.agents[combo.agent].service_endpoints.values():
+        if combo.memory_integration == "agent_plugin" and "memory" not in agent.service_endpoints.values():
             raise ValueError(f"agent {combo.agent} does not reference configured memory")
-        for consumer, mock_ref in ((config.agents[combo.agent], combo.mock), (memory, shared.mock if shared else combo.mock)):
+        for consumer, role, mock_ref in ((agent, "agent", combo.mock), (memory, "memory", shared.mock if shared else combo.mock)):
             for ref in consumer.service_endpoints.values():
-                if ref.startswith("mock.") and (not mock_ref or ref[5:] not in config.mocks[mock_ref].endpoints):
-                    raise ValueError(f"missing mock endpoint: {ref}")
+                if ref.startswith("mock."):
+                    if not mock_ref or ref[5:] not in config.mocks[mock_ref].endpoints:
+                        raise ValueError(f"missing mock endpoint: {ref}")
+                elif ref == "memory" and role == "agent":
+                    pass
+                elif ref == "vector" and vector and (role == "memory" or agent.allow_agent_storage_access):
+                    pass
+                elif ref == "graph" and graph and (role == "memory" or agent.allow_agent_storage_access):
+                    pass
+                else:
+                    raise ValueError(f"invalid {role} service endpoint: {ref}")
+        available = {"memory"}
+        if vector:
+            available.add("vector")
+        if graph:
+            available.add("graph")
+        memory_mock = shared.mock if shared else combo.mock
+        if memory_mock or combo.mock:
+            available.add("mock")
+        preparations = [shared.preparation if shared else combo.preparation]
+        if shared:
+            preparations.append(combo.preparation)
+        for preparation in preparations:
+            for step in (preparation.seed, preparation.readiness, preparation.warmup):
+                if not step.enabled:
+                    continue
+                if step.target not in available | {"agent"}:
+                    raise ValueError(f"invalid preparation target: {step.target}")
+                if shared and preparation is shared.preparation and step.target == "agent":
+                    raise ValueError("shared preparation target cannot be agent")
+                if shared and preparation is shared.preparation and step.target == "mock" and not shared.mock:
+                    raise ValueError("shared preparation target requires shared mock")
     return config
 
 

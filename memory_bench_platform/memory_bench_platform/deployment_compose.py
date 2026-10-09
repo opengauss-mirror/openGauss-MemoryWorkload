@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 
 from .deployment_config import DeploymentGroup, Service
@@ -17,13 +18,8 @@ def required_resources(groups: tuple[DeploymentGroup, ...]) -> ResourceRequest:
     cpu = 0.0
     memory = 0
     for group in groups:
-        memory_mock_used = any(ref.startswith("mock.") for ref in group.memory_template.service_endpoints.values())
-        independent_agent_mock_used = not group.shared_memory_instance_id and any(
-            ref.startswith("mock.") for template in group.agents.values() for ref in template.service_endpoints.values())
         services = [*group.agents.values(), group.memory_template, group.vector_template, group.graph_template,
-                    group.memory_mock_template if memory_mock_used or independent_agent_mock_used else None,
-                    *(mock for combo_id, mock in group.agent_mocks.items() if any(
-                        ref.startswith("mock.") for ref in group.agents[combo_id].service_endpoints.values()))]
+                    group.memory_mock_template, *group.agent_mocks.values()]
         for service in services:
             if service and service.resources:
                 cpu += service.resources.cpus or 0.0
@@ -84,7 +80,8 @@ def _url(template: Service, name: str, endpoint_name: str | None = None) -> str:
 def render_project(group: DeploymentGroup, deployment_name: str,
                    generated_mounts: dict[str, list[dict[str, object]]],
                    deployment_root: Path | None = None) -> dict[str, object]:
-    project = f"mb_{deployment_name}_{group.project_key}".replace("-", "_")
+    project_hash = hashlib.sha256(f"{(deployment_root or group.source_root).resolve()}:{deployment_name}:{group.project_key}".encode()).hexdigest()[:10]
+    project = f"mb_{deployment_name[:18]}_{group.project_key[:18]}_{project_hash}".replace("-", "_")
     services: dict[str, object] = {}
     networks: dict[str, object] = {"storage_net": {}}
     volumes: dict[str, object] = {}
@@ -111,37 +108,37 @@ def render_project(group: DeploymentGroup, deployment_name: str,
                 result[env] = _url(mock, name, target[5:])
         return result
 
+    state_root = (deployment_root / group.project_key) if deployment_root else (group.source_root / group.project_key)
     if group.vector_template:
-        services["vector"] = _service(group.vector_template, group.source_root, [], ["storage_net"], {}, [], "vector", deployment_root)
+        services["vector"] = _service(group.vector_template, group.source_root, [], ["storage_net"], {}, [], "vector", state_root)
     if group.graph_template:
-        services["graph"] = _service(group.graph_template, group.source_root, [], ["storage_net"], {}, [], "graph", deployment_root)
+        services["graph"] = _service(group.graph_template, group.source_root, [], ["storage_net"], {}, [], "graph", state_root)
     if group.memory_mock_template:
         mock_networks = ["storage_net"]
         if independent_mock:
             mock_networks += list(agent_networks.values())
-        services[mock_memory_name] = _service(group.memory_mock_template, group.source_root, [], mock_networks, {}, [], mock_memory_name, deployment_root)
+        services[mock_memory_name] = _service(group.memory_mock_template, group.source_root, [], mock_networks, {}, [], mock_memory_name, state_root)
     for combo_id, mock in group.agent_mocks.items():
         name = "mock_" + combo_id.replace("-", "_")
-        services[name] = _service(mock, group.source_root, [], [agent_networks[combo_id]], {}, [], name, deployment_root)
+        services[name] = _service(mock, group.source_root, [], [agent_networks[combo_id]], {}, [], name, state_root)
     memory_deps = [name for name in ("vector", "graph") if name in services]
     if group.memory_mock_template and any(v.startswith("mock.") for v in group.memory_template.service_endpoints.values()):
         memory_deps.append(mock_memory_name)
     services["memory"] = _service(group.memory_template, group.source_root, generated_mounts.get("memory", []),
-                                   memory_networks, endpoint_vars(group.memory_template), memory_deps, "memory", deployment_root)
+                                   memory_networks, endpoint_vars(group.memory_template), memory_deps, "memory", state_root)
     for combo in group.combinations:
         name = "agent_" + combo.id.replace("-", "_")
         template = group.agents[combo.id]
         deps = ["memory"] if combo.memory_integration == "agent_plugin" else []
+        storage_refs = {ref for ref in template.service_endpoints.values() if ref in ("vector", "graph")}
+        deps.extend(sorted(storage_refs))
         if any(v.startswith("mock.") for v in template.service_endpoints.values()):
             deps.append("mock_" + combo.id.replace("-", "_") if combo.id in group.agent_mocks else mock_memory_name)
+        agent_network_membership = [agent_networks[combo.id]]
+        if template.allow_agent_storage_access and storage_refs:
+            agent_network_membership.append("storage_net")
         services[name] = _service(template, group.source_root, generated_mounts.get(name, []),
-                                  [agent_networks[combo.id]], endpoint_vars(template, combo.id), deps, name, deployment_root)
-    used_mocks = set()
-    for rendered_service in services.values():
-        used_mocks.update(name for name in rendered_service.get("depends_on", {}) if name.startswith("mock"))
-    for name in tuple(services):
-        if name.startswith("mock") and name not in used_mocks:
-            del services[name]
+                                  agent_network_membership, endpoint_vars(template, combo.id), deps, name, state_root)
     for name, service in services.items():
         for mount in service.get("volumes", []):
             if mount["type"] == "volume":

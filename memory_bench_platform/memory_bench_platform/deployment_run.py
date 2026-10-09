@@ -73,7 +73,13 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                 try:
                     warmup = combo.preparation.warmup
                     if warmup.enabled:
-                        target_id = state.containers[group.project_key].get(warmup.target)
+                        target_name = warmup.target
+                        if target_name == "agent":
+                            target_name = "agent_" + combo.id.replace("-", "_")
+                        elif target_name == "mock":
+                            if group.shared_memory_instance_id:
+                                target_name = ("mock_" + combo.id.replace("-", "_")) if combo.mock else "mock_memory"
+                        target_id = state.containers[group.project_key].get(target_name)
                         if not target_id:
                             raise ValueError(f"unknown warmup target: {warmup.target}")
                         record["warmup"] = docker.exec_json(target_id, warmup.command)
