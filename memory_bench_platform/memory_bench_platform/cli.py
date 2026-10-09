@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from . import token_usage
+
 import argparse
 import json
 from dataclasses import asdict
@@ -84,6 +86,12 @@ def _execution_options(args, configured=None) -> ExecutionSpec:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memory-bench")
     sub = parser.add_subparsers(dest="command", required=True)
+    token_parser = sub.add_parser("token-summary", help="Rebuild observed Token usage from captured shards (offline)")
+    token_parser.add_argument("--run-dir", type=Path, required=True)
+    proxy_parser = sub.add_parser("token-proxy", help="Relay dedicated memory-system model traffic and record numeric usage")
+    proxy_parser.add_argument("--config", type=Path, required=True)
+    proxy_parser.add_argument("--audit-dir", type=Path, required=True)
+    proxy_parser.add_argument("--port", type=int, default=0)
 
     sub.add_parser("list-skills")
 
@@ -811,6 +819,13 @@ def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "token-proxy":
+        from .token_proxy import serve
+        serve(args.config, args.audit_dir, args.port)
+        return
+    if args.command == "token-summary":
+        print(json.dumps(token_usage.rebuild(args.run_dir), ensure_ascii=False, indent=2))
+        return
     if args.command in {"run", "plan-run"}:
         try:
             _execution_options(args)
@@ -1371,6 +1386,10 @@ def main(argv: list[str] | None = None) -> None:
     lifecycle_traces: list[TraceEventRecord] = []
     lifecycle_metric = None
     trace_finalize_error: BaseException | None = None
+    token_context = token_usage.context(runtime_context)
+    token_usage.best_effort(token_usage.initialize, token_context)
+    from . import token_collectors
+    collection_run = token_collectors.start(token_context)
     try:
         with adapter_environment(trace_environment):
             workflow_output = execute_cases(
@@ -1398,6 +1417,9 @@ def main(argv: list[str] | None = None) -> None:
                     lifecycle_metric,
                 ) = _run_plugin_finalize(runtime_context)
         finally:
+            token_collectors.finish(collection_run)
+            if token_usage.enabled():
+                token_usage.best_effort(token_usage.rebuild, run_dir)
             monitor.stop_background_sampling()
             if trace_runtime is not None:
                 try:

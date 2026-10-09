@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from . import token_usage
+
 import json
 import hashlib
 from contextvars import copy_context
@@ -222,13 +224,17 @@ def _execute_case(
                             )
                         )
 
-                    operator_output = _execute_step_operator(
-                        resolved_step,
-                        agent_id=agent_id,
-                        memory_id=memory_id,
-                        runtime_context=runtime_context,
-                        poll_trace=record_poll_trace,
-                    )
+                    with token_usage.scope(token_usage.context(
+                        runtime_context, case_id=step.case_id, step_id=step.step_id,
+                        attempt=attempt,
+                    )):
+                        operator_output = _execute_step_operator(
+                            resolved_step,
+                            agent_id=agent_id,
+                            memory_id=memory_id,
+                            runtime_context=runtime_context,
+                            poll_trace=record_poll_trace,
+                        )
                     final_operator_output = operator_output
                     ended_at = _timestamp()
 

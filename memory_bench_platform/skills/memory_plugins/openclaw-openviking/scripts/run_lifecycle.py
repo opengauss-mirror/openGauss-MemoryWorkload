@@ -419,7 +419,16 @@ def _wait_settle(request: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
             if backend_status in TERMINAL_FAILURE:
-                raise RuntimeError(f"OpenViking plugin task {task_id} failed with status {backend_status}")
+                response = _ok({"method": "exact_task_poll", "task_id": task_id,
+                                "backend_status": backend_status, "task_result": {
+                                    "token_usage": (task.get("result") or {}).get("token_usage", {})
+                                } if isinstance(task.get("result"), dict) else {}})
+                response.update(status="failed", state="failed", error={
+                    "type": "RuntimeError",
+                    "code": "runtimeerror", "category": "runtime", "retryable": False,
+                    "message": f"OpenViking plugin task {task_id} failed with status {backend_status}",
+                })
+                return response
             time.sleep(interval)
         raise TimeoutError(f"OpenViking plugin task {task_id} did not settle within {timeout} seconds")
 
