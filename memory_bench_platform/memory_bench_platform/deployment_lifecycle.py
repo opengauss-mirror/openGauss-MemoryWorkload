@@ -1,0 +1,275 @@
+"""Deploy, verify and remove owned Docker Compose workload environments."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import shutil
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+from .deployment_compose import render_project, required_resources
+from .deployment_config import (DeploymentConfig, DeploymentGroup, Service,
+                                _pointer_value, apply_config_overrides, load_deployment, resolve_groups)
+from .deployment_config_files import prepare_instance_configs
+from .deployment_docker import DockerClient
+from .deployment_store import DeploymentState, DeploymentStore
+
+
+class DeploymentFailed(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DeploymentStatus:
+    ready: bool
+    drift: tuple[str, ...]
+    state: DeploymentState
+
+
+def _hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resources_preflight(groups: tuple[DeploymentGroup, ...], docker: DockerClient) -> None:
+    request = required_resources(groups)
+    info = docker.info()
+    if request.cpus > float(info.get("NCPU", 0)) or request.memory_mb * 1024**2 > int(info.get("MemTotal", 0)):
+        raise DeploymentFailed("insufficient Docker CPU or memory")
+    for group in groups:
+        services = [*group.agents.values(), group.memory_template, group.vector_template, group.graph_template,
+                    group.memory_mock_template, *group.agent_mocks.values()]
+        for service in services:
+            if service and service.resources and service.resources.numa_node is not None:
+                node = service.resources.numa_node
+                if platform.system() != "Linux" or not Path(f"/sys/devices/system/node/node{node}").exists():
+                    raise DeploymentFailed(f"NUMA node {node} is unavailable")
+
+
+def _service_templates(group: DeploymentGroup) -> dict[str, Service]:
+    result = {"memory": group.memory_template}
+    result.update({"agent_" + id_.replace("-", "_"): service for id_, service in group.agents.items()})
+    for name, template in (("vector", group.vector_template), ("graph", group.graph_template)):
+        if template:
+            result[name] = template
+    if group.memory_mock_template:
+        result["mock_memory" if group.shared_memory_instance_id else "mock"] = group.memory_mock_template
+    result.update({"mock_" + id_.replace("-", "_"): template for id_, template in group.agent_mocks.items()})
+    return result
+
+
+def _expected_parameters(template: Service, mounts: list[dict]) -> dict[str, object]:
+    expected = {}
+    by_target = {mount["target"]: Path(mount["source"]) for mount in mounts if mount["type"] == "bind"}
+    for spec in template.config_files.values():
+        path = by_target[spec.target]
+        data = json.loads(path.read_text()) if spec.format == "json" else yaml.safe_load(path.read_text())
+        for name, parameter in spec.parameters.items():
+            expected[name] = _pointer_value(data, parameter.pointer)
+    return expected
+
+
+def _verify_service(docker: DockerClient, container_id: str, template: Service,
+                    rendered: dict, expected_image: str) -> list[str]:
+    issues = []
+    inspect = docker.inspect(container_id)
+    if inspect.get("Id") != container_id or not inspect.get("State", {}).get("Running"):
+        issues.append("container missing or stopped")
+    if inspect.get("State", {}).get("Health", {}).get("Status") != "healthy":
+        issues.append("container unhealthy")
+    if inspect.get("Image") != expected_image:
+        issues.append("image changed")
+    actual_mounts = {(Path(m["Source"]).resolve(), m["Destination"]) for m in inspect.get("Mounts", []) if "Source" in m}
+    for mount in rendered.get("volumes", []):
+        if mount["type"] == "bind" and (Path(mount["source"]).resolve(), mount["target"]) not in actual_mounts:
+            issues.append(f"mount changed: {mount['target']}")
+    if template.verify:
+        result = docker.exec_json(container_id, template.verify.command)
+        if result.get("version") != template.verify.expected_version:
+            issues.append("version changed")
+        for key, value in rendered.get("environment", {}).items():
+            if key in template.service_endpoints and result.get("endpoints", {}).get(key) != value:
+                issues.append(f"endpoint changed: {key}")
+        for dependency in rendered.get("depends_on", {}):
+            if result.get("reachable", {}).get(dependency) is not True:
+                issues.append(f"dependency unreachable: {dependency}")
+        expected = _expected_parameters(template, rendered.get("volumes", []))
+        for name, value in expected.items():
+            if result.get("effective_parameters", {}).get(name) != value:
+                issues.append(f"config parameter changed: {name}")
+    return issues
+
+
+def _ports(inspect: dict) -> dict[str, int]:
+    result = {}
+    for container_port, bindings in inspect.get("NetworkSettings", {}).get("Ports", {}).items():
+        if bindings:
+            binding = bindings[0]
+            if binding.get("HostIp") not in ("127.0.0.1", "::1"):
+                raise DeploymentFailed("published port is not loopback-only")
+            result[container_port] = int(binding["HostPort"])
+    return result
+
+
+def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], docker: DockerClient) -> dict:
+    prep = group.preparation
+    outcome = {"seed": False, "readiness": False}
+    boost = prep.seed_resource_boost
+    vector_id = containers.get("vector")
+    boosted = False
+    try:
+        if prep.seed.enabled:
+            if boost:
+                if not vector_id or not group.vector_template or not group.vector_template.resources:
+                    raise DeploymentFailed("seed_resource_boost requires a vector with original resource limits")
+                docker.update_resources(vector_id, cpus=boost.cpus, memory_mb=boost.memory_mb)
+                boosted = True
+            docker.exec_json(containers[prep.seed.target], prep.seed.command)
+            outcome["seed"] = True
+        if prep.readiness.enabled:
+            deadline = time.monotonic() + prep.readiness.timeout_seconds
+            consecutive = 0
+            while time.monotonic() < deadline:
+                result = docker.exec_json(containers[prep.readiness.target], prep.readiness.command)
+                consecutive = consecutive + 1 if result.get("ready") is True else 0
+                if consecutive >= prep.readiness.consecutive_successes:
+                    outcome["readiness"] = True
+                    break
+                time.sleep(1)
+            if not outcome["readiness"]:
+                raise DeploymentFailed("baseline readiness timed out")
+    finally:
+        if boosted:
+            old = group.vector_template.resources
+            docker.update_resources(vector_id, cpus=old.cpus, memory_mb=old.memory_mb)
+    if boosted and prep.readiness.enabled:
+        result = docker.exec_json(containers[prep.readiness.target], prep.readiness.command)
+        if result.get("ready") is not True:
+            raise DeploymentFailed("baseline not ready after resource restoration")
+    return outcome
+
+
+def deploy(config_path: Path, cwd: Path, docker: DockerClient,
+           agent_items: list[str] | None = None, memory_items: list[str] | None = None) -> DeploymentState:
+    config = apply_config_overrides(load_deployment(config_path), agent_items or [], memory_items or [])
+    if config.pressure_tests:
+        raise DeploymentFailed("pressure_tests need the separate multi-agent pressure implementation")
+    groups = resolve_groups(config)
+    _resources_preflight(groups, docker)
+    for group in groups:
+        for service in _service_templates(group).values():
+            for var in [*service.environment_from.values(), *(service.client.environment_from.values() if service.client else ())]:
+                if var not in os.environ:
+                    raise DeploymentFailed(f"missing host environment variable: {var}")
+            if service.image.archive:
+                docker.load_image((group.source_root / service.image.archive).resolve(), service.image.name)
+            else:
+                docker.inspect_image(service.image.name)
+    store = DeploymentStore(cwd)
+    directory = store.create(config.name)
+    state = DeploymentState(name=config.name, config_path=str(config.source_path), config_sha256=_hash(config.source_path))
+    started: list[tuple[str, Path]] = []
+    try:
+        for group in groups:
+            group_dir = directory / group.project_key
+            group_dir.mkdir(mode=0o700)
+            mounts = prepare_instance_configs(group, group_dir / "configs")
+            rendered = render_project(group, config.name, mounts, directory)
+            for rendered_service in rendered["services"].values():
+                for mount in rendered_service.get("volumes", []):
+                    if mount["type"] == "bind" and Path(mount["source"]).is_relative_to(directory / "state"):
+                        Path(mount["source"]).mkdir(parents=True, exist_ok=True, mode=0o700)
+            compose_file = group_dir / "compose.yaml"
+            compose_file.write_text(yaml.safe_dump(rendered, sort_keys=False))
+            project = rendered["name"]
+            state.projects[group.project_key] = project
+            state.containers[group.project_key] = {}
+            state.ports[group.project_key] = {}
+            state.owned_volumes.extend(f"{project}_{name}" for name in rendered["volumes"])
+            state.owned_directories.append(str(group_dir))
+            for service_name, mount_list in mounts.items():
+                for mount in mount_list:
+                    state.config_hashes[mount["source"]] = _hash(Path(mount["source"]))
+                instance = service_name[len("agent_"):].replace("_", "-") if service_name.startswith("agent_") else group.memory_instance_id
+                names = group.agent_config_overrides.get(instance, {}) if service_name.startswith("agent_") else group.memory_config_overrides
+                state.config_origins[f"{group.project_key}/{service_name}"] = sorted(names)
+            store.write_atomic(state)
+            started.append((project, compose_file))
+            docker.compose_up(project, compose_file, env=os.environ.copy())
+            for service_name, template in _service_templates(group).items():
+                cid = docker.compose_ps(project, compose_file, service_name)
+                if not cid:
+                    raise DeploymentFailed(f"missing container: {service_name}")
+                inspect = docker.inspect(cid)
+                state.containers[group.project_key][service_name] = cid
+                state.ports[group.project_key][service_name] = _ports(inspect)
+                expected_image = docker.inspect_image(template.image.name)["Id"]
+                state.image_ids[cid] = expected_image
+                problems = _verify_service(docker, cid, template, rendered["services"][service_name], expected_image)
+                if problems:
+                    raise DeploymentFailed(f"{service_name}: {', '.join(problems)}")
+            state.preparation[group.project_key] = _execute_preparation(group, state.containers[group.project_key], docker)
+            store.write_atomic(state)
+        state.ready = True
+        store.write_atomic(state)
+        return state
+    except BaseException as exc:
+        for project, file in reversed(started):
+            try:
+                docker.compose_down(project, file)
+            except Exception:
+                pass
+        shutil.rmtree(directory, ignore_errors=True)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise DeploymentFailed(str(exc)) from exc
+
+
+def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
+    store = DeploymentStore(cwd)
+    state = store.read(name)
+    drift = []
+    config_path = Path(state.config_path)
+    if not config_path.is_file() or _hash(config_path) != state.config_sha256:
+        drift.append("deployment YAML changed")
+    for path, expected in state.config_hashes.items():
+        if not Path(path).is_file() or _hash(Path(path)) != expected:
+            drift.append(f"generated config changed: {Path(path).name}")
+    try:
+        config = load_deployment(config_path)
+        groups = {g.project_key: g for g in resolve_groups(config)}
+        for group_key, project in state.projects.items():
+            group = groups[group_key]
+            rendered = yaml.safe_load((store.directory(name) / group_key / "compose.yaml").read_text())
+            for service_name, template in _service_templates(group).items():
+                cid = state.containers[group_key][service_name]
+                if docker.compose_ps(project, store.directory(name) / group_key / "compose.yaml", service_name) != cid:
+                    drift.append(f"container replaced: {service_name}")
+                    continue
+                drift.extend(f"{service_name}: {issue}" for issue in _verify_service(
+                    docker, cid, template, rendered["services"][service_name], state.image_ids[cid]))
+            if group.preparation.readiness.enabled:
+                step = group.preparation.readiness
+                result = docker.exec_json(state.containers[group_key][step.target], step.command)
+                if result.get("ready") is not True:
+                    drift.append(f"baseline not ready: {group_key}")
+    except Exception as exc:
+        drift.append(f"status inspection failed: {type(exc).__name__}")
+    return DeploymentStatus(state.ready and not drift, tuple(drift), state)
+
+
+def undeploy(name: str, cwd: Path, docker: DockerClient) -> None:
+    store = DeploymentStore(cwd)
+    store.acquire_lock(name)
+    try:
+        state = store.read(name)
+        for group_key, project in reversed(list(state.projects.items())):
+            compose_file = store.directory(name) / group_key / "compose.yaml"
+            docker.compose_down(project, compose_file)
+        shutil.rmtree(store.directory(name))
+    finally:
+        store.release_lock(name)
