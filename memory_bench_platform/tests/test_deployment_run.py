@@ -6,6 +6,7 @@ from memory_bench_platform.deployment_lifecycle import deploy
 from memory_bench_platform.deployment_run import run_deployment
 from test_deployment_config import fixture_config
 from test_deployment_lifecycle import RecordingDocker
+from test_deployment_compose import pooled_fixture
 
 
 def test_run_deployment_routes_each_combination_and_summarizes(tmp_path, monkeypatch):
@@ -45,3 +46,31 @@ def test_shared_second_agent_warmup_targets_its_own_container(tmp_path):
     warmup_calls = [container for container, command in docker.exec_calls if command == ["warmup"]]
     assert len(warmup_calls) == 1
     assert warmup_calls[0].endswith("agent_worker_common")
+
+
+def test_pooled_run_uses_pool_url_and_detects_restart(tmp_path, monkeypatch):
+    path, _ = pooled_fixture(tmp_path)
+    upstreams = [f"http://agent_claw_common_{n}:8080" for n in range(1, 4)]
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": upstreams, "assignments": {}, "request_counts": {}})
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    seen = []
+
+    def invoke(argv, *, env, cwd):
+        seen.append(env.copy())
+        return 0
+
+    assert run_deployment("suite", tmp_path, "claw-common", docker, invoke) == 0
+    assert seen[0]["OPENCLAW_GATEWAY_URL"] == "http://127.0.0.1:49789"
+    assert seen[0]["OPENCLAW_TRANSPORT"] == "http"
+    assert seen[0]["OPENCLAW_POOL_ENABLED"] == "1"
+    assert seen[0]["OPENCLAW_POOL_ROUTE_PREFIX"].endswith(":claw-common")
+
+    cid = state.containers[next(iter(state.projects))]["gateway_pool_claw_common"]
+
+    def restart(argv, *, env, cwd):
+        docker.containers[cid]["RestartCount"] = 1
+        return 0
+
+    assert run_deployment("suite", tmp_path, "claw-common", docker, restart) == 1

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from skills.agents.openclaw.scripts.run_task import (
     build_openclaw_command,
     build_openclaw_http_request,
@@ -132,6 +134,23 @@ def test_openclaw_http_runner_propagates_trace_correlation(monkeypatch):
     assert headers["X-Trace-Step-ID"] == "step-1"
     assert headers["X-Trace-Session-ID"] == "session-1"
     assert headers["X-Request-ID"] == "request-1"
+
+
+def test_pool_requests_keep_user_affinity_and_matching_header(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_POOL_ENABLED", "1")
+    monkeypatch.setenv("OPENCLAW_POOL_ROUTE_PREFIX", "run:claw")
+    request = {"messages": [{"role": "user", "content": "hello"}],
+               "metadata": {"agent_id": "main", "user_id": "alice"}}
+    _, first_headers, first_body = build_openclaw_http_request(request)
+    _, second_headers, second_body = build_openclaw_http_request(request)
+    assert first_body["user"] == second_body["user"] == "run:claw:alice"
+    assert first_headers["X-OpenClaw-Memory-User"] == first_body["user"]
+    assert second_headers["X-OpenClaw-Memory-User"] == second_body["user"]
+    request["metadata"]["user_id"] = "bob"
+    assert build_openclaw_http_request(request)[2]["user"] != first_body["user"]
+    monkeypatch.delenv("OPENCLAW_POOL_ROUTE_PREFIX")
+    with pytest.raises(ValueError, match="route prefix"):
+        build_openclaw_http_request(request)
 
 
 def test_openclaw_session_collector_returns_explicit_jsonl(tmp_path: Path):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from typing import Callable
 
 from .deployment_config import load_deployment, resolve_groups
 from .deployment_docker import DockerClient
+from . import deployment_lifecycle
 from .deployment_lifecycle import status
 from .deployment_store import DeploymentStore
 
@@ -56,7 +58,17 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                 env = os.environ.copy()
                 for endpoint in all_endpoint_names:
                     env.pop(endpoint, None)
-                env[agent.client.endpoint_env] = _child_url(group_ports, "agent_" + combo.id.replace("-", "_"), agent)
+                for key in ("OPENCLAW_POOL_ENABLED", "OPENCLAW_POOL_ROUTE_PREFIX"):
+                    env.pop(key, None)
+                if combo.gateway_pool:
+                    pool = group.gateway_pools[combo.id]
+                    pool_name = "gateway_pool_" + combo.id.replace("-", "_")
+                    env[agent.client.endpoint_env] = _child_url(group_ports, pool_name, pool)
+                    env["OPENCLAW_TRANSPORT"] = "http"
+                    env["OPENCLAW_POOL_ENABLED"] = "1"
+                    env["OPENCLAW_POOL_ROUTE_PREFIX"] = f"{suite_id}:{combo.id}"
+                else:
+                    env[agent.client.endpoint_env] = _child_url(group_ports, "agent_" + combo.id.replace("-", "_"), agent)
                 env[memory.client.endpoint_env] = _child_url(group_ports, "memory", memory)
                 for template in (agent, memory):
                     for target, source in template.client.environment_from.items():
@@ -84,6 +96,26 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                             raise ValueError(f"unknown warmup target: {warmup.target}")
                         record["warmup"] = docker.exec_json(target_id, warmup.command)
                     rc = invoke(argv, env=env, cwd=cwd)
+                    if combo.gateway_pool:
+                        names = [f"agent_{combo.id.replace('-', '_')}_{n}"
+                                 for n in range(1, combo.agent_replicas + 1)]
+                        names.append(pool_name)
+                        for name in names:
+                            cid = state.containers[group.project_key][name]
+                            inspect = docker.inspect(cid)
+                            if inspect.get("Id") != cid or int(inspect.get("RestartCount", 0)) != state.restart_counts[cid]:
+                                raise ValueError(f"pooled service changed during run: {name}")
+                        snapshot = deployment_lifecycle._pool_status(env[agent.client.endpoint_env])
+                        expected_upstreams = {f"http://{name}:{agent.container_port}" for name in names[:-1]}
+                        upstreams = snapshot.get("upstreams")
+                        if not isinstance(upstreams, list) or len(upstreams) != len(expected_upstreams) or set(upstreams) != expected_upstreams:
+                            raise ValueError("gateway pool upstreams changed during run")
+                        salt = os.urandom(16)
+                        record["gateway_pool"] = {
+                            "assigned_users": {hashlib.sha256(salt + user.encode()).hexdigest()[:16]: upstream
+                                               for user, upstream in snapshot.get("assignments", {}).items()},
+                            "request_counts": snapshot.get("request_counts", {}),
+                        }
                     record["status"] = "passed" if rc == 0 else "failed"
                     record["return_code"] = rc
                     if rc:
