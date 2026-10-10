@@ -18,6 +18,7 @@ class PhaseEvent(_Strict):
     schema_version: Literal["phase-event/1"] = Field(alias="schema")
     run_id: str
     phase_id: str
+    parent_phase_id: str | None = None
     target_id: str
     start_utc: datetime
     end_utc: datetime
@@ -120,8 +121,14 @@ def load_profile_archive(run_dir: Path) -> ProfileArchive | None:
         by_target.setdefault(phase.target_id, []).append(phase)
     for events in by_target.values():
         ordered = sorted(events, key=lambda item: item.start_monotonic_ns)
-        if any(left.end_monotonic_ns > right.start_monotonic_ns for left, right in zip(ordered, ordered[1:])):
-            raise ValueError("overlapping target phases")
+        for index, left in enumerate(ordered):
+            for right in ordered[index + 1:]:
+                if right.start_monotonic_ns >= left.end_monotonic_ns:
+                    break
+                nested = (right.parent_phase_id == left.phase_id and
+                          right.end_monotonic_ns <= left.end_monotonic_ns)
+                if not nested:
+                    raise ValueError("overlapping target phases")
     if any(item.target_id not in target_ids or (item.target_id, item.phase_id) not in seen
            for item in collectors.items):
         raise ValueError("collector references unknown target phase")
