@@ -140,6 +140,27 @@ def test_seed_failure_restores_resources_and_rolls_back(tmp_path):
     assert docker.removed_projects
 
 
+def test_false_readiness_receipt_does_not_mark_deployment_ready(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["shared_memory_instances"]["mem0-common"]["preparation"] = {
+        "readiness": {"enabled": True, "target": "memory", "command": ["ready"],
+                      "timeout_seconds": 1}}
+    path.write_text(yaml.safe_dump(raw))
+
+    class NotReadyDocker(RecordingDocker):
+        def exec_json(self, container, command, input_data=None):
+            if command == ["ready"]:
+                self.exec_calls.append((container, command))
+                return {"ready": False}
+            return super().exec_json(container, command, input_data)
+
+    docker = NotReadyDocker()
+    with pytest.raises(DeploymentFailed, match="baseline readiness timed out"):
+        deploy(path, tmp_path, docker)
+    assert any(command == ["ready"] for _, command in docker.exec_calls)
+    assert docker.removed_projects
+
+
 def test_partial_compose_up_is_rolled_back(tmp_path):
     path, raw = fixture_config(tmp_path)
     path.write_text(yaml.safe_dump(raw))

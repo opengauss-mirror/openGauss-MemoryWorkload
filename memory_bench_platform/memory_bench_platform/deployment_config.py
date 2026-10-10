@@ -103,7 +103,7 @@ class PreparationStep(StrictModel):
     target: str | None = None
     command: list[str] | None = None
     timeout_seconds: int = 300
-    consecutive_successes: int = 1
+    consecutive_successes: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def require_command(self):
@@ -236,6 +236,8 @@ def _type_matches(value, kind: str) -> bool:
 def _validate_service(service: Service, root: Path, role: str):
     if role in ("agent", "memory") and (not service.skill or not service.client or not service.verify):
         raise ValueError(f"{role} needs skill, client and verify")
+    if role in ("agent", "memory") and service.container_port is None:
+        raise ValueError(f"{role} client needs container_port")
     if not service.container_port and not service.endpoints:
         raise ValueError(f"{role} needs container_port or endpoints")
     if service.container_port is not None and not 1 <= service.container_port <= 65535:
@@ -321,7 +323,7 @@ def load_deployment(path: Path) -> DeploymentConfig:
             if agent.environment.get("OPENCLAW_TRANSPORT") == "cli":
                 raise ValueError("gateway_pool conflicts with CLI transport")
             if any(step.enabled and step.target == "agent" for step in
-                   (combo.preparation.seed, combo.preparation.warmup)):
+                   (combo.preparation.seed, combo.preparation.readiness, combo.preparation.warmup)):
                 raise ValueError("agent preparation bypasses gateway_pool")
         entry = resolve_benchmark_entrypoint(combo.benchmark, combo.entrypoint)
         if entry.entrypoint_kind not in ("case_builder", "scenario_builder"):
@@ -348,6 +350,8 @@ def load_deployment(path: Path) -> DeploymentConfig:
                 raise ValueError(f"unknown shared {label}: {ref}")
     for combo in config.combinations:
         shared = config.shared_memory_instances.get(combo.memory_instance)
+        if shared and (combo.preparation.seed.enabled or combo.preparation.readiness.enabled):
+            raise ValueError("shared memory combination preparation allows only warmup")
         vector = shared.vector if shared else combo.vector
         graph = shared.graph if shared else combo.graph
         memory = config.memories[shared.memory if shared else combo.memory]

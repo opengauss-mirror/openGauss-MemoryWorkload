@@ -55,6 +55,41 @@ def test_shared_memory_group_is_resolved_once(tmp_path):
     assert groups[0].memory_template.skill == "mem0"
 
 
+@pytest.mark.parametrize("successes", [0, -1])
+def test_readiness_requires_positive_consecutive_successes(tmp_path, successes):
+    path, raw = fixture_config(tmp_path)
+    raw["shared_memory_instances"]["mem0-common"]["preparation"] = {
+        "readiness": {"enabled": True, "target": "memory", "command": ["ready"],
+                      "consecutive_successes": successes}}
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="consecutive_successes"):
+        load_deployment(path)
+
+
+@pytest.mark.parametrize("section, name", [("agents", "claw"), ("memories", "mem0")])
+def test_client_requires_primary_container_port(tmp_path, section, name):
+    path, raw = fixture_config(tmp_path)
+    service = raw[section][name]
+    service.pop("container_port")
+    service["endpoints"] = {"named": {"container_port": 8080}}
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="container_port"):
+        load_deployment(path)
+
+
+@pytest.mark.parametrize("step", ["seed", "readiness"])
+def test_shared_combination_rejects_seed_and_readiness(tmp_path, step):
+    path, raw = fixture_config(tmp_path)
+    raw["combinations"][0]["preparation"] = {
+        step: {"enabled": True, "target": "memory", "command": [step]}}
+    if step == "seed":
+        raw["combinations"][0]["preparation"]["readiness"] = {
+            "enabled": True, "target": "memory", "command": ["ready"]}
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="shared.*preparation"):
+        load_deployment(path)
+
+
 def test_gateway_pool_resolves_per_combination(tmp_path):
     path, raw = fixture_config(tmp_path)
     raw["agents"]["claw"]["client"]["endpoint_env"] = "OPENCLAW_GATEWAY_URL"
@@ -89,6 +124,7 @@ def test_gateway_pool_rejects_invalid_topology(tmp_path):
         ("missing port", lambda r: r["gateway_pools"]["pool"].pop("container_port")),
         ("CLI transport", lambda r: r["agents"]["claw"].update(environment={"OPENCLAW_TRANSPORT": "cli"})),
         ("agent warmup", lambda r: r["combinations"][0].update(preparation={"warmup": {"enabled": True, "target": "agent", "command": ["warmup"]}})),
+        ("agent readiness", lambda r: r["combinations"][0].update(preparation={"readiness": {"enabled": True, "target": "agent", "command": ["ready"]}})),
     ]
     for _, change in cases:
         import copy
