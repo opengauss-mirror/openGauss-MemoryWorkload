@@ -329,6 +329,16 @@ def load_deployment(path: Path) -> DeploymentConfig:
         memory_id = combo.memory or config.shared_memory_instances[combo.memory_instance].memory
         resolve_run_skill_bundle(combo.benchmark, config.agents[combo.agent].skill,
                                  config.memories[memory_id].skill, combo.memory_integration)
+    physical_names: dict[str, set[str]] = {}
+    for combo in config.combinations:
+        group_key = combo.memory_instance or combo.id
+        names = physical_names.setdefault(group_key, set())
+        base = "agent_" + combo.id.replace("-", "_")
+        planned = ([f"{base}_{n}" for n in range(1, combo.agent_replicas + 1)]
+                   if combo.gateway_pool else [base])
+        if any(name in names for name in planned):
+            raise ValueError(f"service name collision in {group_key}")
+        names.update(planned)
     for name, shared in config.shared_memory_instances.items():
         if not _ID.fullmatch(name) or shared.memory not in config.memories:
             raise ValueError(f"invalid shared memory instance: {name}")

@@ -262,6 +262,7 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 state.image_ids[cid] = expected_image
                 if service_name.startswith(("agent_", "gateway_pool_")):
                     state.restart_counts[cid] = int(inspect.get("RestartCount", 0))
+                    state.start_times[cid] = str(inspect.get("State", {}).get("StartedAt", ""))
                 problems = _verify_service(docker, cid, template, rendered["services"][service_name], expected_image)
                 if problems:
                     raise DeploymentFailed(f"{service_name}: {', '.join(problems)}")
@@ -315,6 +316,8 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
                     drift.append(f"published ports changed: {service_name}")
                 if cid in state.restart_counts and int(docker.inspect(cid).get("RestartCount", 0)) != state.restart_counts[cid]:
                     drift.append(f"container restarted: {service_name}")
+                if cid in state.start_times and docker.inspect(cid).get("State", {}).get("StartedAt", "") != state.start_times[cid]:
+                    drift.append(f"container start changed: {service_name}")
             drift.extend(_pool_issues(group, state.ports[group_key]))
             if group.preparation.readiness.enabled:
                 step = group.preparation.readiness

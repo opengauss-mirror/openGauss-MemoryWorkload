@@ -37,7 +37,8 @@ class RecordingDocker:
                      for p in spec.get("ports", [])}
             self.containers[container_id] = {
                 "Id": container_id, "Image": "sha256:" + spec["image"],
-                "State": {"Running": True, "Health": {"Status": "healthy"}},
+                "State": {"Running": True, "Health": {"Status": "healthy"},
+                          "StartedAt": "2026-10-10T00:00:00Z"},
                 "NetworkSettings": {"Ports": ports},
                 "Mounts": [{"Source": v["source"], "Destination": v["target"]}
                            for v in spec.get("volumes", []) if v["type"] == "bind"],
@@ -172,6 +173,9 @@ def test_pool_deploy_checks_upstreams_and_restart_drift(tmp_path, monkeypatch):
                         lambda url: {"upstreams": expected})
     cid = state.containers[group]["gateway_pool_claw_common"]
     docker.containers[cid]["RestartCount"] = 1
+    assert not status("suite", tmp_path, docker).ready
+    docker.containers[cid]["RestartCount"] = 0
+    docker.containers[cid]["State"]["StartedAt"] = "2026-10-10T01:00:00Z"
     assert not status("suite", tmp_path, docker).ready
 
 

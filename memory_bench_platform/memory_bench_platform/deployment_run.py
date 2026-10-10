@@ -60,6 +60,10 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                     env.pop(endpoint, None)
                 for key in ("OPENCLAW_POOL_ENABLED", "OPENCLAW_POOL_ROUTE_PREFIX"):
                     env.pop(key, None)
+                for template in (agent, memory):
+                    for target, source in template.client.environment_from.items():
+                        env[target] = os.environ[source]
+                env[memory.client.endpoint_env] = _child_url(group_ports, "memory", memory)
                 if combo.gateway_pool:
                     pool = group.gateway_pools[combo.id]
                     pool_name = "gateway_pool_" + combo.id.replace("-", "_")
@@ -69,10 +73,6 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                     env["OPENCLAW_POOL_ROUTE_PREFIX"] = f"{suite_id}:{combo.id}"
                 else:
                     env[agent.client.endpoint_env] = _child_url(group_ports, "agent_" + combo.id.replace("-", "_"), agent)
-                env[memory.client.endpoint_env] = _child_url(group_ports, "memory", memory)
-                for template in (agent, memory):
-                    for target, source in template.client.environment_from.items():
-                        env[target] = os.environ[source]
                 argv = ["run", "--benchmark", combo.benchmark, "--agent", agent.skill,
                         "--memory-backend", memory.skill, "--memory-integration", combo.memory_integration,
                         "--data-path", str((group.source_root / combo.data_path).resolve()),
@@ -103,7 +103,9 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                         for name in names:
                             cid = state.containers[group.project_key][name]
                             inspect = docker.inspect(cid)
-                            if inspect.get("Id") != cid or int(inspect.get("RestartCount", 0)) != state.restart_counts[cid]:
+                            if (inspect.get("Id") != cid or
+                                int(inspect.get("RestartCount", 0)) != state.restart_counts[cid] or
+                                inspect.get("State", {}).get("StartedAt", "") != state.start_times[cid]):
                                 raise ValueError(f"pooled service changed during run: {name}")
                         snapshot = deployment_lifecycle._pool_status(env[agent.client.endpoint_env])
                         expected_upstreams = {f"http://{name}:{agent.container_port}" for name in names[:-1]}

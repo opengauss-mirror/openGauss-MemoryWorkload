@@ -74,3 +74,25 @@ def test_pooled_run_uses_pool_url_and_detects_restart(tmp_path, monkeypatch):
         return 0
 
     assert run_deployment("suite", tmp_path, "claw-common", docker, restart) == 1
+
+
+def test_pooled_run_imports_cannot_override_mandatory_routing(tmp_path, monkeypatch):
+    path, raw = pooled_fixture(tmp_path)
+    raw["agents"]["claw"]["client"]["environment_from"] = {
+        "OPENCLAW_POOL_ENABLED": "HOST_POOL_ENABLED", "OPENCLAW_TRANSPORT": "HOST_TRANSPORT",
+        "OPENCLAW_GATEWAY_URL": "HOST_GATEWAY_URL"}
+    path.write_text(yaml.safe_dump(raw))
+    monkeypatch.setenv("HOST_POOL_ENABLED", "0")
+    monkeypatch.setenv("HOST_TRANSPORT", "cli")
+    monkeypatch.setenv("HOST_GATEWAY_URL", "http://wrong.invalid")
+    upstreams = [f"http://agent_claw_common_{n}:8080" for n in range(1, 4)]
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": upstreams, "assignments": {}, "request_counts": {}})
+    docker = RecordingDocker()
+    deploy(path, tmp_path, docker)
+    seen = []
+    assert run_deployment("suite", tmp_path, "claw-common", docker,
+                          lambda argv, *, env, cwd: seen.append(env.copy()) or 0) == 0
+    assert seen[0]["OPENCLAW_POOL_ENABLED"] == "1"
+    assert seen[0]["OPENCLAW_TRANSPORT"] == "http"
+    assert seen[0]["OPENCLAW_GATEWAY_URL"] == "http://127.0.0.1:49789"

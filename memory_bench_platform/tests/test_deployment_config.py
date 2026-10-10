@@ -99,6 +99,19 @@ def test_gateway_pool_rejects_invalid_topology(tmp_path):
             load_deployment(path)
 
 
+def test_gateway_pool_rejects_physical_service_name_collision(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["agents"]["claw"]["client"]["endpoint_env"] = "OPENCLAW_GATEWAY_URL"
+    raw["gateway_pools"] = {"pool": {"kind": "openclaw_http_pool_v1", "image": {"name": "pool:1"},
+                                      "command": ["python", "gateway_pool.py"], "container_port": 29789,
+                                      "healthcheck": ["CMD", "true"]}}
+    raw["combinations"][0].update(gateway_pool="pool", agent_replicas=2)
+    raw["combinations"][1]["id"] = "claw-common-1"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="service name collision"):
+        load_deployment(path)
+
+
 def test_typed_config_overrides_and_rejections(tmp_path):
     path, _ = fixture_config(tmp_path)
     config = load_deployment(path)
