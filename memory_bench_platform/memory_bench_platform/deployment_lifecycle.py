@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,7 +42,8 @@ def _resources_preflight(groups: tuple[DeploymentGroup, ...], docker: DockerClie
     if request.cpus > float(info.get("NCPU", 0)) or request.memory_mb * 1024**2 > int(info.get("MemTotal", 0)):
         raise DeploymentFailed("insufficient Docker CPU or memory")
     for group in groups:
-        services = [*group.agents.values(), group.memory_template, group.vector_template, group.graph_template,
+        services = [*group.agents.values(), *group.gateway_pools.values(),
+                    group.memory_template, group.vector_template, group.graph_template,
                     group.memory_mock_template, *group.agent_mocks.values()]
         for service in services:
             if service and service.resources and service.resources.numa_node is not None:
@@ -52,7 +54,12 @@ def _resources_preflight(groups: tuple[DeploymentGroup, ...], docker: DockerClie
 
 def _service_templates(group: DeploymentGroup, rendered: dict | None = None) -> dict[str, Service]:
     result = {"memory": group.memory_template}
-    result.update({"agent_" + id_.replace("-", "_"): service for id_, service in group.agents.items()})
+    for combo in group.combinations:
+        base = "agent_" + combo.id.replace("-", "_")
+        names = [f"{base}_{n}" for n in range(1, combo.agent_replicas + 1)] if combo.gateway_pool else [base]
+        result.update({name: group.agents[combo.id] for name in names})
+        if combo.gateway_pool:
+            result["gateway_pool_" + combo.id.replace("-", "_")] = group.gateway_pools[combo.id]
     for name, template in (("vector", group.vector_template), ("graph", group.graph_template)):
         if template:
             result[name] = template
@@ -121,6 +128,27 @@ def _ports(inspect: dict) -> dict[str, int]:
                 raise DeploymentFailed("published port is not loopback-only")
             result[container_port] = int(binding["HostPort"])
     return result
+
+
+def _pool_status(url: str) -> dict:
+    with urllib.request.urlopen(url + "/pool/status", timeout=5) as response:
+        return json.load(response)
+
+
+def _pool_issues(group: DeploymentGroup, ports: dict[str, dict[str, int]]) -> list[str]:
+    issues = []
+    for combo in group.combinations:
+        if not combo.gateway_pool:
+            continue
+        name = "gateway_pool_" + combo.id.replace("-", "_")
+        pool = group.gateway_pools[combo.id]
+        port = ports[name][f"{pool.container_port}/tcp"]
+        expected = {f"http://agent_{combo.id.replace('-', '_')}_{n}:{group.agents[combo.id].container_port}"
+                    for n in range(1, combo.agent_replicas + 1)}
+        actual = _pool_status(f"http://127.0.0.1:{port}").get("upstreams")
+        if not isinstance(actual, list) or len(actual) != len(expected) or set(actual) != expected:
+            issues.append(f"{name}: upstream mismatch")
+    return issues
 
 
 def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], docker: DockerClient) -> dict:
@@ -214,7 +242,10 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
             for service_name, mount_list in mounts.items():
                 for mount in mount_list:
                     state.config_hashes[mount["source"]] = _hash(Path(mount["source"]))
-                instance = service_name[len("agent_"):].replace("_", "-") if service_name.startswith("agent_") else group.memory_instance_id
+                instance = next((combo.id for combo in group.combinations
+                                 if service_name == "agent_" + combo.id.replace("-", "_") or
+                                 service_name.startswith("agent_" + combo.id.replace("-", "_") + "_")),
+                                group.memory_instance_id)
                 names = group.agent_config_overrides.get(instance, {}) if service_name.startswith("agent_") else group.memory_config_overrides
                 state.config_origins[f"{group.project_key}/{service_name}"] = sorted(names)
             store.write_atomic(state)
@@ -229,9 +260,14 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 state.ports[group.project_key][service_name] = _ports(inspect)
                 expected_image = docker.inspect_image(template.image.name)["Id"]
                 state.image_ids[cid] = expected_image
+                if service_name.startswith(("agent_", "gateway_pool_")):
+                    state.restart_counts[cid] = int(inspect.get("RestartCount", 0))
                 problems = _verify_service(docker, cid, template, rendered["services"][service_name], expected_image)
                 if problems:
                     raise DeploymentFailed(f"{service_name}: {', '.join(problems)}")
+            pool_problems = _pool_issues(group, state.ports[group.project_key])
+            if pool_problems:
+                raise DeploymentFailed("; ".join(pool_problems))
             state.preparation[group.project_key] = _execute_preparation(group, state.containers[group.project_key], docker)
             store.write_atomic(state)
         state.ready = True
@@ -277,6 +313,9 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
                     docker, cid, template, rendered["services"][service_name], state.image_ids[cid]))
                 if _ports(docker.inspect(cid)) != state.ports[group_key][service_name]:
                     drift.append(f"published ports changed: {service_name}")
+                if cid in state.restart_counts and int(docker.inspect(cid).get("RestartCount", 0)) != state.restart_counts[cid]:
+                    drift.append(f"container restarted: {service_name}")
+            drift.extend(_pool_issues(group, state.ports[group_key]))
             if group.preparation.readiness.enabled:
                 step = group.preparation.readiness
                 result = docker.exec_json(state.containers[group_key][_target_service(group, step.target)], step.command)

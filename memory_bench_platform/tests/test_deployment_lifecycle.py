@@ -6,6 +6,7 @@ import yaml
 
 from memory_bench_platform.deployment_lifecycle import DeploymentFailed, deploy, status, undeploy
 from test_deployment_config import fixture_config
+from test_deployment_compose import pooled_fixture
 
 
 class RecordingDocker:
@@ -151,3 +152,34 @@ def test_partial_compose_up_is_rolled_back(tmp_path):
         deploy(path, tmp_path, docker)
     assert len(docker.removed_projects) == 1
     assert next(iter(docker.removed_projects)).startswith("mb_suite_mem0_common_")
+
+
+def test_pool_deploy_checks_upstreams_and_restart_drift(tmp_path, monkeypatch):
+    path, _ = pooled_fixture(tmp_path)
+    expected = [f"http://agent_claw_common_{n}:8080" for n in range(1, 4)]
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": expected})
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    group = next(iter(state.projects))
+    assert all(f"agent_claw_common_{n}" in state.containers[group] for n in range(1, 4))
+    assert "gateway_pool_claw_common" in state.containers[group]
+    assert status("suite", tmp_path, docker).ready
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": expected[:-1]})
+    assert not status("suite", tmp_path, docker).ready
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": expected})
+    cid = state.containers[group]["gateway_pool_claw_common"]
+    docker.containers[cid]["RestartCount"] = 1
+    assert not status("suite", tmp_path, docker).ready
+
+
+def test_pool_wrong_upstreams_rolls_back(tmp_path, monkeypatch):
+    path, _ = pooled_fixture(tmp_path)
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": []})
+    docker = RecordingDocker()
+    with pytest.raises(DeploymentFailed, match="upstream"):
+        deploy(path, tmp_path, docker)
+    assert docker.removed_projects
