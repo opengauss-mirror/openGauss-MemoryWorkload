@@ -1,6 +1,6 @@
 # 端到端阶段化 Profiling 与性能分析闭环设计
 
-状态：待评审。本文定义目标行为和接口，不代表现有代码已经实现。
+状态：核心路径已实施；Linux 真实 perf/cgroup 验证与多 Agent `--pressure-test` 前置能力仍待完成。本文定义目标行为，未完成项不应视为已交付。
 
 ## 1. 目标与边界
 
@@ -29,6 +29,8 @@
 | 统一阶段事件 + 独立采集模块 + 离线分析模块（选用） | runner 只声明阶段；采集器和报告可复用，支持离线复算 | 需明确跨模块契约并逐条接入运行路径 |
 
 选用第三种。接口保持小：runner 发阶段事件；采集模块接受阶段与目标映射；分析模块只读取不可变归档。`ResourceMonitor` 保留为宿主粗粒度背景数据，不把其结果冒充容器 perf。
+
+现有 `analyze-run` 已按归档格式分派：普通 run 由 `result_analysis.analyze_run()` 读取 `run.json`、`reports/summary.json`、`case_results.json` 等，汇总准确率、失败分类、ingest 与宿主资源指标，按 LoCoMo/official_small 的特定格式生成 timing 报告，并写出 `analysis.json`、`analysis.md`、`run_report.html`；`run_config.json` 标记为 `multi-user-run/1` 时，由 `multi_user_report.import_report()` 校验用户/实例绑定与事件，再重算整体、用户和实例指标并重渲染报告。后者不依赖普通 run 的 `run.json`/`case_results.json`，也不生成普通 run 的 `analysis.json/md`。两条路径目前都没有通用的内部 span 与 Topdown 归因。保留既有分派，不把多用户归档强制转换为普通 run 格式。
 
 ## 3. 运行范围与阶段模型
 
@@ -120,6 +122,19 @@ runs/<run-id>/
 
 `run_config.json` 记录代码/镜像版本、工作负载指纹、模型模式、并发/速率/超时、profiling 配置摘要、硬件和 perf 版本，不写密钥、原始请求或私有 endpoint。所有运行目录保持不可覆盖；报告公开目录只放脱敏数据，可能敏感的 raw 独立设为用户私有权限。`analyze-run` 对该 schema 重新计算报告，发现原始数据与已有汇总不符时报错，不把旧值当权威。
 
+### 7.1 复用现有 `analyze-run` 的接点
+
+新增纯离线模块 `analyze_profiling_archive(run_dir) -> ProfilingAnalysis`。它只在归档含 profiling 契约时读取 `phase_events`、内部 span、perf/Topdown 和 collector 状态；根据归档 schema 选用普通 run 或多用户 run 的客户端事件适配器，归一化为带 `run_id`、实例/用户身份、`request_id`、操作和时间窗口的关联输入。缺少关联字段的旧事件只计入覆盖率缺口，不合成 request ID 或内部阶段。模块校验 profiling 原始工件的引用、计数和有效性，生成 `reports/profiling_analysis.*`，并返回可嵌入的摘要；调用者不用了解 perf 原始格式和 stage map。
+
+| 现有路径 | 保留的职责 | profiling 接入位置 |
+|---|---|---|
+| 普通 run `result_analysis.analyze_run()` | 原有外部结果刷新、准确率/失败/资源分析、LoCoMo/official_small timing，以及 `analysis.json/md`、`run_report.html` | 原有指标计算后、报告写入前调用共用离线模块，将 profiling 摘要及报告链接嵌入现有分析和 HTML |
+| 多用户 run `multi_user_report.import_report()` | 先严格校验 `request_events.jsonl`、用户/实例绑定与 summary，重算整体/用户/实例指标 | 校验通过后调用同一模块，将 profiling 报告链接加入多用户 HTML；完整摘要留在独立的 `profiling_analysis.json`，不扩展现有 summary schema，也不要求 `run.json` 或 `case_results.json` |
+
+两条路径复用既有 CLI 分派、事件校验、基础指标汇总和文件输出约定，不复用 LoCoMo/official_small 的格式特定解析作为通用 span 解析器。`reporter.py` 的 JSON/Markdown/HTML 写入函数和已有资源图表可按输出格式复用；Topdown、阶段时钟关联、非重叠 leaf 归因与采集有效性由新模块负责。旧 `result_analysis.py` 中按 LoCoMo 诊断步骤时长累加得到的资源阶段标记仅保留为旧报告语义，不能替代真实 `phase_events`。
+
+没有 profiling 工件的历史 run 继续走原路径且输出不变；新归档中契约要求的 profiling 工件缺失、损坏或与已有 profiling 汇总不一致时，离线复算明确报错或将归因判为无效，不能回退到旧汇总并宣称 profiling 成功。被明确标记为 skipped 的采集器不要求原始计数文件。普通 run 的专项 timing 可作为独立参考，只有字段和时间语义经适配验证后才导入统一模型；父级总时长与 leaf 子阶段不相加。
+
 基础报告至少含：各阶段 QPS/成功率/p50/p95/p99、目标与用户维度；内部阶段分位数/占比与 residual；request join 的匹配/缺失/重复/多余数量；每目标每阶段 cycles、IPC、cache/branch miss、Topdown L1（若有效）；采集覆盖率、失败/降级原因、模型模式与局限性。简单规则可标注候选瓶颈，例如“recall p95 上升且同阶段 vector_search leaf 占比高”，但只有证据链完整时给 `confidence=supported`；否则显示 `hypothesis` 和下一次验证实验。质量/非空率不满足门槛时先报告正确性问题，不做“更快”结论。
 
 分析结论不得把宿主资源采样当作进程级 perf，不得把 Topdown 占比与 wall-time 占比相加，也不得将缺失硬件/trace 数据记作 0。普通 benchmark 的 `official_small` timing 报告继续保留，并经适配器导入统一模型；缺失字段显示 unavailable，不从旧汇总反推不存在的 span。
@@ -130,13 +145,13 @@ runs/<run-id>/
 - `multi_user_replay.py`、普通 workflow runner 和压测计划中的 `pressure_runtime.py` 都向同一 phase sink 发事件，并将 request events 交给分析器；不直接解析硬件计数器。压测前置未落地时保持当前拒绝行为。
 - 新 profiling 模块隐藏 capability probe、cgroup 定位、采集器进程生命周期与 raw/status 归档；Linux perf 是首个适配器，unavailable 是另一实际适配器。
 - 新 trace 导入/归因模块处理 stage map、去重、join 和残差；保留现有 `official_small_timing` 特定格式适配层。
-- `result_analysis.py` 只协调离线分析结果并将统一 profiling 摘要嵌入现有报告，不把新解析逻辑继续堆进单个大文件。
+- `result_analysis.py` 与 `multi_user_report.py` 各自保留原有输入契约和校验职责，在原有结果成立后调用同一个 `analyze_profiling_archive()`；新模块内部以归档格式适配客户端事件，不把新解析逻辑继续堆进旧报告文件。
 
 向后兼容：不提供 profiling 配置时现有命令行为、报告不变。提供配置才生成 profiling/ 新工件。旧 run 的 `analyze-run` 继续可用，缺少新文件不视为损坏。`profiling/1` 与 stage-map 版本不兼容时明确失败，不静默降级。`deployment/1` 和 `multi-user-replay/1` 不改变现有字段含义。
 
 ## 9. 验证矩阵与实施顺序
 
-1. **契约与离线分析**：用固定小样本验证 schema、重复/错配 request ID、leaf/wrapper 防重、缺失阶段 residual、无效计数器和旧 run 兼容；不依赖真实 perf。
+1. **契约与离线分析**：分别用普通 run、多用户 run 固定小样本验证原有 `analyze-run` 输出不变，以及新增 profiling 摘要在两条入口一致；覆盖缺少 `run.json` 的多用户归档、重复/错配 request ID、leaf/wrapper 防重、缺失阶段 residual、无效计数器、旧 run 无 profiling 工件和新工件损坏；不依赖真实 perf。
 2. **采集器**：用可注入命令执行器模拟 perf 支持、不支持、无权限、挂起、子进程残留、目标重启、计数器复用与原始文件上限；Linux CI 再做最小真实 perf smoke，权限不足须明确 skipped。
 3. **阶段接入**：backend_direct 与 OpenClaw 各用 add→drain→search 小负载，验证先启动采集器、再打开阶段窗口，以及中断后的状态/清理。共享实例、多用户/多 Agent、不同速度用户只生成一次物理目标采集。
 4. **部署闭环**：假 Docker 验证 deploy/verify/run/analyze/cleanup 的顺序、已存在部署不被清理、部署漂移阻止采集、运行失败仍产部分报告；真实 Linux 环境做一次端到端受控 probe。多 Agent 部署压测闭环须在既有压测计划完成后，针对共享记忆实例、多个 Agent target 和稳态 search 分别验收。
