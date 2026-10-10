@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +41,7 @@ def capture_trace_cursor(source: Path) -> TraceCursor:
     except FileNotFoundError:
         return TraceCursor(None, 0, None)
     stream.seek(0, 2)
-    return TraceCursor(source.stat().st_ino, stream.tell(), stream)
+    return TraceCursor(os.fstat(stream.fileno()).st_ino, stream.tell(), stream)
 
 
 def _stage_map(path: Path) -> dict:
@@ -66,10 +67,15 @@ def _stage_map(path: Path) -> dict:
 def _lines(source: Path, cursor: TraceCursor, limit: int):
     consumed = 0
     streams = []
-    if cursor.stream is not None:
+    current = source.stat() if source.is_file() else None
+    truncated = (current is not None and current.st_ino == cursor.inode
+                 and current.st_size < cursor.offset)
+    if cursor.stream is not None and not truncated:
         streams.append(cursor.stream)
-    if source.is_file() and (cursor.inode is None or source.stat().st_ino != cursor.inode):
+    if current is not None and (cursor.inode is None or current.st_ino != cursor.inode or truncated):
         streams.append(source.open("rb"))
+    if truncated and cursor.stream is not None:
+        cursor.stream.close()
     try:
         for stream in streams:
             for line in stream:
@@ -86,7 +92,12 @@ def import_trace(source: Path, cursor: TraceCursor, run: TraceRunScope, stage_ma
                  output_dir: Path) -> TraceImportStatus:
     if run.start_utc.tzinfo is None or run.end_utc.tzinfo is None or run.end_utc < run.start_utc:
         raise ValueError("invalid trace run window")
-    clean_map = _stage_map(stage_map)
+    try:
+        clean_map = _stage_map(stage_map)
+    except BaseException:
+        if cursor.stream is not None:
+            cursor.stream.close()
+        raise
     root = output_dir / "profiling"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
@@ -108,7 +119,8 @@ def import_trace(source: Path, cursor: TraceCursor, run: TraceRunScope, stage_ma
             if not isinstance(row, dict) or row.get("kind") != "memory_perf":
                 counts["wrong_kind"] += 1
                 continue
-            if any(not row.get(field) for field in ("request_id", "instance_id", "user_id", "run_id")):
+            required_ids = ("request_id", "instance_id", "run_id") + (("user_id",) if run.user_ids else ())
+            if any(not row.get(field) for field in required_ids):
                 counts["missing_id"] += 1
                 continue
             try:
@@ -120,7 +132,8 @@ def import_trace(source: Path, cursor: TraceCursor, run: TraceRunScope, stage_ma
                 counts["invalid_timestamp"] += 1
                 continue
             if (row["run_id"] != run.run_id or row["instance_id"] not in run.instance_ids
-                    or row["user_id"] not in run.user_ids or row["request_id"] not in run.request_ids
+                    or (run.user_ids and row.get("user_id") not in run.user_ids)
+                    or (run.request_ids and row["request_id"] not in run.request_ids)
                     or not run.start_utc <= ts <= run.end_utc):
                 counts["out_of_scope"] += 1
                 continue
@@ -136,15 +149,17 @@ def import_trace(source: Path, cursor: TraceCursor, run: TraceRunScope, stage_ma
                 counts["invalid_span"] += 1
                 continue
             span_id = row.get("span_id")
-            if span_id and span_id in seen:
+            span_key = (row["run_id"], row["instance_id"], row.get("user_id"), row["request_id"], span_id)
+            if span_id and span_key in seen:
                 counts["duplicate_span_id"] += 1
                 continue
             if span_id:
-                seen.add(span_id)
+                seen.add(span_key)
             if row["stage"] not in clean_map["stages"]:
                 counts["unknown_stage"] += 1
-            clean = {key: row[key] for key in ("kind", "ts", "run_id", "instance_id", "user_id",
+            clean = {key: row[key] for key in ("kind", "ts", "run_id", "instance_id",
                      "request_id", "operation", "stage", "span_role", "status")}
+            clean["user_id"] = row.get("user_id") if run.user_ids else None
             clean["duration_ms"] = duration
             for field in ("span_id", "parent_span_id", "task_id", "trace_id", "start_utc", "end_utc"):
                 if isinstance(row.get(field), str):

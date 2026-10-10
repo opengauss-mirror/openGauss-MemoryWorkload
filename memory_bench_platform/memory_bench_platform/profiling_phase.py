@@ -17,6 +17,7 @@ T = TypeVar("T")
 class PhaseSink:
     def __init__(self, run_dir: Path, run_id: str, session: ProfilerSession):
         self.run_dir, self.run_id, self.session = run_dir, run_id, session
+        self.invalid_profile = False
         run_dir.mkdir(parents=True, exist_ok=True)
         targets = [asdict(target) for target in session.targets.values()]
         (run_dir / "target_registry.json").write_text(json.dumps(
@@ -51,7 +52,9 @@ class PhaseSink:
                 self._write(unique_targets, phase_id, start_utc, end_utc, start_ns,
                             end_ns, state, count, warmup, parent_phase_id)
             finally:
-                self.session.stop_phase(handles)
+                statuses = self.session.stop_phase(handles)
+                if any(item.state in {"failed", "invalid"} for item in statuses):
+                    self.invalid_profile = True
 
     def _write(self, targets: list[str], phase: str, start_utc: datetime, end_utc: datetime,
                start_ns: int, end_ns: int, state: str, count: int, warmup: bool,

@@ -255,7 +255,8 @@ def test_external_replay_brackets_real_add_and_search_phases(dataset_dir: Path, 
     config = _config(module, dataset_dir, tmp_path)
     phases = []
     class Sink:
-        session = type("Session", (), {"config": type("Config", (), {"phases": ["ingest", "drain", "recall"]})()})()
+        session = type("Session", (), {"config": type("Config", (), {
+            "phases": ["ingest", "drain", "recall"], "mode": "best_effort"})()})()
         def run_phase(self, phase, targets, operation, **kwargs):
             phases.append((phase, targets, kwargs.get("applicable", True)))
             return operation()
@@ -776,3 +777,87 @@ def test_main_creates_profile_archive_for_external_replay(dataset_dir, tmp_path,
         ("ingest", "completed"), ("drain", "not_applicable"), ("recall", "completed")]
     status = json.loads((tmp_path / "run" / "profiling" / "collector_status.json").read_text())
     assert all(row["reason"] == "hardware_off" for row in status["items"])
+
+
+def test_required_stop_failure_keeps_add_events_and_blocks_search(dataset_dir, tmp_path):
+    module = _module()
+    sent = []
+    class Sink:
+        invalid_profile = False
+        session = type("Session", (), {"config": type("Config", (), {
+            "mode": "required", "phases": ["ingest", "recall"]})()})()
+        def run_phase(self, phase, targets, operation, **kwargs):
+            result = operation()
+            self.invalid_profile = True
+            return result
+    def invoke(memory_id, request, **kwargs):
+        sent.append(request.action)
+        return _output(module, operation={"session_id": "s"}, output={"count": 0})
+    config = _config(module, dataset_dir, tmp_path)
+    with pytest.raises(RuntimeError, match="invalid_profile"):
+        module.execute_replay(config, invoke, phase_sink=Sink(), target_ids=["memory"])
+    assert sent == ["ingest"]
+    assert len((config.output_dir / "request_events.jsonl").read_text().splitlines()) == 1
+
+
+def test_main_imports_run_scoped_file_trace(dataset_dir, tmp_path, monkeypatch):
+    from memory_bench_platform import integration
+    from datetime import datetime, timezone
+    source = tmp_path / "memory.log"
+    source.write_text("old history\n")
+    stage_map = tmp_path / "stage-map.json"
+    stage_map.write_text(json.dumps({"schema": "stage-map/1", "stages": {
+        "extract": {"category": "extract_llm", "role": "leaf", "operation": "add"}}}))
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "schema: profiling/1\nmode: best_effort\ntargets: [memory]\n"
+        "external_targets:\n  memory:\n    host_pid: 1\n"
+        "    cgroup_path: /sys/fs/cgroup/example\n"
+        "hardware:\n  stat: 'off'\n"
+        f"internal_trace:\n  source: file\n  path: {source}\n  stage_map: {stage_map}\n")
+    def invoke(memory_id, request, **kwargs):
+        if request.action == "ingest":
+            with source.open("a") as stream:
+                stream.write(json.dumps({"kind": "memory_perf", "ts": datetime.now(timezone.utc).isoformat(),
+                    "run_id": "profiled-run", "instance_id": "memory",
+                    "request_id": request.inputs["request_id"], "operation": "add",
+                    "stage": "extract", "span_role": "leaf", "span_id": "s1",
+                    "duration_ms": 1, "status": "ok"}) + "\n")
+        return _output(_module(), operation={"session_id": "s"}, output={"count": 0})
+    monkeypatch.setattr(integration, "run_memory_task", invoke)
+    for key, value in {"DATA_PATH": str(dataset_dir), "OUTPUT_DIR": str(tmp_path / "out"),
+                       "RUN_DIR": str(tmp_path / "run"), "RUN_ID": "profiled-run",
+                       "MEMORY_BACKEND": "fake-memory", "AGENT_ID": "generic-cli",
+                       "MEMORY_BENCH_PROFILING_CONFIG": str(profile)}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("MEMORY_BENCH_PROFILE_TARGETS", raising=False)
+    _module().main()
+    imported = (tmp_path / "run" / "profiling" / "perf_trace_events.jsonl").read_text()
+    assert "extract" in imported and "old history" not in imported
+
+
+def test_trace_import_failure_does_not_mask_replay_failure(dataset_dir, tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_trace_import
+    source = tmp_path / "memory.log"
+    source.write_text("")
+    stage_map = tmp_path / "stage-map.json"
+    stage_map.write_text(json.dumps({"schema": "stage-map/1", "stages": {}}))
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "schema: profiling/1\nmode: best_effort\ntargets: [memory]\n"
+        "external_targets:\n  memory:\n    host_pid: 1\n"
+        "    cgroup_path: /sys/fs/cgroup/example\n"
+        "hardware:\n  stat: 'off'\n"
+        f"internal_trace:\n  source: file\n  path: {source}\n  stage_map: {stage_map}\n")
+    for key, value in {"DATA_PATH": str(dataset_dir), "OUTPUT_DIR": str(tmp_path / "out"),
+                       "RUN_DIR": str(tmp_path / "run"), "RUN_ID": "profiled-run",
+                       "MEMORY_BACKEND": "fake-memory", "AGENT_ID": "generic-cli",
+                       "MEMORY_BENCH_PROFILING_CONFIG": str(profile)}.items():
+        monkeypatch.setenv(key, value)
+    module = _module()
+    monkeypatch.setattr(module, "execute_replay", lambda *_args, **_kwargs:
+                        (_ for _ in ()).throw(RuntimeError("replay failed")))
+    monkeypatch.setattr(profiling_trace_import, "import_trace", lambda *_args, **_kwargs:
+                        (_ for _ in ()).throw(RuntimeError("trace failed")))
+    with pytest.raises(RuntimeError, match="replay failed"):
+        module.main()

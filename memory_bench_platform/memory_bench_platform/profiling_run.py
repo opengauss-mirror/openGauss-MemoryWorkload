@@ -27,7 +27,11 @@ def prepare_phase_sink(config: ProfilingConfig, run_dir: Path, run_id: str,
             cpu_scope=spec.cpu_scope)
             for name, spec in config.external_targets.items()]
         targets = resolve_targets(config, None, explicit)
-    session = ProfilerSession(config, targets, run_dir)
+    docker = None
+    if any(target.container_id is not None for target in targets):
+        from .deployment_docker import DockerClient
+        docker = DockerClient()
+    session = ProfilerSession(config, targets, run_dir, docker=docker)
     if config.mode == "required":
         for target in targets:
             capability = session.probe(target, config)

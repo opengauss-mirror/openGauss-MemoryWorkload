@@ -32,6 +32,9 @@ def _fixture(tmp_path, *, collector="completed", running="1.0", topdown=None):
         "target_id,phase_id,event,value,running_fraction,cpu_scope,event_group\n"
         f"memory-i,ingest,cycles,1000,{running},0-3,basic\n"
         f"memory-i,ingest,instructions,500,{running},0-3,basic\n")
+    raw = tmp_path / "profiling" / "raw" / "memory-i" / "ingest"
+    raw.mkdir(parents=True)
+    (raw / "perf-stat.txt").write_text("1000;;cycles;1000;100.00\n")
     if topdown is not None:
         (tmp_path / "profiling" / "topdown_summary.csv").write_text(
             "target_id,phase_id,cpu_scope,event_group,frontend_bound,bad_speculation,backend_bound,retiring\n"
@@ -49,6 +52,8 @@ def test_reanalysis_rebuilds_same_report(tmp_path):
     assert (run / "reports" / "profiling_analysis.json").read_bytes() == before
     assert (run / "reports" / "join_coverage.json").exists()
     assert (run / "reports" / "stage_summary.csv").exists()
+    assert first.summary["overall"]["ingest"]["qps"] == 1.0
+    assert "Overall" in (run / "reports" / "profiling_analysis.html").read_text()
 
 
 def test_counter_running_below_090_invalid(tmp_path):
@@ -76,6 +81,15 @@ def test_skipped_hardware_is_unavailable_not_zero(tmp_path):
     hardware = report.summary["hardware"]["memory-i:ingest"]
     assert hardware["state"] == "skipped"
     assert "cycles" not in hardware
+
+
+def test_missing_collector_status_is_invalid_not_skipped(tmp_path):
+    run = _fixture(tmp_path)
+    (run / "profiling" / "collector_status.json").write_text(json.dumps({
+        "schema": "collector-status/1", "items": []}))
+    report = analyze_profiling_archive(run)
+    assert report.summary["hardware"]["memory-i:ingest"] == {
+        "state": "invalid", "reason": "missing_collector_status"}
 
 
 def test_report_excludes_trace_payload_and_private_endpoint(tmp_path):
@@ -109,6 +123,46 @@ def test_phase_latency_percentiles_use_client_durations(tmp_path):
     report = analyze_profiling_archive(run)
     phase = report.summary["phases"]["memory-i:ingest"]
     assert (phase["p50_ms"], phase["p95_ms"], phase["p99_ms"]) == (100.0, 100.0, 100.0)
+
+
+def test_production_replay_counts_unscoped_events_in_phase_window(tmp_path):
+    run = _fixture(tmp_path, collector="skipped")
+    (run / "run_config.json").unlink()
+    (run / "run.json").write_text(json.dumps({"run_id": "run1"}))
+    replay = run / "external_artifacts" / "replay"
+    replay.mkdir(parents=True)
+    (replay / "run_config.json").write_text(json.dumps({
+        "schema": "production-replay-config/1", "run_id": "run1"}))
+    (replay / "request_events.jsonl").write_text(json.dumps({
+        "request_id": "r1", "operation": "add", "ts": "2026-01-01T00:00:00.200000+00:00",
+        "duration_ms": 100, "status": "ok", "state": "completed"}) + "\n")
+    report = analyze_profiling_archive(run)
+    assert report.summary["phases"]["memory-i:ingest"]["qps"] == 1.0
+
+
+def test_unscoped_event_does_not_count_for_other_target(tmp_path):
+    run = _fixture(tmp_path)
+    (run / "run_config.json").unlink()
+    (run / "run.json").write_text(json.dumps({"run_id": "run1"}))
+    (run / "target_registry.json").write_text(json.dumps({"schema": "target-registry/1",
+        "targets": [{"target_id": "memory-i", "physical_instance_id": "i", "role": "memory"},
+                    {"target_id": "memory-j", "physical_instance_id": "j", "role": "memory"}]}))
+    replay = run / "external_artifacts" / "replay"
+    replay.mkdir(parents=True)
+    (replay / "run_config.json").write_text(json.dumps({
+        "schema": "production-replay-config/1", "run_id": "run1"}))
+    (replay / "request_events.jsonl").write_text(json.dumps({
+        "request_id": "r1", "operation": "add", "ts": "2026-01-01T00:00:00.200000+00:00",
+        "duration_ms": 100, "status": "ok", "state": "completed"}) + "\n")
+    report = analyze_profiling_archive(run)
+    assert report.summary["phases"]["memory-i:ingest"]["count"] == 0
+
+
+def test_ordinary_run_uses_archived_quality_gate(tmp_path):
+    from memory_bench_platform.profiling_analysis import _gate
+    (tmp_path / "run.json").write_text(json.dumps({
+        "config": {"profiling": {"quality_gates": {"min_counter_running_fraction": 0.75}}}}))
+    assert _gate(tmp_path, "min_counter_running_fraction", 0.90) == 0.75
 
 
 def test_topdown_requires_same_event_group(tmp_path):

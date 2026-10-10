@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,7 +101,8 @@ def load_profile_archive(run_dir: Path) -> ProfileArchive | None:
     except (OSError, ValueError) as exc:
         raise ValueError("invalid profiling archive") from exc
     target_ids = [target.get("target_id") for target in registry.targets]
-    if any(not isinstance(item, str) or not item for item in target_ids) or len(set(target_ids)) != len(target_ids):
+    if any(not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,127}", item) is None
+           for item in target_ids) or len(set(target_ids)) != len(target_ids):
         raise ValueError("invalid or duplicate target")
     run_record = run_dir / "run_config.json"
     if not run_record.is_file():
@@ -132,15 +134,27 @@ def load_profile_archive(run_dir: Path) -> ProfileArchive | None:
     if any(item.target_id not in target_ids or (item.target_id, item.phase_id) not in seen
            for item in collectors.items):
         raise ValueError("collector references unknown target phase")
+    collector_keys = [(item.target_id, item.phase_id) for item in collectors.items]
+    if len(collector_keys) != len(set(collector_keys)):
+        raise ValueError("duplicate collector status")
     return ProfileArchive(run_dir, phases, tuple(registry.targets), tuple(collectors.items))
 
 
 def load_client_events(run_dir: Path) -> list[ClientEvent]:
+    def memory_instance() -> str | None:
+        registry = run_dir / "target_registry.json"
+        if not registry.is_file():
+            return None
+        targets = _read_json(registry).get("targets", [])
+        memories = {item.get("physical_instance_id") for item in targets
+                    if isinstance(item, dict) and item.get("role") == "memory"}
+        return next(iter(memories)) if len(memories) == 1 else None
+
     config_path = run_dir / "run_config.json"
     if config_path.is_file() and _read_json(config_path).get("schema") == "multi-user-run/1":
         config = _read_json(config_path)
         users = {item["user_id"]: item["instance"] for item in config["users"].values()}
-        origin = datetime.fromisoformat(config["started_at"])
+        origin = datetime.fromisoformat(config.get("request_time_origin_utc", config["started_at"]))
         if origin.tzinfo is None:
             raise ValueError("run started_at must have timezone")
         rows = []
@@ -160,6 +174,51 @@ def load_client_events(run_dir: Path) -> list[ClientEvent]:
                 rows.append(ClientEvent(config["run_id"], event["instance_id"], event["user_id"],
                     event["request_id"], event["operation"], origin + timedelta(milliseconds=start),
                     origin + timedelta(milliseconds=end), event["status"], end - start))
+        return rows
+    replay_dir = run_dir / "external_artifacts" / "replay"
+    replay_config = replay_dir / "run_config.json"
+    if replay_config.is_file() and _read_json(replay_config).get("schema") == "production-replay-config/1":
+        from math import isfinite
+        from .external_report_import import _load_production_events
+        run_id = _read_json(run_dir / "run.json")["run_id"]
+        if _read_json(replay_config).get("run_id") != run_id:
+            raise ValueError("production replay run_id mismatch")
+        rows = []
+        instance = memory_instance()
+        for event in _load_production_events(replay_dir / "request_events.jsonl"):
+            try:
+                ended = datetime.fromisoformat(event["ts"])
+                duration = float(event["duration_ms"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid production replay event window") from exc
+            if ended.tzinfo is None or not isfinite(duration) or duration < 0:
+                raise ValueError("invalid production replay event window")
+            rows.append(ClientEvent(run_id, instance, None, event["request_id"], event["operation"],
+                ended - timedelta(milliseconds=duration), ended, event["status"], duration))
+        return rows
+    native_path = run_dir / "profiling_client_events.jsonl"
+    if native_path.is_file():
+        run_id = _read_json(run_dir / "run.json")["run_id"]
+        instance = memory_instance()
+        rows = []
+        seen = set()
+        with native_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                    started = datetime.fromisoformat(event["started_utc"])
+                    ended = datetime.fromisoformat(event["ended_utc"])
+                    key = (event["request_id"], event["operation"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("invalid native profiling event") from exc
+                if (event.get("run_id") != run_id or key in seen or
+                        event["operation"] not in {"add", "drain", "search"} or
+                        event.get("status") not in {"ok", "failed"} or
+                        started.tzinfo is None or ended.tzinfo is None or ended < started):
+                    raise ValueError("invalid native profiling event")
+                seen.add(key)
+                rows.append(ClientEvent(run_id, instance, None, key[0], key[1], started, ended,
+                    event["status"], (ended - started).total_seconds() * 1000))
         return rows
     record = _read_json(run_dir / "run.json")
     cases = _read_json(run_dir / "reports" / "case_results.json")

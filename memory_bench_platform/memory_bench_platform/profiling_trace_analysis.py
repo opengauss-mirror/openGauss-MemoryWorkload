@@ -34,7 +34,8 @@ def _quality_gate(root: Path) -> float:
         path = root / filename
         if path.is_file():
             config = json.loads(path.read_text(encoding="utf-8"))
-            return float(config.get("profiling", {}).get("quality_gates", {}).get("min_request_join_rate", 0.95))
+            profile = config.get("profiling") or config.get("config", {}).get("profiling") or {}
+            return float(profile.get("quality_gates", {}).get("min_request_join_rate", 0.95))
     return 0.95
 
 
@@ -74,11 +75,13 @@ def analyze_trace(archive: ProfileArchive, clients: list[ClientEvent]) -> TraceA
             invalid["malformed_row"] += 1
             continue
         span_id = row.get("span_id")
-        if span_id and span_id in seen_spans:
+        span_key = (row.get("run_id"), row.get("instance_id"), row.get("user_id"),
+                    row.get("request_id"), span_id)
+        if span_id and span_key in seen_spans:
             invalid["duplicate_span_id"] += 1
             continue
         if span_id:
-            seen_spans.add(span_id)
+            seen_spans.add(span_key)
         try:
             duration = float(row["duration_ms"])
         except (KeyError, TypeError, ValueError):
@@ -112,11 +115,38 @@ def analyze_trace(archive: ProfileArchive, clients: list[ClientEvent]) -> TraceA
     for key, rows in rows_by_scope.items():
         by_category = Counter()
         wrappers = []
+        leaves = []
         for row, role, category in rows:
             if role == "leaf":
-                by_category[category] += float(row["duration_ms"])
+                leaves.append((row, category))
             else:
                 wrappers.append(float(row["duration_ms"]))
+        if len(leaves) == 1:
+            row, category = leaves[0]
+            by_category[category] = float(row["duration_ms"])
+        elif leaves:
+            if not all(_anchored(row) for row, _ in leaves):
+                invalid["unverifiable_leaf_overlap"] += 1
+            else:
+                intervals = sorted((datetime.fromisoformat(row["start_utc"]),
+                                    datetime.fromisoformat(row["end_utc"]), category)
+                                   for row, category in leaves)
+                merged = []
+                ambiguous = False
+                for start, end, category in intervals:
+                    if merged and start < merged[-1][1]:
+                        previous_start, previous_end, previous_category = merged[-1]
+                        if category != previous_category:
+                            ambiguous = True
+                            break
+                        merged[-1] = (previous_start, max(previous_end, end), category)
+                    else:
+                        merged.append((start, end, category))
+                if ambiguous:
+                    invalid["overlapping_leaf_categories"] += 1
+                else:
+                    for start, end, category in merged:
+                        by_category[category] += (end - start).total_seconds() * 1000
         operation = key[-1]
         for category, duration in by_category.items():
             distributions[operation][category].append(duration)
@@ -131,7 +161,9 @@ def analyze_trace(archive: ProfileArchive, clients: list[ClientEvent]) -> TraceA
     rate = matched / total if total else 0.0
     coverage = {"matched": matched, "missing": total - matched, "extra": len(extra_scopes),
                 "duplicates": invalid["duplicate_span_id"], "rate": rate}
-    validity = "valid" if rate >= _quality_gate(archive.run_dir) else "invalid"
+    overlap_invalid = invalid["overlapping_leaf_categories"] or invalid["unverifiable_leaf_overlap"]
+    validity = "valid" if rate >= _quality_gate(archive.run_dir) and not overlap_invalid else "invalid"
     return TraceAnalysis(coverage, {op: dict(values) for op, values in distributions.items()}, residuals,
                          dict(invalid), anchored, validity,
-                         None if validity == "valid" else "low_request_join_rate")
+                         None if validity == "valid" else
+                         "leaf_overlap_unverifiable" if overlap_invalid else "low_request_join_rate")

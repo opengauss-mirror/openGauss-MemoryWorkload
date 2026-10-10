@@ -58,6 +58,36 @@ def test_ordinary_event_preserves_missing_identity(tmp_path):
     assert events[1].request_id == "read2" and events[1].status == "failed"
 
 
+def test_production_replay_events_keep_actual_request_windows(tmp_path):
+    (tmp_path / "run.json").write_text(json.dumps({"run_id": "run1"}))
+    (tmp_path / "target_registry.json").write_text(json.dumps({
+        "schema": "target-registry/1", "targets": [{"target_id": "memory-i", "role": "memory",
+                                                    "physical_instance_id": "i"}]}))
+    replay = tmp_path / "external_artifacts" / "replay"
+    replay.mkdir(parents=True)
+    (replay / "run_config.json").write_text(json.dumps({
+        "schema": "production-replay-config/1", "run_id": "run1"}))
+    (replay / "request_events.jsonl").write_text(json.dumps({
+        "request_id": "add-1", "operation": "add", "ts": "2026-01-01T00:00:01+00:00",
+        "duration_ms": 250, "status": "ok", "state": "completed"}) + "\n")
+    events = load_client_events(tmp_path)
+    assert len(events) == 1
+    assert events[0].request_id == "add-1"
+    assert events[0].instance_id == "i"
+    assert events[0].started_utc.isoformat() == "2026-01-01T00:00:00.750000+00:00"
+
+
+def test_native_workflow_events_keep_stage_window(tmp_path):
+    (tmp_path / "run.json").write_text(json.dumps({"run_id": "run1"}))
+    (tmp_path / "profiling_client_events.jsonl").write_text(json.dumps({
+        "run_id": "run1", "request_id": "case-1", "operation": "search",
+        "started_utc": "2026-01-01T00:00:00+00:00",
+        "ended_utc": "2026-01-01T00:00:00.100000+00:00", "status": "ok"}) + "\n")
+    events = load_client_events(tmp_path)
+    assert [(item.request_id, item.operation, item.duration_ms) for item in events] == [
+        ("case-1", "search", 100.0)]
+
+
 def test_marked_archive_missing_phase_file_fails(tmp_path):
     (tmp_path / "profiling").mkdir()
     with pytest.raises(ValueError, match="phase_events"):

@@ -88,3 +88,13 @@ def test_overlapping_parent_child_are_explicit(tmp_path):
     archive = load_profile_archive(tmp_path)
     assert len(archive.phases) == 2
     assert next(p for p in archive.phases if p.phase_id == "qa").parent_phase_id == "recall"
+
+
+def test_failed_stop_marks_profile_invalid_after_operation(tmp_path):
+    from types import SimpleNamespace
+    session = FakeSession()
+    session.config = SimpleNamespace(mode="required")
+    session.stop_phase = lambda handles: [SimpleNamespace(state="invalid", reason="low_running_fraction")]
+    sink = PhaseSink(tmp_path, "run", session)
+    sink.run_phase("ingest", ["memory-i"], lambda: None)
+    assert sink.invalid_profile is True

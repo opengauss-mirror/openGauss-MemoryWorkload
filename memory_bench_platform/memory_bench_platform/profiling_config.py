@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _Strict(BaseModel):
@@ -25,6 +26,11 @@ class TraceConfig(_Strict):
     path: Path | None = None
     stage_map: Path | None = None
     max_raw_bytes: int = Field(default=1073741824, gt=0)
+
+    @field_validator("path", "stage_map", mode="before")
+    @classmethod
+    def parse_path(cls, value):
+        return Path(value) if isinstance(value, str) and value else value
 
 
 class QualityGates(_Strict):
@@ -53,6 +59,9 @@ class ProfilingConfig(_Strict):
     def valid_selection(self):
         if not self.phases or not self.targets or len(set(self.phases)) != len(self.phases) or len(set(self.targets)) != len(self.targets):
             raise ValueError("empty or duplicate profiling selection")
+        if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,127}", name) is None
+               for name in self.targets):
+            raise ValueError("invalid profiling target id")
         if not set(self.external_targets) <= set(self.targets):
             raise ValueError("external target identity is not selected")
         if self.hardware.record == "selected_phases" and not set(self.hardware.record_phases) <= set(self.phases):

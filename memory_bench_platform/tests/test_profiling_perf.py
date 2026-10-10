@@ -54,6 +54,40 @@ def test_required_probe_failure_blocks_start(tmp_path):
         session.start_phase("ingest", ["memory-i"])
 
 
+def test_required_immediate_perf_exit_blocks_work(tmp_path):
+    class ExitedProcess(FakeProcess):
+        def poll(self):
+            return 1
+    session = ProfilerSession(_config(mode="required"), [_target()], tmp_path,
+        command_factory=lambda *a, **k: ExitedProcess("permission denied"),
+        probe=lambda target, config: CapabilityResult("ready", None, "basic"))
+    with pytest.raises(RuntimeError, match="collector_start_failed"):
+        session.start_phase("ingest", ["memory-i"])
+    status = json.loads((tmp_path / "profiling" / "collector_status.json").read_text())
+    assert status["items"][0]["state"] == "failed"
+
+
+def test_target_restart_during_phase_invalidates_counters(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_perf
+    monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
+    class Docker:
+        restart = 0
+        def inspect(self, container):
+            return {"Id": container, "RestartCount": self.restart,
+                    "State": {"StartedAt": "start"}}
+    docker = Docker()
+    target = TargetIdentity("memory-i", "memory", "i", "compose",
+        container_id="cid", cgroup_path="/sys/fs/cgroup/test", restart_count=0,
+        start_time="start")
+    session = ProfilerSession(_config(), [target], tmp_path,
+        command_factory=lambda *a, **k: FakeProcess(), docker=docker,
+        probe=lambda target, config: CapabilityResult("ready", None, "basic"))
+    handles = session.start_phase("ingest", ["memory-i"])
+    docker.restart = 1
+    status = session.stop_phase(handles)
+    assert status[0].state == "invalid" and status[0].reason == "target_drift"
+
+
 def test_best_effort_topdown_downgrades_by_name(tmp_path):
     session = ProfilerSession(_config(hardware={"stat": "topdown_l1"}), [_target()], tmp_path,
         command_factory=lambda *a, **k: FakeProcess(),
@@ -137,3 +171,23 @@ def test_selected_phase_starts_perf_record_and_stops_it(tmp_path, monkeypatch):
     session.stop_phase(session.start_phase("ingest", ["memory-i"]))
     assert [argv[1] for argv in commands] == ["stat", "record"]
     assert "-o" in commands[1]
+
+
+def test_perf_record_limit_stops_capture_during_phase(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_perf
+    signals = []
+    monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    def factory(argv, **kwargs):
+        if argv[1] == "record":
+            path = tmp_path / "profiling" / "raw" / "memory-i" / "ingest" / "perf.data"
+            path.write_bytes(b"x" * 20)
+        return FakeProcess()
+    session = ProfilerSession(_config(hardware={"record": "selected_phases",
+        "record_phases": ["ingest"], "max_raw_bytes": 10}), [_target()], tmp_path,
+        command_factory=factory,
+        probe=lambda target, config: CapabilityResult("ready", None, "basic"))
+    handles = session.start_phase("ingest", ["memory-i"])
+    time.sleep(.12)
+    assert handles[0].record_overflow is True
+    assert signals
+    assert session.stop_phase(handles)[0].reason == "raw_size_limit"

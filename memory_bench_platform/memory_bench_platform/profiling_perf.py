@@ -6,13 +6,15 @@ import json
 import os
 import signal
 import subprocess
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from .profiling_archive import CollectorStatus
 from .profiling_config import ProfilingConfig
-from .profiling_targets import CapabilityResult, TargetIdentity, probe_target
+from .profiling_targets import CapabilityResult, TargetIdentity, probe_target, target_drifted
 
 
 @dataclass
@@ -23,6 +25,9 @@ class CollectorHandle:
     reason: str | None = None
     process: object | None = None
     record_process: object | None = None
+    record_stop: threading.Event = field(default_factory=threading.Event)
+    record_watcher: threading.Thread | None = None
+    record_overflow: bool = False
     result: CollectorStatus | None = None
 
 
@@ -61,6 +66,7 @@ class ProfilerSession:
                 target = self.targets[target_id]
                 handle = CollectorHandle(target_id, phase_id, "probing")
                 self.handles[key] = handle
+                result.append(handle)
                 self._persist()
                 capability: CapabilityResult = self.probe(target, self.config)
                 if capability.state != "ready":
@@ -68,15 +74,17 @@ class ProfilerSession:
                     self._persist()
                     if self.config.mode == "required":
                         raise RuntimeError(capability.reason or "collector unavailable")
-                    result.append(handle)
                     continue
-                events = ("cycles,instructions,task-clock" if capability.event_group == "basic" else
+                events = ("cycles,instructions,task-clock,cache-misses,branches,branch-misses" if capability.event_group == "basic" else
                           "topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound")
                 argv = ["perf", "stat", "-x", ";", "--no-big-num", "-a", "-G", target.cgroup_path,
                         "-e", events, "--", "sleep", "infinity"]
                 try:
                     handle.process = self.command_factory(argv, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+                    time.sleep(0.05)
+                    if handle.process.poll() is not None:
+                        raise OSError("perf exited before phase start")
                     if self.config.hardware.record == "selected_phases" and phase_id in self.config.hardware.record_phases:
                         raw_dir = self.root / "raw" / target_id / phase_id
                         raw_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -85,18 +93,39 @@ class ProfilerSession:
                                        "-o", str(record_path), "--", "sleep", "infinity"]
                         handle.record_process = self.command_factory(record_argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+                        time.sleep(0.05)
+                        if handle.record_process.poll() is not None:
+                            raise OSError("perf record exited before phase start")
+                        def watch_record(handle=handle, record_path=record_path):
+                            while not handle.record_stop.wait(0.05):
+                                try:
+                                    if record_path.stat().st_size <= self.config.hardware.max_raw_bytes:
+                                        continue
+                                except FileNotFoundError:
+                                    continue
+                                handle.record_overflow = True
+                                try:
+                                    os.killpg(handle.record_process.pid, signal.SIGINT)
+                                except OSError:
+                                    pass
+                                return
+                        handle.record_watcher = threading.Thread(target=watch_record, daemon=True)
+                        handle.record_watcher.start()
                 except OSError as exc:
+                    handle.record_stop.set()
+                    if handle.record_watcher is not None:
+                        handle.record_watcher.join(timeout=1)
                     if handle.process is not None:
                         self._stop_process(handle.process)
+                    if handle.record_process is not None:
+                        self._stop_process(handle.record_process)
                     handle.state, handle.reason = "failed", "collector_start_failed"
                     self._persist()
                     if self.config.mode == "required":
                         raise RuntimeError("collector_start_failed") from exc
-                    result.append(handle)
                     continue
                 handle.state = "running"
                 self._persist()
-                result.append(handle)
         except BaseException:
             self.stop_phase(result)
             raise
@@ -121,6 +150,9 @@ class ProfilerSession:
             except (OSError, subprocess.TimeoutExpired):
                 stop_failed = True
             finally:
+                handle.record_stop.set()
+                if handle.record_watcher is not None:
+                    handle.record_watcher.join(timeout=1)
                 if handle.record_process is not None:
                     try:
                         self._stop_process(handle.record_process)
@@ -139,6 +171,10 @@ class ProfilerSession:
             raw_path.write_bytes(encoded)
             raw_path.chmod(0o600)
             record_path = raw_dir / "perf.data"
+            if handle.record_overflow:
+                handle.state, handle.reason = "invalid", "raw_size_limit"
+            if handle.record_process is not None and not record_path.is_file():
+                handle.state, handle.reason = "invalid", "record_missing"
             if record_path.is_file():
                 record_path.chmod(0o600)
                 if record_path.stat().st_size > self.config.hardware.max_raw_bytes:
@@ -160,6 +196,13 @@ class ProfilerSession:
                                 handle.state = "completed"
                         else:
                             handle.state = "completed"
+            target = self.targets[handle.target_id]
+            try:
+                drifted = target_drifted(target, self.docker)
+            except (OSError, ValueError):
+                drifted = True
+            if drifted:
+                handle.state, handle.reason = "invalid", "target_drift"
             handle.result = CollectorStatus(target_id=handle.target_id, phase_id=handle.phase_id,
                                             state=handle.state, reason=handle.reason)
             result.append(handle.result)

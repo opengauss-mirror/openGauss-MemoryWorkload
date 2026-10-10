@@ -43,9 +43,22 @@ def test_join_requires_scope_and_operation(tmp_path):
     assert report.reason == "low_request_join_rate"
 
 
+def test_same_span_id_in_different_request_scopes_is_not_duplicate(tmp_path):
+    archive = _archive(tmp_path, [_span(user="alice", request="r1"),
+                                  _span(user="bob", request="r2")])
+    report = analyze_trace(archive, [_client("alice", "r1"), _client("bob", "r2")])
+    assert report.join_coverage["matched"] == 2
+    assert report.join_coverage["duplicates"] == 0
+
+
 def test_wrapper_leaf_not_double_counted(tmp_path):
     archive = _archive(tmp_path, [_span("pipeline", "wrapper", 100),
-                                  _span("extract", "leaf", 40), _span("write", "leaf", 30)])
+                                  _span("extract", "leaf", 40,
+                                        start_utc="2026-01-01T00:00:00+00:00",
+                                        end_utc="2026-01-01T00:00:00.040000+00:00"),
+                                  _span("write", "leaf", 30,
+                                        start_utc="2026-01-01T00:00:00.040000+00:00",
+                                        end_utc="2026-01-01T00:00:00.070000+00:00")])
     report = analyze_trace(archive, [_client()])
     assert report.stage_durations_ms["add"] == {"extract_llm": [40.0], "memory_write": [30.0]}
     assert report.residuals[0]["unattributed_ms"] == 30.0
@@ -66,6 +79,19 @@ def test_missing_clock_anchor_prevents_perf_bucket_join(tmp_path):
     assert report.join_coverage["matched"] == 1
 
 
+def test_overlapping_leaf_categories_are_not_summed(tmp_path):
+    rows = [_span("extract", "leaf", 80,
+                  start_utc="2026-01-01T00:00:00+00:00",
+                  end_utc="2026-01-01T00:00:00.080000+00:00"),
+            _span("write", "leaf", 60,
+                  start_utc="2026-01-01T00:00:00.040000+00:00",
+                  end_utc="2026-01-01T00:00:00.100000+00:00")]
+    report = analyze_trace(_archive(tmp_path, rows), [_client()])
+    assert report.stage_durations_ms == {}
+    assert report.invalid_rows["overlapping_leaf_categories"] == 1
+    assert report.validity == "invalid"
+
+
 def test_invalid_and_extra_trace_rows_are_accounted(tmp_path):
     archive = _archive(tmp_path, [_span(), _span(duration=50),
                                   _span(stage="unknown", duration=10),
@@ -76,4 +102,5 @@ def test_invalid_and_extra_trace_rows_are_accounted(tmp_path):
     assert report.join_coverage["extra"] == 1
     assert report.invalid_rows["negative_duration"] == 1
     assert report.invalid_rows["unknown_stage"] == 1
-    assert report.stage_durations_ms["add"]["other_leaf"] == [10.0]
+    assert report.invalid_rows["unverifiable_leaf_overlap"] == 1
+    assert report.stage_durations_ms == {}

@@ -653,6 +653,15 @@ def execute_replay(
     dataset_state = (
         "complete" if all(event.status == "ok" for event in add_events) else "partially_written"
     )
+    def fail_invalid(events, elapsed):
+        if phase_sink is None or phase_sink.session.config.mode != "required" or not phase_sink.invalid_profile:
+            return
+        partial = tuple(events)
+        _write_request_events(config, partial)
+        _write_summary(config, summarize_replay(config.run_id, dataset_state, partial,
+            (), config.model_mode, elapsed))
+        raise RuntimeError("invalid_profile")
+    fail_invalid(add_events, {"add": add_elapsed_ms, "search": 0.0})
     if phase_sink is not None and "drain" in phase_sink.session.config.phases:
         phase_sink.run_phase("drain", targets, lambda: None, applicable=False)
     search_events, search_elapsed_ms = measured("recall", lambda: _run_phase(
@@ -661,6 +670,7 @@ def execute_replay(
         config.search_rate_per_second,
         lambda record: _run_search(config, record, invoke_memory)))
     events = tuple(add_events + search_events)
+    fail_invalid(events, {"add": add_elapsed_ms, "search": search_elapsed_ms})
     _write_request_events(config, events)
     internal_request_ids: tuple[str, ...] = ()
     attribution_error = None
@@ -731,13 +741,42 @@ def main() -> None:
         )
         profile_path = os.environ.get("MEMORY_BENCH_PROFILING_CONFIG")
         sink = None
+        cursor = None
+        trace_started = None
         if profile_path:
             from memory_bench_platform.profiling_config import load_profiling_config
             from memory_bench_platform.profiling_run import prepare_phase_sink
             profile = load_profiling_config(Path(profile_path))
             sink = prepare_phase_sink(profile, config.run_dir or output_dir, config.run_id)
-        execute_replay(config, run_memory_task, phase_sink=sink,
-                       target_ids=list(sink.session.targets) if sink else None)
+            if profile.internal_trace.source == "file":
+                from memory_bench_platform.profiling_trace_import import _stage_map, capture_trace_cursor
+                _stage_map(profile.internal_trace.stage_map)
+                cursor = capture_trace_cursor(profile.internal_trace.path)
+                trace_started = datetime.now(timezone.utc)
+        try:
+            execute_replay(config, run_memory_task, phase_sink=sink,
+                           target_ids=list(sink.session.targets) if sink else None)
+        finally:
+            if cursor is not None:
+                from memory_bench_platform.profiling_trace_import import TraceRunScope, import_trace
+                replay_failed = sys.exc_info()[0] is not None
+                try:
+                    events_path = output_dir / "request_events.jsonl"
+                    request_ids = ({json.loads(line)["request_id"] for line in events_path.read_text(encoding="utf-8").splitlines()}
+                                   if events_path.is_file() else set())
+                    import_trace(profile.internal_trace.path, cursor,
+                        TraceRunScope(config.run_id,
+                            {target.physical_instance_id for target in sink.session.targets.values()},
+                            set(), request_ids, trace_started, datetime.now(timezone.utc),
+                            profile.internal_trace.max_raw_bytes),
+                        profile.internal_trace.stage_map, config.run_dir or output_dir)
+                except Exception as exc:
+                    if not replay_failed:
+                        raise
+                    print(f"trace import also failed: {exc}", file=sys.stderr)
+                finally:
+                    if cursor.stream is not None:
+                        cursor.stream.close()
     except (KeyError, OSError, ValueError) as exc:
         print(f"production replay configuration failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from None

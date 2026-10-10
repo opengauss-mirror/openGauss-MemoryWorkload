@@ -10,7 +10,7 @@ import subprocess
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .integration import run_agent_task, run_memory_plugin_task, run_memory_task
@@ -666,6 +666,9 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
     outputs, statuses, failures = {}, {}, {}
     progress = run_dir / "records" / "case-progress"
     progress.mkdir(parents=True, exist_ok=True)
+    client_event_path = run_dir / "profiling_client_events.jsonl" if phase_sink is not None else None
+    if client_event_path is not None:
+        client_event_path.touch()
 
     def archive(case, output):
         target = progress / (hashlib.sha256(case.case_id.encode()).hexdigest() + ".json")
@@ -678,7 +681,7 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
 
     with ThreadPoolExecutor(max_workers=execution_spec.qa_concurrency) as qa_pool, \
          ThreadPoolExecutor(max_workers=execution_spec.judge_concurrency) as judge_pool:
-      def run_group(group):
+      def run_group(group, phase):
             # Drain both pools at checkpoint/sample boundaries, before any writes.
             remaining = iter(group)
             pending = {}
@@ -711,6 +714,17 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                         if output["_failure_kind"]:
                             failures[case.case_id] = output["_failure_kind"]
                         archive(case, output)
+                        if client_event_path is not None and phase in {"ingest", "drain", "recall"}:
+                            timed = [item for item in output["step_results"]
+                                     if item.started_at is not None and item.ended_at is not None]
+                            if timed:
+                                started = min(item.started_at for item in timed).astimezone(timezone.utc)
+                                ended = max(item.ended_at for item in timed).astimezone(timezone.utc)
+                                with client_event_path.open("a", encoding="utf-8") as stream:
+                                    stream.write(json.dumps({"run_id": run_id, "request_id": case.case_id,
+                                        "operation": {"ingest": "add", "drain": "drain", "recall": "search"}[phase],
+                                        "started_utc": started.isoformat(), "ended_utc": ended.isoformat(),
+                                        "status": "ok" if output["_execution_status"] == "passed" else "failed"}) + "\n")
                         if output["_judge_job"] is not None:
                             judge = judge_pool.submit(copy_context().run, _judge_case, run_id, case, output["_judge_job"], runtime_context)
                             pending[judge] = ("judge", case)
@@ -730,10 +744,12 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
             drain_recorded = True
         def run_batch():
             for group in batch:
-                run_group(group)
+                run_group(group, phase)
         if phase_sink is not None and phase in phase_sink.session.config.phases:
             phase_sink.run_phase(phase, target_ids or [], run_batch,
                                  request_count=lambda: sum(len(group) for group in batch))
+            if phase_sink.session.config.mode == "required" and phase_sink.invalid_profile:
+                raise RuntimeError("invalid_profile")
         else:
             run_batch()
     if phase_sink is not None and set(phase_sink.session.config.phases) - set(selected_phases):

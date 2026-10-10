@@ -50,6 +50,15 @@ def test_rotation_uses_saved_identity_and_offset(tmp_path):
     assert result.imported == 2
 
 
+def test_truncated_source_reads_new_lines_from_start(tmp_path):
+    source = tmp_path / "source.log"
+    source.write_text("old-history" * 100)
+    cursor = capture_trace_cursor(source)
+    source.write_text(json.dumps(_row()) + "\n")
+    result = import_trace(source, cursor, _scope(), _map(tmp_path), tmp_path / "out")
+    assert result.imported == 1
+
+
 def test_out_of_run_and_missing_ids_counted(tmp_path):
     source = tmp_path / "source.log"
     source.write_text("")
@@ -100,3 +109,16 @@ def test_async_task_id_preserved(tmp_path):
     import_trace(source, cursor, _scope(), _map(tmp_path), tmp_path / "out")
     row = json.loads((tmp_path / "out" / "profiling" / "perf_trace_events.jsonl").read_text())
     assert row["task_id"] == "task-1"
+
+
+def test_ordinary_run_accepts_missing_user_id_when_scope_is_unscoped(tmp_path):
+    source = tmp_path / "source.log"
+    source.write_text("")
+    cursor = capture_trace_cursor(source)
+    row = _row()
+    row.pop("user_id")
+    source.write_text(json.dumps(row) + "\n")
+    scope = TraceRunScope("run", {"instance"}, set(), {"r1"},
+        datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 2, tzinfo=timezone.utc))
+    result = import_trace(source, cursor, scope, _map(tmp_path), tmp_path / "out")
+    assert result.imported == 1

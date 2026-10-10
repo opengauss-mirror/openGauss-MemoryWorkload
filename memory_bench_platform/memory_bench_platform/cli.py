@@ -5,7 +5,7 @@ from . import token_usage
 import argparse
 import json
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import traceback
@@ -1085,6 +1085,10 @@ def main(argv: list[str] | None = None) -> None:
                     "memory_integration": args.memory_integration,
                     "memory_plugin_id": run_contract["selection"].get("memory_plugin_id"),
                     "version_overrides": version_overrides or None,
+                    "profiling": ({"mode": profiling_config.mode,
+                                   "hardware": profiling_config.hardware.model_dump(),
+                                   "quality_gates": profiling_config.quality_gates.model_dump()}
+                                  if profiling_config is not None else None),
                 }.items()
                 if value
             }
@@ -1461,9 +1465,16 @@ def main(argv: list[str] | None = None) -> None:
             raise
 
     phase_sink = None
+    profile_trace_cursor = None
+    profile_trace_started = None
     if profiling_config is not None:
         from .profiling_run import prepare_phase_sink
         phase_sink = prepare_phase_sink(profiling_config, run_dir, run_record.run_id)
+        if profiling_config.internal_trace.source == "file":
+            from .profiling_trace_import import _stage_map, capture_trace_cursor
+            _stage_map(profiling_config.internal_trace.stage_map)
+            profile_trace_cursor = capture_trace_cursor(profiling_config.internal_trace.path)
+            profile_trace_started = datetime.now(timezone.utc)
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
     monitor.start_background_sampling()
@@ -1514,6 +1525,19 @@ def main(argv: list[str] | None = None) -> None:
             if token_usage.enabled():
                 token_usage.best_effort(token_usage.rebuild, run_dir)
             monitor.stop_background_sampling()
+            if profile_trace_cursor is not None:
+                try:
+                    from .profiling_trace_import import TraceRunScope, import_trace
+                    import_trace(profiling_config.internal_trace.path, profile_trace_cursor,
+                        TraceRunScope(run_record.run_id,
+                            {target.physical_instance_id for target in phase_sink.session.targets.values()},
+                            set(), set(), profile_trace_started, datetime.now(timezone.utc),
+                            profiling_config.internal_trace.max_raw_bytes),
+                        profiling_config.internal_trace.stage_map, run_dir)
+                except Exception as exc:
+                    if execution_error is None:
+                        execution_error = exc
+                        execution_traceback = traceback.format_exc()
             if trace_runtime is not None:
                 try:
                     trace_verification_payload, trace_metric_rows = _stop_and_archive_trace_runtime(

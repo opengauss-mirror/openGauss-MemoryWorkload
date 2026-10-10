@@ -52,8 +52,8 @@ def resolve_targets(config: ProfilingConfig, deployment_state: DeploymentState |
                     container_id=container_id, host_pid=pid,
                     cgroup_path=_cgroup_for_pid(pid) if isinstance(pid, int) and pid > 0 else None,
                     image_digest=inspect.get("Image") or deployment_state.image_ids.get(role),
-                    restart_count=deployment_state.restart_counts.get(container_id),
-                    start_time=deployment_state.start_times.get(container_id),
+                    restart_count=deployment_state.restart_counts.get(container_id, inspect.get("RestartCount")),
+                    start_time=deployment_state.start_times.get(container_id, inspect.get("State", {}).get("StartedAt")),
                     cpu_scope=inspect.get("HostConfig", {}).get("CpusetCpus") or None,
                     owner=deployment_state.name)
     selected = []
@@ -89,8 +89,15 @@ def _changed(target: TargetIdentity, docker) -> bool:
         return False
     current = docker.inspect(target.container_id)
     return (current.get("Id") != target.container_id or
-            current.get("RestartCount") != target.restart_count or
-            current.get("State", {}).get("StartedAt") != target.start_time)
+            (target.restart_count is not None and current.get("RestartCount") != target.restart_count) or
+            (target.start_time is not None and current.get("State", {}).get("StartedAt") != target.start_time))
+
+
+def target_drifted(target: TargetIdentity, docker=None) -> bool:
+    if _changed(target, docker):
+        return True
+    return (target.host_pid is not None and target.cgroup_path is not None and
+            _cgroup_for_pid(target.host_pid) != target.cgroup_path)
 
 
 def probe_target(target: TargetIdentity, config: ProfilingConfig, docker=None,
@@ -115,7 +122,7 @@ def probe_target(target: TargetIdentity, config: ProfilingConfig, docker=None,
         version = command([perf, "--version"], capture_output=True, text=True, timeout=5, check=False)
         if version.returncode != 0:
             return CapabilityResult("skipped", "perf_unavailable")
-        events = "cycles,instructions,task-clock" if config.hardware.stat == "basic" else "topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound"
+        events = "cycles,instructions,task-clock,cache-misses,branches,branch-misses" if config.hardware.stat == "basic" else "topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound"
         probe = command([perf, "stat", "-a", "-G", str(cgroup), "-e", events, "--", "sleep", "0.01"],
                         capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):

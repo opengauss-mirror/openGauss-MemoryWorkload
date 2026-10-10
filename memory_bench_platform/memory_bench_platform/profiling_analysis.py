@@ -29,7 +29,8 @@ def _gate(run_dir: Path, key: str, default: float) -> float:
         path = run_dir / filename
         if path.is_file():
             data = json.loads(path.read_text(encoding="utf-8"))
-            return float(data.get("profiling", {}).get("quality_gates", {}).get(key, default))
+            profile = data.get("profiling") or data.get("config", {}).get("profiling") or {}
+            return float(profile.get("quality_gates", {}).get(key, default))
     return default
 
 
@@ -52,12 +53,18 @@ def _hardware(archive) -> dict[str, dict]:
         key = f"{phase.target_id}:{phase.phase_id}"
         status = next((s for s in archive.collectors if s.target_id == phase.target_id and s.phase_id == phase.phase_id), None)
         if status is None:
-            result[key] = {"state": "skipped", "reason": "collector_unavailable"}
+            result[key] = ({"state": "skipped", "reason": "not_applicable"}
+                           if phase.state == "not_applicable" else
+                           {"state": "invalid", "reason": "missing_collector_status"})
             continue
         if status.state != "completed":
             result[key] = {"state": status.state, "reason": status.reason}
             continue
         selected = [r for r in counters if r.get("target_id") == phase.target_id and r.get("phase_id") == phase.phase_id]
+        raw_path = archive.run_dir / "profiling" / "raw" / phase.target_id / phase.phase_id / "perf-stat.txt"
+        if not raw_path.is_file():
+            result[key] = {"state": "invalid", "reason": "missing_raw_counter_evidence"}
+            continue
         if not selected:
             result[key] = {"state": "invalid", "reason": "missing_counters"}
             continue
@@ -103,21 +110,29 @@ def _hardware(archive) -> dict[str, dict]:
 def _phase_metrics(archive, clients) -> dict[str, dict]:
     operation_for_phase = {"ingest": "add", "drain": "drain", "recall": "search"}
     results = {}
+    physical_ids = {target.get("physical_instance_id") for target in archive.targets}
     for phase in archive.phases:
         key = f"{phase.target_id}:{phase.phase_id}"
         operation = operation_for_phase.get(phase.phase_id)
         physical = next(target.get("physical_instance_id") for target in archive.targets
                         if target["target_id"] == phase.target_id)
-        selected = [event for event in clients if event.instance_id == physical
+        selected = [event for event in clients if (event.instance_id == physical or
+                    (event.instance_id is None and len(physical_ids) == 1))
                     and event.operation == operation and event.started_utc is not None
                     and phase.start_utc <= event.started_utc < phase.end_utc]
         seconds = (phase.end_monotonic_ns - phase.start_monotonic_ns) / 1_000_000_000
         by_user = {}
         for event in selected:
             user = event.user_id or "unscoped"
-            item = by_user.setdefault(user, {"count": 0, "succeeded": 0})
+            item = by_user.setdefault(user, {"count": 0, "succeeded": 0, "durations": []})
             item["count"] += 1
             item["succeeded"] += event.status == "ok"
+            if event.duration_ms is not None:
+                item["durations"].append(float(event.duration_ms))
+        for item in by_user.values():
+            durations_for_user = item.pop("durations")
+            item["qps"] = item["count"] / seconds if seconds else 0.0
+            item["p95_ms"] = _percentile(durations_for_user, 0.95)
         durations = [float(event.duration_ms) for event in selected if event.duration_ms is not None]
         results[key] = {"state": phase.state, "window_ms": seconds * 1000,
                         "count": len(selected), "succeeded": sum(e.status == "ok" for e in selected),
@@ -129,14 +144,88 @@ def _phase_metrics(archive, clients) -> dict[str, dict]:
     return results
 
 
+def _overall(archive, clients) -> dict[str, dict]:
+    operations = {"ingest": "add", "drain": "drain", "recall": "search"}
+    result = {}
+    for name, operation in operations.items():
+        phases = [phase for phase in archive.phases if phase.phase_id == name and
+                  phase.state != "not_applicable"]
+        if not phases:
+            continue
+        intervals = sorted((phase.start_utc, phase.end_utc) for phase in phases)
+        merged = []
+        for start, end in intervals:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        seconds = sum((end - start).total_seconds() for start, end in merged)
+        selected = [event for event in clients if event.operation == operation and
+                    event.started_utc is not None and any(
+                        start <= event.started_utc < end for start, end in merged)]
+        unique = {(event.instance_id, event.user_id, event.request_id, event.operation): event
+                  for event in selected}
+        durations = [float(event.duration_ms) for event in unique.values()
+                     if event.duration_ms is not None]
+        count = len(unique)
+        result[name] = {"count": count, "succeeded": sum(e.status == "ok" for e in unique.values()),
+                        "window_ms": seconds * 1000, "qps": count / seconds if seconds else 0.0,
+                        "success_rate": sum(e.status == "ok" for e in unique.values()) / count if count else 0.0,
+                        "p50_ms": _percentile(durations, .50),
+                        "p95_ms": _percentile(durations, .95),
+                        "p99_ms": _percentile(durations, .99)}
+    return result
+
+
+def _candidate(trace, overall) -> list[dict]:
+    result = []
+    for operation, categories in trace.stage_durations_ms.items():
+        phase = {"add": "ingest", "drain": "drain", "search": "recall"}.get(operation)
+        client_p95 = overall.get(phase, {}).get("p95_ms", 0)
+        if not client_p95:
+            continue
+        for category, durations in categories.items():
+            stage_p95 = _percentile(durations, .95)
+            if stage_p95 >= .5 * client_p95:
+                result.append({"operation": operation, "stage": category,
+                    "stage_p95_ms": stage_p95, "client_p95_ms": client_p95,
+                    "confidence": "supported" if trace.validity == "valid" else "hypothesis"})
+    return result
+
+
+def _model_mode(run_dir: Path) -> str:
+    for path in (run_dir / "run_config.json", run_dir / "external_artifacts" / "replay" / "run_config.json",
+                 run_dir / "run.json"):
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mode = data.get("model_mode") or data.get("config", {}).get("model_mode")
+            if isinstance(mode, str):
+                return mode
+    return "unavailable"
+
+
 def analyze_profiling_archive(run_dir: Path) -> ProfilingAnalysis | None:
     archive = load_profile_archive(run_dir)
     if archive is None:
         return None
     clients = load_client_events(run_dir)
     trace = analyze_trace(archive, clients)
+    overall = _overall(archive, clients)
+    hardware = _hardware(archive)
+    measured = len([phase for phase in archive.phases if phase.state != "not_applicable"])
+    completed = sum(item.get("state") == "completed" for item in hardware.values())
+    degraded = sorted({item.get("reason") or item["state"] for item in hardware.values()
+                       if item.get("state") != "completed"})
     summary = {"schema": "profiling-analysis/1", "run_id": archive.phases[0].run_id if archive.phases else None,
-               "phases": _phase_metrics(archive, clients), "hardware": _hardware(archive),
+               "model_mode": _model_mode(run_dir),
+               "phases": _phase_metrics(archive, clients), "overall": overall, "hardware": hardware,
+               "collector_coverage": {"measured": measured, "completed": completed,
+                                      "rate": completed / measured if measured else 0.0,
+                                      "degraded_reasons": degraded},
+               "bottleneck_candidates": _candidate(trace, overall),
+               "limitations": (["hardware_is_per_physical_target_not_per_user"] +
+                               (["internal_trace_unavailable_or_invalid"] if trace.validity != "valid" else []) +
+                               (["hardware_incomplete"] if degraded else [])),
                "trace": {"validity": trace.validity, "reason": trace.reason,
                          "join_coverage": trace.join_coverage, "invalid_rows": trace.invalid_rows,
                          "time_bucket_eligible": trace.time_bucket_eligible,
