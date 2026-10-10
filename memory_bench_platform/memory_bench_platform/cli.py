@@ -105,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_undeploy = sub.add_parser("undeploy")
     p_undeploy.add_argument("--deployment", required=True)
 
+    p_experiment = sub.add_parser("experiment")
+    p_experiment.add_argument("--config", type=Path, required=True)
+    p_experiment.add_argument("--profiling-config", type=Path, required=True)
+    p_experiment.add_argument("--pressure-test")
+    p_experiment.add_argument("--cleanup-owned-deployment", action="store_true")
+
     p_plan = sub.add_parser("plan-run")
     p_plan.add_argument("--benchmark", required=True)
     p_plan.add_argument("--agent", required=True)
@@ -833,6 +839,19 @@ def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "experiment":
+        from .deployment_docker import DockerClient
+        from .profiling_experiment import run_experiment
+        try:
+            result = run_experiment(args.config, args.profiling_config, Path.cwd(), DockerClient(),
+                pressure_test=args.pressure_test,
+                cleanup_owned_deployment=args.cleanup_owned_deployment)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(str(result.archive_dir))
+        if result.status != "completed":
+            raise SystemExit(1)
+        return
     if args.command in {"deploy", "undeploy"} or (args.command == "run" and args.deployment):
         from .deployment_docker import DockerClient
         from .deployment_lifecycle import deploy, status, undeploy
