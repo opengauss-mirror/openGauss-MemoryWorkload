@@ -47,10 +47,13 @@ def _copy_service(service: Service, root: Path, destination: Path, overrides: di
 
 def prepare_instance_configs(group: DeploymentGroup, root: Path) -> dict[str, list[dict[str, object]]]:
     result = {}
-    for combination_id, template in group.agents.items():
-        service_name = "agent_" + combination_id.replace("-", "_")
-        result[service_name] = _copy_service(template, group.source_root, root / service_name,
-                                              group.agent_config_overrides.get(combination_id, {}))
+    for combo in group.combinations:
+        template = group.agents[combo.id]
+        base = "agent_" + combo.id.replace("-", "_")
+        names = [f"{base}_{index}" for index in range(1, combo.agent_replicas + 1)] if combo.gateway_pool else [base]
+        for service_name in names:
+            result[service_name] = _copy_service(template, group.source_root, root / service_name,
+                                                  group.agent_config_overrides.get(combo.id, {}))
     result["memory"] = _copy_service(group.memory_template, group.source_root, root / "memory",
                                       group.memory_config_overrides)
     return result

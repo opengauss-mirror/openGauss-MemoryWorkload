@@ -18,7 +18,8 @@ def required_resources(groups: tuple[DeploymentGroup, ...]) -> ResourceRequest:
     cpu = 0.0
     memory = 0
     for group in groups:
-        services = [*group.agents.values(), group.memory_template, group.vector_template, group.graph_template,
+        services = [*(group.agents[combo.id] for combo in group.combinations for _ in range(combo.agent_replicas)),
+                    *group.gateway_pools.values(), group.memory_template, group.vector_template, group.graph_template,
                     group.memory_mock_template, *group.agent_mocks.values()]
         for service in services:
             if service and service.resources:
@@ -127,7 +128,7 @@ def render_project(group: DeploymentGroup, deployment_name: str,
     services["memory"] = _service(group.memory_template, group.source_root, generated_mounts.get("memory", []),
                                    memory_networks, endpoint_vars(group.memory_template), memory_deps, "memory", state_root)
     for combo in group.combinations:
-        name = "agent_" + combo.id.replace("-", "_")
+        base = "agent_" + combo.id.replace("-", "_")
         template = group.agents[combo.id]
         deps = ["memory"] if combo.memory_integration == "agent_plugin" else []
         storage_refs = {ref for ref in template.service_endpoints.values() if ref in ("vector", "graph")}
@@ -137,8 +138,21 @@ def render_project(group: DeploymentGroup, deployment_name: str,
         agent_network_membership = [agent_networks[combo.id]]
         if template.allow_agent_storage_access and storage_refs:
             agent_network_membership.append("storage_net")
-        services[name] = _service(template, group.source_root, generated_mounts.get(name, []),
-                                  agent_network_membership, endpoint_vars(template, combo.id), deps, name, state_root)
+        names = [f"{base}_{index}" for index in range(1, combo.agent_replicas + 1)] if combo.gateway_pool else [base]
+        for name in names:
+            services[name] = _service(template, group.source_root, generated_mounts.get(name, []),
+                                      agent_network_membership, endpoint_vars(template, combo.id), deps, name, state_root)
+            if combo.gateway_pool:
+                services[name].pop("ports", None)
+        if combo.gateway_pool:
+            pool = group.gateway_pools[combo.id]
+            pool_name = "gateway_pool_" + combo.id.replace("-", "_")
+            pool_service = _service(pool, group.source_root, [], [agent_networks[combo.id]], {}, names,
+                                    pool_name, state_root)
+            pool_service["command"] = [*pool.command, "--host", "0.0.0.0", "--port", str(pool.container_port),
+                                       *(part for name in names for part in ("--upstream", _url(template, name))),
+                                       "--expected", str(combo.agent_replicas)]
+            services[pool_name] = pool_service
     for name, service in services.items():
         for mount in service.get("volumes", []):
             if mount["type"] == "volume":
