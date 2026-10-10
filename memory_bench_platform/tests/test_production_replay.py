@@ -250,6 +250,22 @@ def test_old_run_traces_do_not_validate_new_run(dataset_dir: Path, tmp_path: Pat
     assert module.execute_replay(config, invoke).attribution_status == "validated"
 
 
+def test_external_replay_brackets_real_add_and_search_phases(dataset_dir: Path, tmp_path: Path):
+    module = _module()
+    config = _config(module, dataset_dir, tmp_path)
+    phases = []
+    class Sink:
+        session = type("Session", (), {"config": type("Config", (), {"phases": ["ingest", "drain", "recall"]})()})()
+        def run_phase(self, phase, targets, operation, **kwargs):
+            phases.append((phase, targets, kwargs.get("applicable", True)))
+            return operation()
+    def invoke(memory_id, request, **kwargs):
+        return _output(module, operation={"session_id": "s"}, output={"count": 0})
+    module.execute_replay(config, invoke, phase_sink=Sink(), target_ids=["memory-i"])
+    assert phases == [("ingest", ["memory-i"], True), ("drain", ["memory-i"], False),
+                      ("recall", ["memory-i"], True)]
+
+
 def test_execute_replay_drains_add_before_search_and_preserves_protocol(
     dataset_dir: Path, tmp_path: Path
 ):
@@ -715,3 +731,48 @@ def test_replay_config_rejects_invalid_controls(
     module = _module()
     with pytest.raises(ValueError):
         _config(module, dataset_dir, tmp_path, **overrides)
+
+
+def test_required_collector_failure_precedes_first_add(dataset_dir, tmp_path):
+    module = _module()
+    calls = []
+
+    class FailingSink:
+        session = type("Session", (), {"config": type("Config", (), {"phases": ["ingest", "recall"]})()})()
+        def run_phase(self, phase, targets, operation, **kwargs):
+            calls.append(phase)
+            raise RuntimeError("perf unavailable")
+
+    with pytest.raises(RuntimeError, match="perf unavailable"):
+        module.execute_replay(_config(module, dataset_dir, tmp_path),
+                              lambda *_args, **_kwargs: calls.append("request"),
+                              phase_sink=FailingSink(), target_ids=["memory"])
+    assert calls == ["ingest"]
+
+
+def test_main_creates_profile_archive_for_external_replay(dataset_dir, tmp_path, monkeypatch):
+    from memory_bench_platform import integration
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "schema: profiling/1\nmode: best_effort\n"
+        "targets: [memory]\n"
+        "external_targets:\n  memory:\n    host_pid: 1\n"
+        "    cgroup_path: /sys/fs/cgroup/example\n"
+        "hardware:\n  stat: 'off'\n", encoding="utf-8")
+    monkeypatch.setattr(integration, "run_memory_task", lambda *_args, **_kwargs:
+                        _output(_module(), operation={"session_id": "s"}, output={"count": 0}))
+    for key, value in {
+        "DATA_PATH": str(dataset_dir), "OUTPUT_DIR": str(tmp_path / "out"),
+        "RUN_DIR": str(tmp_path / "run"), "RUN_ID": "profiled-run",
+        "MEMORY_BACKEND": "fake-memory", "AGENT_ID": "generic-cli",
+        "MEMORY_INTEGRATION": "backend_direct",
+        "MEMORY_BENCH_PROFILING_CONFIG": str(profile),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("MEMORY_BENCH_PROFILE_TARGETS", raising=False)
+    _module().main()
+    phases = [json.loads(line) for line in (tmp_path / "run" / "phase_events.jsonl").read_text().splitlines()]
+    assert [(row["phase_id"], row["state"]) for row in phases] == [
+        ("ingest", "completed"), ("drain", "not_applicable"), ("recall", "completed")]
+    status = json.loads((tmp_path / "run" / "profiling" / "collector_status.json").read_text())
+    assert all(row["reason"] == "hardware_off" for row in status["items"])

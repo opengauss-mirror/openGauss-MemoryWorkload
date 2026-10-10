@@ -623,6 +623,9 @@ def _write_summary(config: ReplayConfig, summary: ReplaySummary) -> None:
 def execute_replay(
     config: ReplayConfig,
     invoke_memory: Callable[..., MemoryTaskOutput],
+    *,
+    phase_sink=None,
+    target_ids: list[str] | None = None,
 ) -> ReplaySummary:
     dataset = discover_dataset(config.data_path)
     # Validate both complete files before submitting any writes. Keep inputs
@@ -631,21 +634,32 @@ def execute_replay(
         for _ in iter_replay_records(path, operation, config.run_id):
             pass
     _write_run_config(config)
-    add_events, add_elapsed_ms = _run_phase(
+    targets = target_ids or []
+    def measured(phase, operation, *, applicable=True):
+        if phase_sink is None or phase not in phase_sink.session.config.phases:
+            return operation()
+        count = [0]
+        def wrapped():
+            result = operation()
+            count[0] = len(result[0]) if isinstance(result, tuple) else 0
+            return result
+        return phase_sink.run_phase(phase, targets, wrapped, applicable=applicable,
+                                    request_count=lambda: count[0])
+    add_events, add_elapsed_ms = measured("ingest", lambda: _run_phase(
         iter_replay_records(dataset.add_path, "add", config.run_id),
         config.add_concurrency,
         config.add_rate_per_second,
-        lambda record: _run_add(config, record, invoke_memory),
-    )
+        lambda record: _run_add(config, record, invoke_memory)))
     dataset_state = (
         "complete" if all(event.status == "ok" for event in add_events) else "partially_written"
     )
-    search_events, search_elapsed_ms = _run_phase(
+    if phase_sink is not None and "drain" in phase_sink.session.config.phases:
+        phase_sink.run_phase("drain", targets, lambda: None, applicable=False)
+    search_events, search_elapsed_ms = measured("recall", lambda: _run_phase(
         iter_replay_records(dataset.search_path, "search", config.run_id),
         config.search_concurrency,
         config.search_rate_per_second,
-        lambda record: _run_search(config, record, invoke_memory),
-    )
+        lambda record: _run_search(config, record, invoke_memory)))
     events = tuple(add_events + search_events)
     _write_request_events(config, events)
     internal_request_ids: tuple[str, ...] = ()
@@ -715,7 +729,15 @@ def main() -> None:
                 else None
             ),
         )
-        execute_replay(config, run_memory_task)
+        profile_path = os.environ.get("MEMORY_BENCH_PROFILING_CONFIG")
+        sink = None
+        if profile_path:
+            from memory_bench_platform.profiling_config import load_profiling_config
+            from memory_bench_platform.profiling_run import prepare_phase_sink
+            profile = load_profiling_config(Path(profile_path))
+            sink = prepare_phase_sink(profile, config.run_dir or output_dir, config.run_id)
+        execute_replay(config, run_memory_task, phase_sink=sink,
+                       target_ids=list(sink.session.targets) if sink else None)
     except (KeyError, OSError, ValueError) as exc:
         print(f"production replay configuration failed: {exc}", file=sys.stderr)
         raise SystemExit(2) from None

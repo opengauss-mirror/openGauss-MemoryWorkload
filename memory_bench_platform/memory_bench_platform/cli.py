@@ -861,7 +861,10 @@ def main(argv: list[str] | None = None) -> None:
                              if getattr(args, name, None)]
                 if conflicts or getattr(args, "memory_integration_explicit", False):
                     parser.error("--deployment cannot be combined with manual run selection options")
-                rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker)
+                profile_options = ({"profiling_config": args.profiling_config}
+                                   if args.profiling_config is not None else {})
+                rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker,
+                                    **profile_options)
                 if rc:
                     raise SystemExit(rc)
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
@@ -1025,6 +1028,10 @@ def main(argv: list[str] | None = None) -> None:
         args.memory_integration,
     )
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
+    profiling_config = None
+    if args.profiling_config is not None:
+        from .profiling_config import load_profiling_config
+        profiling_config = load_profiling_config(args.profiling_config)
     if entrypoint.entrypoint_kind == "external_runner" and any(
         getattr(args, name, None) not in (None, 1) for name in ("qa_concurrency", "judge_concurrency")
     ):
@@ -1184,6 +1191,15 @@ def main(argv: list[str] | None = None) -> None:
             )
             env.update(build_external_runner_env(run_record.version_selection))
             env.update(trace_environment)
+            env.pop("MEMORY_BENCH_PROFILING_CONFIG", None)
+            if profiling_config is not None:
+                if args.benchmark == "production-http-replay" and entrypoint.entrypoint_id == "replay":
+                    env["MEMORY_BENCH_PROFILING_CONFIG"] = str(args.profiling_config.resolve())
+                else:
+                    from .profiling_run import mark_phase_unavailable, prepare_phase_sink
+                    if profiling_config.mode == "required":
+                        raise ValueError("phase_boundary_unavailable")
+                    mark_phase_unavailable(prepare_phase_sink(profiling_config, run_dir, run_record.run_id))
             monitor.start_background_sampling()
             try:
                 runner_result = execute_external_runner(
@@ -1425,6 +1441,10 @@ def main(argv: list[str] | None = None) -> None:
             )
             raise
 
+    phase_sink = None
+    if profiling_config is not None:
+        from .profiling_run import prepare_phase_sink
+        phase_sink = prepare_phase_sink(profiling_config, run_dir, run_record.run_id)
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
     monitor.start_background_sampling()
@@ -1453,6 +1473,8 @@ def main(argv: list[str] | None = None) -> None:
                 steps=steps,
                 execution_spec=execution_spec,
                 run_dir=run_dir,
+                phase_sink=phase_sink,
+                target_ids=list(phase_sink.session.targets) if phase_sink else None,
             )
     except Exception as exc:
         execution_error = exc
