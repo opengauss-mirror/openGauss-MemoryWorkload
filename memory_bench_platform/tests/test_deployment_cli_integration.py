@@ -8,6 +8,7 @@ from memory_bench_platform import cli
 from memory_bench_platform import deployment_docker, deployment_run
 from test_deployment_config import fixture_config
 from test_deployment_lifecycle import RecordingDocker
+from test_deployment_compose import pooled_fixture
 
 
 def test_deploy_status_run_undeploy_commands(tmp_path, monkeypatch, capsys):
@@ -39,3 +40,32 @@ def test_deploy_status_run_undeploy_commands(tmp_path, monkeypatch, capsys):
     cli.main(["undeploy", "--deployment", "suite"])
     assert docker.removed_projects == set(state["projects"].values())
     assert not (tmp_path / ".memory-bench/deployments/suite").exists()
+
+
+def test_pooled_deploy_run_and_undeploy_commands(tmp_path, monkeypatch, capsys):
+    path, _ = pooled_fixture(tmp_path)
+    upstreams = [f"http://agent_claw_common_{n}:8080" for n in range(1, 4)]
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle._pool_status",
+                        lambda url: {"upstreams": upstreams, "assignments": {"private-user": upstreams[0]},
+                                     "request_counts": {upstreams[0]: 2}})
+    docker = RecordingDocker()
+    monkeypatch.setattr(deployment_docker, "DockerClient", lambda: docker)
+    monkeypatch.chdir(tmp_path)
+    seen = []
+    original_run = deployment_run.run_deployment
+
+    def fake_run(name, cwd, combination, docker):
+        return original_run(name, cwd, combination, docker,
+                            lambda argv, *, env, cwd: seen.append(env.copy()) or 0)
+
+    monkeypatch.setattr(deployment_run, "run_deployment", fake_run)
+    cli.main(["deploy", "--config", str(path), "--agent-config", 'claw-common:log_level="debug"'])
+    cli.main(["deploy", "status", "--deployment", "suite"])
+    assert '"ready": true' in capsys.readouterr().out
+    cli.main(["run", "--deployment", "suite", "--combination", "claw-common"])
+    assert seen[0]["OPENCLAW_GATEWAY_URL"] == "http://127.0.0.1:49789"
+    summary = next((tmp_path / "runs").glob("*/suite_summary.json")).read_text()
+    assert "private-user" not in summary
+    assert '"request_counts"' in summary
+    cli.main(["undeploy", "--deployment", "suite"])
+    assert docker.removed_projects

@@ -60,6 +60,32 @@ combinations:
     data_path: ./data/locomo_small.json
 ```
 
+### OpenClaw Gateway Pool
+
+一个组合需要多个 OpenClaw Gateway 时，可在同一部署中启用 Gateway Pool。以下字段是在上方 YAML 示例中的增量配置；Pool 镜像必须包含与参考项目 `gateway_pool.py` 的 `--host`、`--port`、`--upstream`、`--expected` 参数兼容的程序，健康检查需验证 `/pool/status`。上方 `agents.claw.client.endpoint_env` 应设为 `OPENCLAW_GATEWAY_URL`。
+
+```yaml
+gateway_pools:
+  claw-pool:
+    kind: openclaw_http_pool_v1
+    image: {name: example/runner-with-gateway-pool:tag, archive: ./images/runner.tar}
+    command: [python, /workspace/scripts/gateway_pool.py]
+    container_port: 29789
+    healthcheck: [CMD, python, /workspace/scripts/check_pool.py]
+    resources: {cpus: 1, memory_mb: 256}
+combinations:
+  - id: claw-mem0
+    benchmark: locomo
+    agent: claw
+    agent_replicas: 3
+    gateway_pool: claw-pool
+    memory: mem0
+    memory_integration: agent_plugin
+    data_path: ./data/locomo_small.json
+```
+
+`deploy` 给三个 Gateway 分别生成配置副本和 state 卷，并在其健康后启动 Pool；`run --deployment ... --combination claw-mem0` 访问 Pool 的宿主回环端口。`--agent-config 'claw-mem0:log_level="debug"'` 对三个副本应用相同的允许字段覆盖。每个组合拥有独立 Pool；即使多个组合共用记忆实例，也不会共用 Pool 的用户分配表。部署和运行会核对 Pool 上游、容器重启及配置漂移；报告只保留脱敏的用户分配和各上游请求量。未配置 `gateway_pool` 的组合仍使用一个 Agent 容器。启用 Pool 的组合不能使用指向 Agent 容器的 `preparation.seed` 或 `preparation.warmup` 命令，因为容器内命令不会经过 Pool。当前 `pressure_tests` 仍由部署命令拒绝，多用户压测需要单独实现。
+
 `image.archive` 可省略；指定时先执行 `docker load`，再检查镜像名。当前不校验 archive SHA256 或架构。相对路径以部署 YAML 所在目录为基准。`config_files` 只支持 JSON/YAML、已有字段的 RFC 6901 路径，以及 `string`、`integer`、`number`、`boolean` 四种标量类型。每个物理实例的配置副本只读挂载到容器，原文件不变。生成目录默认位于当前工作目录的 `.memory-bench/deployments/<name>/`，清理部署时删除。
 
 可选的 `vectors`、`graphs`、`mocks` 与组合中的 `vector`、`graph`、`mock` 引用按需要创建。数据库模板使用与服务相同的 `image`、`container_port`、`healthcheck`、`state_mounts` 和 `resources` 字段。Mock 模板使用 `endpoints` 声明命名端口，例如 `chat`、`embedding`；被组合或共享记忆实例选中的 Mock 会启动，顶层未被选中的 Mock 模板不会启动。服务通过 `service_endpoints` 的 `mock.chat` 等名字接入其端点。记忆系统引用向量库或图数据库时，必须声明对应 `service_endpoints`。Agent 插件模式须声明 `memory` 引用。宿主端口只绑定 127.0.0.1，部署后查询实际端口。
