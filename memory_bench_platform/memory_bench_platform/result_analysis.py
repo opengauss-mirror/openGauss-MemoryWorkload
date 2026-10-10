@@ -19,6 +19,7 @@ from .adapters.locomo.timing import build_locomo_test_timing_report, render_loco
 from .reporter import write_analysis_json, write_analysis_markdown
 from .reporter import write_case_results, write_external_result_summary, write_summary
 from .reporter import write_run_report_html, write_timing_report_html, write_timing_report_json
+from .profiling_analysis import analyze_profiling_archive
 
 RETRIEVAL_MISS_PATTERNS = (
     "no information",
@@ -110,9 +111,18 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             "duration_label_count": len(timing_report.get("duration_distributions", {})),
             "report": timing_report,
         }
+    profile = analyze_profiling_archive(run_dir)
+    if profile is not None:
+        analysis["profiling"] = {"status": profile.summary["trace"]["validity"],
+                                 "report": profile.report_paths["html"]}
     write_analysis_json(run_dir, analysis)
-    write_analysis_markdown(run_dir, _render_analysis_markdown(analysis))
-    write_run_report_html(run_dir, _render_analysis_html(analysis))
+    markdown = _render_analysis_markdown(analysis)
+    page = _render_analysis_html(analysis)
+    if profile is not None:
+        markdown += "\n[Profiling analysis](profiling_analysis.html)\n"
+        page = page.replace("</body>", "<p><a href='profiling_analysis.html'>Profiling analysis</a></p></body>")
+    write_analysis_markdown(run_dir, markdown)
+    write_run_report_html(run_dir, page)
     return analysis
 
 

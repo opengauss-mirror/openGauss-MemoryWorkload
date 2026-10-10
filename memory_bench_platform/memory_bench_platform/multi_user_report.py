@@ -132,7 +132,7 @@ def summarize(events, operation, window_ms=None):
         result_count=sum(counts) if counts else None).model_dump()
 
 
-def write_reports(output_dir: Path, report: dict):
+def write_reports(output_dir: Path, report: dict, profiling_report: str | None = None):
     clean = Report.model_validate(report).model_dump(mode="json", by_alias=True)
     (output_dir / "summary.json").write_text(json.dumps(clean, indent=2), encoding="utf-8")
     for group, filename in (("users", "user_summary"), ("instances", "instance_summary")):
@@ -154,10 +154,12 @@ def write_reports(output_dir: Path, report: dict):
             values = [key, user["instance_id"], user["status"], operation,
                       metrics["count"], metrics["success_rate"], metrics["qps"], metrics["p95_ms"]]
             rows.append("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in values) + "</tr>")
+    profile_note = ("<p>Profiling evidence: <a href='reports/profiling_analysis.html'>report</a>. "
+                    "Quality and token metrics may be unavailable.</p>" if profiling_report else
+                    "<p>Internal stages, quality, token metrics and hardware: unavailable.</p>")
     body = ("<!doctype html><meta charset='utf-8'><title>Multi-user replay</title>"
             f"<h1>{html.escape(clean['run_id'])}</h1><p>{clean['status']} · {clean['latency_kind']}</p>"
-            "<p>Internal stages, quality, token metrics and hardware: unavailable.</p>"
-            "<h2>Overall</h2><table><tr><th>Operation</th><th>Requests</th><th>Success rate</th>"
+            + profile_note + "<h2>Overall</h2><table><tr><th>Operation</th><th>Requests</th><th>Success rate</th>"
             "<th>QPS</th><th>P95 ms</th></tr>" + "".join(overall_rows) + "</table>"
             "<h2>Users</h2>"
             "<table><tr><th>User</th><th>Instance</th><th>Status</th><th>Operation</th>"
@@ -200,4 +202,7 @@ def import_report(output_dir: Path):
                 raise ValueError("instance metrics disagree with events")
     except Exception:
         raise ValueError("invalid multi-user report") from None
-    return write_reports(output_dir, report.model_dump(mode="json", by_alias=True))
+    from .profiling_analysis import analyze_profiling_archive
+    profile = analyze_profiling_archive(output_dir)
+    return write_reports(output_dir, report.model_dump(mode="json", by_alias=True),
+                         profile.report_paths["html"] if profile is not None else None)

@@ -699,6 +699,56 @@ def test_cli_workload_config_runs_and_analyzes(tmp_path, monkeypatch, memory_ada
               "--workload-config", str(path), "--data-path", str(tmp_path)])
 
 
+def test_multi_user_analyze_profiles_without_run_json(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_report import import_report
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    assert not (out / "run.json").exists()
+    (out / "profiling").mkdir()
+    (out / "target_registry.json").write_text(json.dumps({"schema": "target-registry/1",
+        "targets": [{"target_id": "memory-i", "physical_instance_id": "i"}]}))
+    (out / "phase_events.jsonl").write_text(json.dumps({
+        "schema": "phase-event/1", "run_id": "r", "target_id": "memory-i", "phase_id": "ingest",
+        "start_utc": "2026-01-01T00:00:00+00:00", "end_utc": "2026-01-01T00:00:01+00:00",
+        "start_monotonic_ns": 1, "end_monotonic_ns": 1000000001,
+        "state": "completed", "request_count": 0, "warmup": False}) + "\n")
+    (out / "profiling" / "collector_status.json").write_text(json.dumps({
+        "schema": "collector-status/1", "items": [{"target_id": "memory-i", "phase_id": "ingest",
+        "state": "skipped", "reason": "unsupported_platform"}]}))
+    import_report(out)
+    assert (out / "reports" / "profiling_analysis.json").exists()
+    assert "profiling_analysis.html" in (out / "report.html").read_text()
+    assert "profiling" not in json.loads((out / "summary.json").read_text())
+
+
+def test_invalid_multi_user_binding_blocks_profile_report(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_report import import_report
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    first, *rest = (out / "request_events.jsonl").read_text().splitlines()
+    changed = json.loads(first)
+    changed["instance_id"] = "wrong"
+    (out / "request_events.jsonl").write_text("\n".join([json.dumps(changed), *rest]) + "\n")
+    (out / "profiling").mkdir()
+    with pytest.raises(ValueError, match="invalid multi-user report"):
+        import_report(out)
+    assert not (out / "reports" / "profiling_analysis.json").exists()
+
+
 def test_import_rejects_unknown_nested_fields(tmp_path, monkeypatch, memory_adapter):
     from memory_bench_platform import integration
     from memory_bench_platform.multi_user_config import load_config

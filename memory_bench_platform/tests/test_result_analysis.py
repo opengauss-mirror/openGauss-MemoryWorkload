@@ -88,6 +88,46 @@ def _write_master_log(run_dir: Path, text: str) -> None:
     (remote_logs / f"{run_dir.name}.master.log").write_text(text, encoding="utf-8")
 
 
+def _add_skipped_profile(run_dir: Path) -> None:
+    (run_dir / "profiling").mkdir()
+    (run_dir / "target_registry.json").write_text(json.dumps({"schema": "target-registry/1",
+        "targets": [{"target_id": "memory-i", "physical_instance_id": "i"}]}))
+    (run_dir / "phase_events.jsonl").write_text(json.dumps({
+        "schema": "phase-event/1", "run_id": run_dir.name, "target_id": "memory-i", "phase_id": "ingest",
+        "start_utc": "2026-01-01T00:00:00+00:00", "end_utc": "2026-01-01T00:00:01+00:00",
+        "start_monotonic_ns": 1, "end_monotonic_ns": 1000000001,
+        "state": "completed", "request_count": 0, "warmup": False}) + "\n")
+    (run_dir / "profiling" / "collector_status.json").write_text(json.dumps({
+        "schema": "collector-status/1", "items": [{"target_id": "memory-i", "phase_id": "ingest",
+                                                   "state": "skipped", "reason": "unsupported_platform"}]}))
+
+
+def test_ordinary_analyze_embeds_profile_link(tmp_path):
+    run_dir = tmp_path / "run-profile"
+    _build_minimal_run(run_dir)
+    _add_skipped_profile(run_dir)
+    result = analyze_run(run_dir)
+    assert result["profiling"]["report"] == "reports/profiling_analysis.html"
+    assert "profiling_analysis.html" in (run_dir / "reports" / "run_report.html").read_text()
+
+
+def test_legacy_analyze_outputs_unchanged(tmp_path):
+    run_dir = tmp_path / "legacy"
+    _build_minimal_run(run_dir)
+    result = analyze_run(run_dir)
+    assert "profiling" not in result
+    assert not (run_dir / "reports" / "profiling_analysis.json").exists()
+
+
+def test_marked_incomplete_profile_is_not_silently_ignored(tmp_path):
+    import pytest
+    run_dir = tmp_path / "incomplete"
+    _build_minimal_run(run_dir)
+    (run_dir / "profiling").mkdir()
+    with pytest.raises(ValueError, match="phase_events"):
+        analyze_run(run_dir)
+
+
 def test_analyze_run_writes_analysis_json_and_md(tmp_path: Path):
     run_dir = tmp_path / "run-1"
     _build_minimal_run(run_dir)
