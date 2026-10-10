@@ -32,12 +32,19 @@ class QualityGates(_Strict):
     min_counter_running_fraction: float = Field(default=0.90, ge=0, le=1, allow_inf_nan=False)
 
 
+class ExternalTarget(_Strict):
+    host_pid: int = Field(gt=0)
+    cgroup_path: str = Field(pattern=r"^/sys/fs/cgroup/")
+    cpu_scope: str | None = None
+
+
 class ProfilingConfig(_Strict):
     schema_version: Literal["profiling/1"] = Field(alias="schema")
     mode: Literal["best_effort", "required"] = "best_effort"
     phases: list[Literal["setup", "warmup", "ingest", "drain", "recall", "cooldown"]] = Field(
         default_factory=lambda: ["ingest", "drain", "recall"])
     targets: list[str]
+    external_targets: dict[str, ExternalTarget] = Field(default_factory=dict)
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     internal_trace: TraceConfig = Field(default_factory=TraceConfig)
     quality_gates: QualityGates = Field(default_factory=QualityGates)
@@ -46,6 +53,8 @@ class ProfilingConfig(_Strict):
     def valid_selection(self):
         if not self.phases or not self.targets or len(set(self.phases)) != len(self.phases) or len(set(self.targets)) != len(self.targets):
             raise ValueError("empty or duplicate profiling selection")
+        if not set(self.external_targets) <= set(self.targets):
+            raise ValueError("external target identity is not selected")
         if self.hardware.record == "selected_phases" and not set(self.hardware.record_phases) <= set(self.phases):
             raise ValueError("record phase not selected")
         return self

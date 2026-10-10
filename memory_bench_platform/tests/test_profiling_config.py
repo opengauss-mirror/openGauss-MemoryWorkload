@@ -24,3 +24,11 @@ def test_invalid_profiling_config_is_rejected(tmp_path, patch):
     path.write_text(yaml.safe_dump({"schema": "profiling/1", "targets": ["memory"], **patch}))
     with pytest.raises(ValueError):
         load_profiling_config(path)
+
+
+def test_external_target_identity_is_kept_out_of_workload_config(tmp_path):
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump({"schema": "profiling/1", "targets": ["i"],
+        "external_targets": {"i": {"host_pid": 42, "cgroup_path": "/sys/fs/cgroup/test", "cpu_scope": "0-3"}}}))
+    config = load_profiling_config(path)
+    assert config.external_targets["i"].host_pid == 42

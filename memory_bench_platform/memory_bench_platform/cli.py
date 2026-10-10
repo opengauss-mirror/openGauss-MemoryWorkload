@@ -158,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=ExplicitIntegration,
     )
     p_run.add_argument("--hardware-profile")
+    p_run.add_argument("--profiling-config", type=Path)
     run_data = p_run.add_mutually_exclusive_group()
     run_data.add_argument("--data-path")
     run_data.add_argument("--workload-config")

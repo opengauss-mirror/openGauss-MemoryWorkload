@@ -18,6 +18,11 @@ from .multi_user_config import MultiUserConfig, identity, preflight, replay_modu
 from .multi_user_report import RequestEvent, summarize, write_reports
 from .multi_user_runtime import InstanceRuntime
 from .protocol import RenderedTaskInput
+from .profiling_config import ProfilingConfig
+from .profiling_perf import ProfilerSession
+from .profiling_phase import PhaseSink
+from .profiling_targets import TargetIdentity, resolve_targets
+from .profiling_trace_import import TraceRunScope, capture_trace_cursor, import_trace
 
 
 def _snapshot(config, run_id):
@@ -329,7 +334,8 @@ class Replay:
             "limitations": ["internal_stages_unavailable", "quality_unavailable", "hardware_collectors_skipped", "tokens_unavailable"]}
 
 
-def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
+def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str, *,
+                   profiling_config: ProfilingConfig | None = None):
     from pydantic import TypeAdapter
     from .multi_user_config import Alias
     TypeAdapter(Alias).validate_python(run_id)
@@ -338,8 +344,30 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
         config = _snapshot_workloads(config, Path(temporary))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=False)
-        (output_dir / "run_config.json").write_text(json.dumps(_snapshot(config, run_id), indent=2), encoding="utf-8")
+        snapshot = _snapshot(config, run_id)
+        if profiling_config is not None:
+            snapshot["profiling"] = {"mode": profiling_config.mode,
+                "hardware": profiling_config.hardware.model_dump(),
+                "quality_gates": profiling_config.quality_gates.model_dump()}
+        (output_dir / "run_config.json").write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
         replay = Replay(config, output_dir, run_id, environments)
+        sink = None
+        cursor = None
+        if profiling_config is not None:
+            explicit = []
+            for name, instance in config.instances.items():
+                if name not in replay.runtimes:
+                    continue
+                identity_spec = profiling_config.external_targets.get(name)
+                explicit.append(TargetIdentity(name, "memory" if instance.kind == "memory" else "agent",
+                    name, instance.deployment,
+                    cgroup_path=identity_spec.cgroup_path if identity_spec else None,
+                    host_pid=identity_spec.host_pid if identity_spec else None,
+                    cpu_scope=identity_spec.cpu_scope if identity_spec else None))
+            targets = resolve_targets(profiling_config, None, explicit)
+            sink = PhaseSink(output_dir, run_id, ProfilerSession(profiling_config, targets, output_dir))
+            if profiling_config.internal_trace.source == "file":
+                cursor = capture_trace_cursor(profiling_config.internal_trace.path)
         try:
             with (output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
                 for name, runtime in replay.runtimes.items():
@@ -351,13 +379,24 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
                         runtime.state = "setup_failed"
                     finally:
                         replay.setup_ms[name] = (time.monotonic()-started)*1000
-                replay.phase("add", stream)
-                if config.mode == "openclaw": replay.phase("drain", stream)
+                def measured(operation, phase, applicable=True):
+                    if sink is None:
+                        if applicable: replay.phase(operation, stream)
+                        return
+                    before = len(replay.events)
+                    ids = [target.target_id for target in sink.session.targets.values()
+                           if replay.runtimes[target.physical_instance_id].state == "ready"]
+                    sink.run_phase(phase, ids,
+                        lambda: replay.phase(operation, stream) if applicable else None,
+                        applicable=applicable,
+                        request_count=lambda: len(replay.events) - before)
+                measured("add", "ingest")
+                measured("drain", "drain", config.mode == "openclaw")
                 for runtime in replay.runtimes.values():
                     if runtime.state == "ready":
                         try: runtime.set_phase("qa")
                         except Exception: runtime.state = "phase_failed"
-                replay.phase("search", stream)
+                measured("search", "recall")
         except BaseException:
             replay.interrupted = True
             raise
@@ -365,5 +404,15 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
             for runtime in reversed(list(replay.runtimes.values())):
                 try: runtime.stop()
                 except Exception: runtime.cleanup_failed = True
+            if cursor is not None:
+                now = datetime.now(timezone.utc)
+                events = replay.events
+                import_trace(profiling_config.internal_trace.path, cursor,
+                    TraceRunScope(run_id, set(replay.runtimes),
+                        {identity(run_id, user.id) for user in config.users},
+                        {event["request_id"] for event in events},
+                        datetime.fromisoformat(snapshot["started_at"]), now,
+                        profiling_config.internal_trace.max_raw_bytes),
+                    profiling_config.internal_trace.stage_map, output_dir)
             report = write_reports(output_dir, replay.report())
         return report

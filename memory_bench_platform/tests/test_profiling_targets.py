@@ -60,3 +60,13 @@ def test_deployed_target_records_live_cgroup_identity(monkeypatch):
     assert target.cgroup_path == "/sys/fs/cgroup/docker/cid"
     assert target.host_pid == 42 and target.cpu_scope == "0-3"
     assert target.image_digest == "sha256:image"
+
+
+def test_external_pid_must_belong_to_declared_cgroup(monkeypatch):
+    target = TargetIdentity("memory-i", "memory", "i", "external", host_pid=42,
+                            cgroup_path="/sys/fs/cgroup/declared")
+    monkeypatch.setattr("memory_bench_platform.profiling_targets.platform.system", lambda: "Linux")
+    monkeypatch.setattr("memory_bench_platform.profiling_targets._cgroup_for_pid",
+                        lambda pid: "/sys/fs/cgroup/actual")
+    result = probe_target(target, _config(), None)
+    assert result.state == "invalid" and result.reason == "target_identity_mismatch"

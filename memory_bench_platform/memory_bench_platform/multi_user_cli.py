@@ -36,7 +36,11 @@ def execute(args, argv=None):
     run_id = args.run_id or "multi-" + uuid.uuid4().hex[:16]
     output = Path.cwd() / "runs" / run_id
     try:
-        report = run_multi_user(config, output, run_id)
+        profile = None
+        if args.profiling_config:
+            from .profiling_config import load_profiling_config
+            profile = load_profiling_config(args.profiling_config)
+        report = run_multi_user(config, output, run_id, profiling_config=profile)
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except Exception:

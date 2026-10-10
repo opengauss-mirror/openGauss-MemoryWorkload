@@ -103,6 +103,8 @@ def probe_target(target: TargetIdentity, config: ProfilingConfig, docker=None,
         return CapabilityResult("invalid", "target_drift")
     if target.cgroup_path is None:
         return CapabilityResult("skipped", "missing_target_identity")
+    if target.host_pid is not None and _cgroup_for_pid(target.host_pid) != target.cgroup_path:
+        return CapabilityResult("invalid", "target_identity_mismatch")
     cgroup = Path(target.cgroup_path)
     if not cgroup.is_dir() or not str(cgroup).startswith("/sys/fs/cgroup/"):
         return CapabilityResult("skipped", "invalid_cgroup")
