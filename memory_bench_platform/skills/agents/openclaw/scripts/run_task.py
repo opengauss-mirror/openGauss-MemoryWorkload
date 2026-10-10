@@ -170,6 +170,14 @@ def build_openclaw_http_request(request: dict) -> tuple[str, dict[str, str], dic
         ],
         "stream": False,
     }
+    if os.environ.get("OPENCLAW_POOL_ENABLED") == "1":
+        prefix = os.environ.get("OPENCLAW_POOL_ROUTE_PREFIX", "").strip()
+        if not prefix:
+            raise ValueError("OpenClaw pool route prefix is required")
+        user = str(metadata.get("user_id") or "default")
+        route_user = f"{prefix}:{user}"
+        payload["user"] = route_user
+        headers["X-OpenClaw-Memory-User"] = route_user
     if request.get("attachments"):
         payload["input"].append({"type": "message", "role": "user", "content":
             "Attachments:\n" + "\n".join(str(x) for x in request["attachments"])})
