@@ -240,6 +240,37 @@ memory-bench deploy --config deployment.yaml \
 
 运行前健康检查证明服务可访问；实际用户/会话隔离和记忆写入正确性仍由 Skill 与 workflow gate 验证。独立组合即使使用相同镜像，也有各自的记忆容器、数据库、Mock Server 和数据卷；共享记忆实例的组合则有意共用这些资源，报告必须标记共享拓扑。
 
+## OpenClaw Gateway Pool 扩展
+
+OpenClaw 可为一个组合部署多个 Gateway 实例，并在它们前面部署一个独立的 Gateway Pool。此扩展沿用该组合所属的 Compose project、记忆实例和网络；每个 Gateway 有独立的 OpenClaw 配置副本、state 目录和容器身份，均连接同一个组合指定的记忆实例。Pool 连接该组合的 Agent 网络，只代理指向本组合 Gateway 的请求，不跨组合或共享记忆实例的其他 Agent 路由。未启用 Pool 的组合保持当前单 Agent 拓扑。此扩展不改变 `backend_direct` 的记忆系统直连路径。
+
+在 `deployment/1` 中增加可选的顶层 `gateway_pools` 模板映射。模板声明 `image`（镜像名及可选 tar）、`container_port`、`healthcheck`、可选 `environment`/`environment_from`、`config_mounts`、`state_mounts`、`resources`，以及运行参考项目 `gateway_pool.py` 协议的 `command` 前缀。首版只支持 `kind: openclaw_http_pool_v1`：平台在命令后追加 `--host 0.0.0.0 --port <container_port>`、每个 Gateway 的 `--upstream http://<service>:<agent.container_port>` 和 `--expected <副本数>`；不依赖 Compose DNS 对缩放副本的返回顺序。组合增加可选 `gateway_pool` 模板引用和 `agent_replicas` 正整数；未指定 Pool 时副本数必须为 1，指定 Pool 时 Agent Skill 必须为 `openclaw`，且使用 HTTP transport。每个组合独立实例化 Pool；模板可以复用，Pool 容器、用户分配表和端口不能跨组合共用。示意增量：
+
+```yaml
+gateway_pools:
+  openclaw-pool:
+    kind: openclaw_http_pool_v1
+    image: {name: "example/runner-with-gateway-pool:tag"}
+    command: [python, /workspace/scripts/gateway_pool.py]
+    container_port: 29789
+    healthcheck: [CMD, python, /workspace/scripts/check_pool.py]
+combinations:
+  - id: claw-mem0
+    benchmark: locomo
+    agent: claw
+    agent_replicas: 3
+    gateway_pool: openclaw-pool
+    memory: mem0
+    memory_integration: agent_plugin
+    data_path: ./data/locomo_small.json
+```
+
+Compose 为该组合生成 `agent_<id>_1` 至 `agent_<id>_N` 和 `gateway_pool_<id>`。各 Agent 的内网端口可以相同；仅 Pool 的宿主端口供 `run` 调用，Agent 宿主端口只在需要单实例核验时发布到回环地址。Pool 以 `depends_on: service_healthy` 等待全部上游，部署就绪检查还需请求 `/pool/status`，核对上游数量、地址集合与声明的副本数，并对每个 Agent 单独执行版本、配置生效、插件连接和依赖可达核验。任一副本或 Pool 不健康、上游集合变化、容器或镜像漂移时，`deploy status` 和 `run --deployment` 均拒绝 ready。容量预检按副本数累加 Agent 资源，再加 Pool 资源；部署状态记录 Pool 和每个副本的容器、镜像、端口及配置指纹。失败回滚和 `undeploy` 按原有 project 归属清理这些资源。
+
+启用 Pool 的组合，其 Agent `client.endpoint_env` 指向 Pool 的宿主回环 URL。OpenClaw HTTP 适配器必须在每个 `/v1/responses` 请求体中传稳定的 `user`，并在使用 `X-OpenClaw-Memory-User` 时传相同值；参考实现只按请求体的 `user` 维护粘性分配，缺失该字段会逐请求轮转。普通 workflow 由运行上下文生成稳定且隔离的用户身份，多用户压测使用本次 run 与目标实例、用户 ID 派生的身份；同一用户的 add、search、用户 seed、用户 warmup 和隔离探针必须使用同一个路由身份。没有可验证的路由身份时，不向 Pool 发送测量请求。现有 `preparation` 的容器内命令不经 Pool，启用 Pool 的组合不得配置以 Agent 为目标的 seed 或 warmup；用户级准备由后续压测实现经 Pool 调用。Pool 返回的 `X-OpenClaw-Upstream` 与 `/pool/status` 分配表用于核对实际路由；报告记录脱敏的用户到上游实例映射、每实例请求量和上游故障，不把仅有 Pool HTTP 200 视为 Agent 或记忆写入成功。Pool 实例重启导致分配表丢失时，运行中视为拓扑变化并停止该组合，避免同一用户迁移到另一 Gateway 的会话状态。
+
+本节是对已实现 Compose 部署功能的后续设计，当前 `deployment_config.py`、`deployment_compose.py` 和 `deployment_run.py` 尚不支持 `gateway_pools`、`agent_replicas` 或 Pool 端点绑定；实现前需单独制定并审阅增量实施计划。参考项目的 Pool 实现位于 `AgentMemoryWorkload/scripts/gateway_pool.py`，部署方式见其 `docker-compose.runner.yml` 和 `scripts/generate_scaleout_compose.py`；实际镜像必须包含与此协议兼容的程序。
+
 ## 多用户、多 Agent 与多记忆系统压测
 
 `memory-bench run --deployment <name> --pressure-test <id>` 根据 `targets[].combination` 获取真实容器端点、Agent Skill、Memory Plugin Skill、物理记忆实例 ID 和部署状态。平台扩展现有多用户回放协调器，使一场运行能同时调度不同 Agent Skill 的 target；每个请求携带所属用户的 `agent_id` 和由 run ID、用户 ID 派生的独立用户/会话身份。Agent 适配器处理 `openmem-agent/1` 的 add/search 请求，并返回可关联的结果；插件负责 prepare、阶段切换、精确写入完成/就绪和 finalize。每个 target 使用独立的 Agent 环境及插件运行上下文；共享记忆实例的 target 仅共用后端容器，不共用 Agent 会话。压测前通过 Agent 写入随机哨兵，再从指定记忆实例的对应作用域读取，核对实例 ID、请求关联和实际命中，并验证其他非共享实例未命中；无法证明实际路由时停止该 target，不以环境变量相等代替验证。
@@ -253,5 +284,7 @@ memory-bench deploy --config deployment.yaml \
 只有 workload 数据、用户数、速率、模型模式和初始数据状态一致的 target 才列入横向性能比较；其他 target 保留分项和共享实例总量报告，不计算“谁更快”的排名。请求事件保留 target、物理记忆实例和 `request_id`，可与可用的后端 trace 关联；缺少内部阶段或硬件采集证据时标记 `unavailable`，不从客户端延迟推断数据库或模型阶段耗时。
 
 ## 验证
+
+Gateway Pool 增量验证覆盖：未配置 Pool 的原有单 Agent 行为；多个 Gateway 的独立配置和 state、相同记忆实例绑定、静态上游列表和网络归属；Pool 镜像与副本资源预检、启动依赖、`/pool/status` 上游集合、每副本生效配置和故障回滚；`run` 使用 Pool 端口且不继承冲突的父进程端点；同一用户跨 add/search/seed/warmup 的粘性路由、不同用户分配、请求体 `user` 与身份头不一致时拒绝、缺少身份时拒绝；Pool 重启、上游替换或缺失时状态漂移和运行中止；报告中保留脱敏分配与每实例请求量。使用参考 `gateway_pool.py` 的真实容器冒烟验证路由契约，不能只凭 Compose 渲染测试宣称端到端通过。
 
 测试覆盖：严格 YAML 校验和路径解析；JSON/YAML 配置源文件、每实例副本、允许字段的类型化 CLI 覆盖、重复或未知字段拒绝、共享记忆唯一副本、配置挂载和实际生效值漂移；archive 加载后镜像名校验；独立组合与共享记忆实例的 Compose project、卷、端口、容量只计一次和网络隔离，包括可选图数据库与 Mock Server 的地址注入、命名端口及健康依赖；未配置 Mock 时不创建相关容器；资源预检在容器启动前失败；启动失败时只清理本次资源；ready 状态、版本/配置/连通性核验与 `deploy status` 的 drift 检测；suite 的环境路由、独立 run 目录、失败继续和中断；seed/readiness/warmup 开关默认关闭，启用基线 seed 必须启用 readiness，共享实例 deploy 仅 seed 一次，run 按身份逐用户 seed 并按需 warmup，保留 workflow 的 checkpoint readiness；压测映射与适配器能力校验、实际 Agent→指定记忆实例路由探针、共享插件作用域、跨 target 并发与限流、有限回放和稳态检索、用户身份/正确性/隔离门槛、运行锁、部分失败和分层报告；`undeploy` 的资源归属。命令集成测试使用可记录调用的 Docker CLI 替身，不要求开发机运行真实 Docker。具备实际镜像和数据集的环境再做真实 Compose 冒烟与端到端验证；没有这些资源时不宣称真实端到端已通过。
