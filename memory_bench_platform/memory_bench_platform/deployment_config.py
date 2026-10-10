@@ -85,6 +85,19 @@ class Service(StrictModel):
     allow_agent_storage_access: bool = False
 
 
+class GatewayPool(Service):
+    kind: Literal["openclaw_http_pool_v1"]
+    command: list[str]
+    container_port: int
+
+    @model_validator(mode="after")
+    def pool_only_fields(self):
+        if not self.command or any((self.skill, self.client, self.verify, self.config_files,
+                                    self.service_endpoints, self.endpoints)):
+            raise ValueError("gateway pool needs a command and cannot use Agent/Memory fields")
+        return self
+
+
 class PreparationStep(StrictModel):
     enabled: bool = False
     target: str | None = None
@@ -124,6 +137,8 @@ class Combination(StrictModel):
     id: str
     benchmark: str
     agent: str
+    gateway_pool: str | None = None
+    agent_replicas: int = 1
     memory: str | None = None
     memory_instance: str | None = None
     vector: str | None = None
@@ -151,6 +166,7 @@ class DeploymentConfig(StrictModel):
     vectors: dict[str, Service] = Field(default_factory=dict)
     graphs: dict[str, Service] = Field(default_factory=dict)
     mocks: dict[str, Service] = Field(default_factory=dict)
+    gateway_pools: dict[str, GatewayPool] = Field(default_factory=dict)
     shared_memory_instances: dict[str, SharedMemory] = Field(default_factory=dict)
     combinations: list[Combination]
     pressure_tests: list[dict] = Field(default_factory=list)
@@ -166,6 +182,7 @@ class DeploymentGroup(StrictModel):
     shared_memory_instance_id: str | None
     combinations: tuple[Combination, ...]
     agents: dict[str, Service]
+    gateway_pools: dict[str, GatewayPool] = Field(default_factory=dict)
     memory_template: Service
     memory_instance_id: str
     vector_template: Service | None = None
@@ -268,7 +285,8 @@ def load_deployment(path: Path) -> DeploymentConfig:
         raise ValueError("invalid deployment name or empty combinations")
     root = path.parent
     for section, role in ((config.agents, "agent"), (config.memories, "memory"), (config.vectors, "vector"),
-                          (config.graphs, "graph"), (config.mocks, "mock")):
+                          (config.graphs, "graph"), (config.mocks, "mock"),
+                          (config.gateway_pools, "gateway pool")):
         for name, service in section.items():
             if not _ID.fullmatch(name):
                 raise ValueError(f"invalid service ID: {name}")
@@ -288,11 +306,23 @@ def load_deployment(path: Path) -> DeploymentConfig:
         for label, ref, section in (("agent", combo.agent, config.agents), ("memory", combo.memory, config.memories),
                                     ("memory_instance", combo.memory_instance, config.shared_memory_instances),
                                     ("vector", combo.vector, config.vectors), ("graph", combo.graph, config.graphs),
-                                    ("mock", combo.mock, config.mocks)):
+                                    ("mock", combo.mock, config.mocks),
+                                    ("gateway_pool", combo.gateway_pool, config.gateway_pools)):
             if ref is not None and ref not in section:
                 raise ValueError(f"unknown {label}: {ref}")
         if not (root / combo.data_path).is_file():
             raise ValueError(f"missing data_path: {combo.data_path}")
+        if combo.agent_replicas < 1 or (not combo.gateway_pool and combo.agent_replicas != 1):
+            raise ValueError("agent_replicas requires gateway_pool and must be positive")
+        if combo.gateway_pool:
+            agent = config.agents[combo.agent]
+            if agent.skill != "openclaw" or agent.client.endpoint_env != "OPENCLAW_GATEWAY_URL":
+                raise ValueError("gateway_pool requires OpenClaw HTTP client")
+            if agent.environment.get("OPENCLAW_TRANSPORT") == "cli":
+                raise ValueError("gateway_pool conflicts with CLI transport")
+            if any(step.enabled and step.target == "agent" for step in
+                   (combo.preparation.seed, combo.preparation.warmup)):
+                raise ValueError("agent preparation bypasses gateway_pool")
         entry = resolve_benchmark_entrypoint(combo.benchmark, combo.entrypoint)
         if entry.entrypoint_kind not in ("case_builder", "scenario_builder"):
             raise ValueError(f"external benchmark entrypoint: {combo.entrypoint}")
@@ -398,7 +428,9 @@ def resolve_groups(config: DeploymentConfig) -> tuple[DeploymentGroup, ...]:
         groups.append(DeploymentGroup(
             project_key=key, source_root=config.source_path.parent, combination_ids=tuple(c.id for c in combos),
             shared_memory_instance_id=key if shared else None, combinations=tuple(combos),
-            agents={c.id: config.agents[c.agent] for c in combos}, memory_template=config.memories[memory_id],
+            agents={c.id: config.agents[c.agent] for c in combos},
+            gateway_pools={c.id: config.gateway_pools[c.gateway_pool] for c in combos if c.gateway_pool},
+            memory_template=config.memories[memory_id],
             memory_instance_id=key, vector_template=config.vectors.get(vector_id) if vector_id else None,
             graph_template=config.graphs.get(graph_id) if graph_id else None,
             memory_mock_template=config.mocks.get(memory_mock_id) if memory_mock_id else None,

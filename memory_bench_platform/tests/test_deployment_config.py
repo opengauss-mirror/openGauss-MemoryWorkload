@@ -55,6 +55,50 @@ def test_shared_memory_group_is_resolved_once(tmp_path):
     assert groups[0].memory_template.skill == "mem0"
 
 
+def test_gateway_pool_resolves_per_combination(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["agents"]["claw"]["client"]["endpoint_env"] = "OPENCLAW_GATEWAY_URL"
+    raw["agents"]["worker"]["client"]["endpoint_env"] = "OPENCLAW_GATEWAY_URL"
+    raw["gateway_pools"] = {"pool": {"kind": "openclaw_http_pool_v1", "image": {"name": "pool:1"},
+                                      "command": ["python", "gateway_pool.py"], "container_port": 29789,
+                                      "healthcheck": ["CMD", "true"]}}
+    for combo in raw["combinations"]:
+        combo.update(gateway_pool="pool", agent_replicas=2)
+    path.write_text(yaml.safe_dump(raw))
+    group, = resolve_groups(load_deployment(path))
+    assert set(group.gateway_pools) == {"claw-common", "worker-common"}
+    assert all(combo.agent_replicas == 2 for combo in group.combinations)
+
+
+def test_gateway_pool_rejects_invalid_topology(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["agents"]["claw"]["client"]["endpoint_env"] = "OPENCLAW_GATEWAY_URL"
+    raw["gateway_pools"] = {"pool": {"kind": "openclaw_http_pool_v1", "image": {"name": "pool:1"},
+                                      "command": ["python", "gateway_pool.py"], "container_port": 29789,
+                                      "healthcheck": ["CMD", "true"]}}
+    raw["combinations"][0].update(gateway_pool="pool", agent_replicas=2)
+    path.write_text(yaml.safe_dump(raw))
+    load_deployment(path)
+    cases = [
+        ("unknown pool", lambda r: r["combinations"][0].update(gateway_pool="missing")),
+        ("replicas without pool", lambda r: r["combinations"][0].pop("gateway_pool")),
+        ("zero replicas", lambda r: r["combinations"][0].update(agent_replicas=0)),
+        ("wrong endpoint", lambda r: r["agents"]["claw"]["client"].update(endpoint_env="OTHER_URL")),
+        ("wrong kind", lambda r: r["gateway_pools"]["pool"].update(kind="other")),
+        ("empty command", lambda r: r["gateway_pools"]["pool"].update(command=[])),
+        ("missing port", lambda r: r["gateway_pools"]["pool"].pop("container_port")),
+        ("CLI transport", lambda r: r["agents"]["claw"].update(environment={"OPENCLAW_TRANSPORT": "cli"})),
+        ("agent warmup", lambda r: r["combinations"][0].update(preparation={"warmup": {"enabled": True, "target": "agent", "command": ["warmup"]}})),
+    ]
+    for _, change in cases:
+        import copy
+        invalid = copy.deepcopy(raw)
+        change(invalid)
+        path.write_text(yaml.safe_dump(invalid))
+        with pytest.raises(ValueError):
+            load_deployment(path)
+
+
 def test_typed_config_overrides_and_rejections(tmp_path):
     path, _ = fixture_config(tmp_path)
     config = load_deployment(path)
