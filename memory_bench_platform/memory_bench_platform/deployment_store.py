@@ -33,6 +33,7 @@ class DeploymentState(BaseModel):
     owned_volumes: list[str] = Field(default_factory=list)
     owned_directories: list[str] = Field(default_factory=list)
     preparation: dict[str, dict] = Field(default_factory=dict)
+    rollback_errors: dict[str, str] = Field(default_factory=dict)
 
 
 class DeploymentStore:

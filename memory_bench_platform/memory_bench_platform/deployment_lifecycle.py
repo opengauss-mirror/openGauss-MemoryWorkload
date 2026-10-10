@@ -275,12 +275,28 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
         store.write_atomic(state)
         return state
     except BaseException as exc:
+        rollback_errors = {}
         for project, file in reversed(started):
             try:
                 docker.compose_down(project, file)
-            except Exception:
-                pass
-        shutil.rmtree(directory, ignore_errors=True)
+            except Exception as cleanup_exc:
+                rollback_errors[project] = str(cleanup_exc)
+        if rollback_errors:
+            state.ready = False
+            state.rollback_errors = rollback_errors
+            try:
+                store.write_atomic(state)
+            except Exception as save_exc:
+                raise DeploymentFailed(
+                    f"deployment failed; rollback failed for {', '.join(rollback_errors)}; "
+                    f"could not update retained state ({type(save_exc).__name__}). "
+                    f"Retry with memory-bench undeploy --deployment {config.name}"
+                ) from exc
+            raise DeploymentFailed(
+                f"deployment failed: {exc}; rollback failed for {', '.join(rollback_errors)}. "
+                f"Retry with memory-bench undeploy --deployment {config.name}"
+            ) from exc
+        shutil.rmtree(directory)
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise DeploymentFailed(str(exc)) from exc
@@ -289,7 +305,8 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
 def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
     store = DeploymentStore(cwd)
     state = store.read(name)
-    drift = []
+    drift = [f"rollback failed for {project}: {error}"
+             for project, error in state.rollback_errors.items()]
     config_path = Path(state.config_path)
     if not config_path.is_file() or _hash(config_path) != state.config_sha256:
         drift.append("deployment YAML changed")

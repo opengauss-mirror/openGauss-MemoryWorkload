@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from memory_bench_platform.deployment_lifecycle import DeploymentFailed, deploy, status, undeploy
+from memory_bench_platform.deployment_store import DeploymentStore
 from test_deployment_config import fixture_config
 from test_deployment_compose import pooled_fixture
 
@@ -153,6 +154,83 @@ def test_partial_compose_up_is_rolled_back(tmp_path):
         deploy(path, tmp_path, docker)
     assert len(docker.removed_projects) == 1
     assert next(iter(docker.removed_projects)).startswith("mb_suite_mem0_common_")
+    assert not (tmp_path / ".memory-bench/deployments/suite").exists()
+
+
+def test_failed_rollback_keeps_manifest_for_safe_undeploy_retry(tmp_path):
+    path, _ = fixture_config(tmp_path)
+
+    class IntermittentDocker(RecordingDocker):
+        down_available = False
+
+        def compose_up(self, project, file, env=None):
+            super().compose_up(project, file, env)
+            raise RuntimeError("one service failed to start")
+
+        def compose_down(self, project, file):
+            if not self.down_available:
+                raise RuntimeError("Docker daemon unavailable")
+            super().compose_down(project, file)
+
+    docker = IntermittentDocker()
+    with pytest.raises(DeploymentFailed, match="rollback failed"):
+        deploy(path, tmp_path, docker)
+    directory = tmp_path / ".memory-bench/deployments/suite"
+    assert (directory / "state.json").is_file()
+    assert (directory / "mem0-common/compose.yaml").is_file()
+    state = DeploymentStore(tmp_path).read("suite")
+    assert not state.ready
+    assert state.rollback_errors
+    assert set(state.projects) == {"mem0-common"}
+    checked = status("suite", tmp_path, docker)
+    assert not checked.ready
+    assert any("rollback failed" in item for item in checked.drift)
+    with pytest.raises(FileExistsError):
+        deploy(path, tmp_path, docker)
+    docker.down_available = True
+    undeploy("suite", tmp_path, docker)
+    assert not directory.exists()
+    assert docker.removed_projects == set(state.projects.values())
+
+
+def test_failed_rollback_preserves_all_project_ownership(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw.pop("shared_memory_instances")
+    for combo in raw["combinations"]:
+        combo.pop("memory_instance")
+        combo["memory"] = "mem0"
+    path.write_text(yaml.safe_dump(raw))
+
+    class PartialDocker(RecordingDocker):
+        up_count = 0
+        fail_down = True
+
+        def compose_up(self, project, file, env=None):
+            super().compose_up(project, file, env)
+            self.up_count += 1
+            if self.up_count == 2:
+                raise RuntimeError("second project failed")
+
+        def compose_down(self, project, file):
+            if self.fail_down and "worker_common" in project:
+                raise RuntimeError("Docker temporarily unavailable")
+            super().compose_down(project, file)
+
+        def compose_ps(self, project, file, service):
+            if project in self.removed_projects:
+                return ""
+            return super().compose_ps(project, file, service)
+
+    docker = PartialDocker()
+    with pytest.raises(DeploymentFailed, match="rollback failed"):
+        deploy(path, tmp_path, docker)
+    state = DeploymentStore(tmp_path).read("suite")
+    assert len(state.projects) == 2
+    assert len(docker.removed_projects) == 1
+    assert set(state.rollback_errors) == set(state.projects.values()) - docker.removed_projects
+    docker.fail_down = False
+    undeploy("suite", tmp_path, docker)
+    assert docker.removed_projects == set(state.projects.values())
 
 
 def test_pool_deploy_checks_upstreams_and_restart_drift(tmp_path, monkeypatch):
