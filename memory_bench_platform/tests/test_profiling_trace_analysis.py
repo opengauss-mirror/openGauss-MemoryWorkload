@@ -1,4 +1,6 @@
 import json
+import math
+import tracemalloc
 from datetime import datetime, timezone
 
 from memory_bench_platform.profiling_archive import ClientEvent, ProfileArchive
@@ -104,3 +106,29 @@ def test_invalid_and_extra_trace_rows_are_accounted(tmp_path):
     assert report.invalid_rows["unknown_stage"] == 1
     assert report.invalid_rows["unverifiable_leaf_overlap"] == 1
     assert report.stage_durations_ms == {}
+
+
+def test_many_spans_are_analyzed_without_retaining_the_trace(tmp_path):
+    archive = _archive(tmp_path, [])
+    source = tmp_path / "profiling" / "perf_trace_events.jsonl"
+    row = _span(start_utc="2026-01-01T00:00:00+00:00",
+                end_utc="2026-01-01T00:00:00.010000+00:00")
+    with source.open("w", encoding="utf-8") as stream:
+        for index in range(50_000):
+            row["span_id"] = f"span-{index}"
+            stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+    tracemalloc.start()
+    try:
+        report = analyze_trace(archive, [_client()])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert report.stage_durations_ms["add"]["extract_llm"] == [10.0]
+    assert peak < 24 * 1024 * 1024
+
+
+def test_nonfinite_duration_is_invalid_before_disk_aggregation(tmp_path):
+    archive = _archive(tmp_path, [_span(duration=math.nan)])
+    report = analyze_trace(archive, [_client()])
+    assert report.invalid_rows["invalid_duration"] == 1
+    assert report.join_coverage["matched"] == 0

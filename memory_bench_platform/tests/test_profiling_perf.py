@@ -146,8 +146,12 @@ def test_timeout_kills_process_group_descendants(tmp_path):
 def test_topdown_l1_writes_four_valid_shares(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_perf
     monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
-    raw = "".join(f"25;;{event};1000;100.00\n" for event in (
-        "topdown-fe-bound", "topdown-bad-spec", "topdown-be-bound", "topdown-retiring"))
+    raw = "".join(f"{count};;{event};1000;100.00;{share};%\n"
+                  for count, event, share in (
+                      (1000, "topdown-fe-bound", 20),
+                      (2000, "topdown-bad-spec", 30),
+                      (3000, "topdown-be-bound", 10),
+                      (4000, "topdown-retiring", 40)))
     session = ProfilerSession(_config(hardware={"stat": "topdown_l1"}), [_target()], tmp_path,
         command_factory=lambda *a, **k: FakeProcess(raw),
         probe=lambda target, config: CapabilityResult("ready", None, "topdown_l1"))
@@ -155,7 +159,37 @@ def test_topdown_l1_writes_four_valid_shares(tmp_path, monkeypatch):
     assert status[0].state == "completed"
     text = (tmp_path / "profiling" / "topdown_summary.csv").read_text()
     assert "frontend_bound,bad_speculation,backend_bound,retiring" in text
-    assert ",25.0,25.0,25.0,25.0" in text
+    assert ",20.0,30.0,10.0,40.0" in text
+    counters = (tmp_path / "profiling" / "perf_counters.csv").read_text()
+    assert "topdown-fe-bound,1000.0" in counters
+
+
+def test_topdown_does_not_treat_counter_values_as_percentages(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_perf
+    monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
+    raw = "".join(f"25;;{event};1000;100.00\n" for event in (
+        "topdown-fe-bound", "topdown-bad-spec", "topdown-be-bound", "topdown-retiring"))
+    session = ProfilerSession(_config(hardware={"stat": "topdown_l1"}), [_target()], tmp_path,
+        command_factory=lambda *a, **k: FakeProcess(raw),
+        probe=lambda target, config: CapabilityResult("ready", None, "topdown_l1"))
+    status = session.stop_phase(session.start_phase("ingest", ["memory-i"]))
+    assert status[0].state == "invalid" and status[0].reason == "invalid_topdown"
+
+
+def test_topdown_slot_counts_are_normalized_when_metric_is_absent(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_perf
+    monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
+    raw = "".join(f"{count};slots;{event};1000;100.00\n"
+                  for count, event in ((1000, "topdown-fe-bound"),
+                                       (2000, "topdown-bad-spec"),
+                                       (3000, "topdown-be-bound"),
+                                       (4000, "topdown-retiring")))
+    session = ProfilerSession(_config(hardware={"stat": "topdown_l1"}), [_target()], tmp_path,
+        command_factory=lambda *a, **k: FakeProcess(raw),
+        probe=lambda target, config: CapabilityResult("ready", None, "topdown_l1"))
+    status = session.stop_phase(session.start_phase("ingest", ["memory-i"]))
+    assert status[0].state == "completed"
+    assert ",10.0,20.0,30.0,40.0" in (tmp_path / "profiling" / "topdown_summary.csv").read_text()
 
 
 def test_selected_phase_starts_perf_record_and_stops_it(tmp_path, monkeypatch):

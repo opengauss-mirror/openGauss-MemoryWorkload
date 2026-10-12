@@ -658,6 +658,15 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
         for phase, batch in batches
     ):
         raise ValueError("phase_boundary_unavailable")
+    missing_phases = (set(phase_sink.session.config.phases) - set(selected_phases)
+                      if phase_sink is not None else set())
+    if integration == "backend_direct" and "recall" in selected_phases:
+        missing_phases.discard("drain")
+    if phase_sink is not None and phase_sink.session.config.mode == "required" and (
+            len(selected_phases) != len(set(selected_phases)) or missing_phases):
+        from .profiling_run import mark_phase_unavailable
+        mark_phase_unavailable(phase_sink)
+        raise RuntimeError("phase_boundary_unavailable")
     if phase_sink is not None and len(selected_phases) != len(set(selected_phases)):
         # Interleaved stages cannot be represented by one capture per phase.
         from .profiling_run import mark_phase_unavailable
@@ -752,7 +761,7 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                 raise RuntimeError("invalid_profile")
         else:
             run_batch()
-    if phase_sink is not None and set(phase_sink.session.config.phases) - set(selected_phases):
+    if phase_sink is not None and missing_phases:
         from .profiling_run import mark_phase_unavailable
         mark_phase_unavailable(phase_sink)
     # Stable report order is independent of completion order.

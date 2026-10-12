@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import signal
 import subprocess
@@ -237,13 +238,29 @@ class ProfilerSession:
             target = self.targets[handle.target_id]
             for row in counters:
                 writer.writerow({"target_id": handle.target_id, "phase_id": handle.phase_id,
-                    "cpu_scope": target.cpu_scope or "all", "event_group": self.config.hardware.stat, **row})
+                    "cpu_scope": target.cpu_scope or "all", "event_group": self.config.hardware.stat,
+                    **{key: row[key] for key in ("event", "value", "running_fraction")}})
 
     def _append_topdown(self, handle: CollectorHandle, counters: list[dict]) -> bool:
         mapping = {"topdown-fe-bound": "frontend_bound", "topdown-bad-spec": "bad_speculation",
                    "topdown-be-bound": "backend_bound", "topdown-retiring": "retiring"}
-        values = {mapping[row["event"]]: row["value"] for row in counters if row["event"] in mapping}
-        if set(values) != set(mapping.values()) or not 95 <= sum(values.values()) <= 105:
+        selected = [row for row in counters if row["event"] in mapping]
+        runtimes = [row.get("event_runtime") for row in selected]
+        if (len(selected) != 4 or {row["event"] for row in selected} != set(mapping) or
+                any(runtime is None or runtime <= 0 for runtime in runtimes) or
+                max(runtimes) - min(runtimes) > max(runtimes) * 0.01):
+            return False
+        if all("metric_percent" in row for row in selected):
+            values = {mapping[row["event"]]: row["metric_percent"] for row in selected}
+        elif (all("metric_percent" not in row for row in selected) and
+              all(row["unit"].lower() in {"slot", "slots"} for row in selected)):
+            total = sum(row["value"] for row in selected)
+            if total <= 0:
+                return False
+            values = {mapping[row["event"]]: row["value"] / total * 100 for row in selected}
+        else:
+            return False
+        if any(not 0 <= value <= 100 for value in values.values()) or not 95 <= sum(values.values()) <= 105:
             return False
         path = self.root / "topdown_summary.csv"
         fields = ["target_id", "phase_id", "cpu_scope", "event_group", *mapping.values()]
@@ -268,7 +285,13 @@ def _parse_stat(raw: str) -> list[dict]:
             raise ValueError("unsupported counter")
         try:
             fraction = float(parts[4].rstrip("%")) / 100 if len(parts) > 4 and parts[4] else 1.0
-            result.append({"event": event, "value": float(value), "running_fraction": fraction})
+            row = {"event": event, "unit": parts[1].strip(), "value": float(value), "running_fraction": fraction,
+                   "event_runtime": float(parts[3]) if len(parts) > 3 and parts[3] else None}
+            if (len(parts) > 6 and parts[5] and parts[6].strip().lower() in {"%", "percent"}):
+                row["metric_percent"] = float(parts[5])
+            if not all(math.isfinite(number) for number in row.values() if isinstance(number, float)):
+                raise ValueError("invalid perf stat row")
+            result.append(row)
         except ValueError as exc:
             raise ValueError("invalid perf stat row") from exc
     if not result:

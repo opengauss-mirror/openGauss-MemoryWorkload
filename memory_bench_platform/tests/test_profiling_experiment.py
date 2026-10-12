@@ -63,6 +63,23 @@ def test_existing_deployment_is_never_cleaned(tmp_path, monkeypatch):
     assert removed == []
 
 
+def test_existing_deployment_rejects_different_supplied_yaml(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_experiment as module
+    config, profile = _files(tmp_path)
+    docker = RecordingDocker()
+    module.deploy(config, tmp_path, docker)
+    changed = tmp_path / "different.yaml"
+    data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    data["combinations"][0]["data_path"] = "./other-data.json"
+    (tmp_path / "other-data.json").write_text("[]", encoding="utf-8")
+    changed.write_text(yaml.safe_dump(data), encoding="utf-8")
+    monkeypatch.setattr(module, "run_deployment", lambda *_args, **_kwargs:
+                        pytest.fail("mismatched deployment must not run"))
+    with pytest.raises(RuntimeError, match="deployment.*config.*mismatch"):
+        module.run_experiment(changed, profile, tmp_path, docker)
+    assert module.DeploymentStore(tmp_path).read("suite").config_path == str(config.resolve())
+
+
 def test_owned_cleanup_only_when_requested(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_experiment as module
     config, profile = _files(tmp_path)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import shutil
@@ -57,7 +58,12 @@ def run_experiment(config_path: Path, profiling_path: Path, cwd: Path, docker, *
     suite_dir = None
     try:
         record("create", "completed")
-        if DeploymentStore(cwd).directory(config.name).exists():
+        store = DeploymentStore(cwd)
+        if store.directory(config.name).exists():
+            deployed = store.read(config.name)
+            if (Path(deployed.config_path).resolve() != config_path or
+                    deployed.config_sha256 != hashlib.sha256(config_path.read_bytes()).hexdigest()):
+                raise RuntimeError("deployment config mismatch: supplied YAML differs from deployed YAML")
             record("deploy", "reused")
         else:
             deploy(config_path, cwd, docker)

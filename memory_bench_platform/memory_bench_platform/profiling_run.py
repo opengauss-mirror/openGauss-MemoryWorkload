@@ -41,6 +41,7 @@ def prepare_phase_sink(config: ProfilingConfig, run_dir: Path, run_id: str,
 
 
 def mark_phase_unavailable(sink: PhaseSink, reason: str = "phase_boundary_unavailable") -> None:
+    sink.invalid_profile = True
     for phase in sink.session.config.phases:
         for target_id in sink.session.targets:
             key = (target_id, phase)
