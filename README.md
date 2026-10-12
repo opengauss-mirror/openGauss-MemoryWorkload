@@ -617,3 +617,27 @@ python -m memory_bench_platform.cli run \
 ### Compose 一键部署与运行
 
 使用 `memory-bench deploy --config deployment.yaml` 部署 YAML 中的 Agent、记忆系统和可选数据库/Mock，再执行 `memory-bench run --deployment <name>` 跑现有平台原生 workflow。`deploy` 可用 `--agent-config`、`--memory-config` 为指定实例覆盖配置文件字段；`deploy status --deployment <name>` 检查漂移，`undeploy --deployment <name>` 清理部署资源。YAML 格式、共享实例和准备阶段开关见 [部署配置说明](docs/deployment-yaml.md)。
+
+### 阶段化 Profiling 与离线分析
+
+`--profiling-config` 可用于 `run --deployment`、普通 `run` 和多用户真实负载。部署组合示例：
+
+```yaml
+schema: profiling/1
+mode: best_effort
+targets: [memory]
+phases: [ingest, drain, recall]
+hardware:
+  stat: basic # 或 topdown_l1；关闭时须写成 'off'
+```
+
+```bash
+memory-bench experiment --config deployment.yaml --profiling-config profile.yaml
+# 只清理由本次 experiment 新建的部署，既有部署永不由此选项删除
+memory-bench experiment --config deployment.yaml --profiling-config profile.yaml --cleanup-owned-deployment
+memory-bench analyze-run --run-dir runs/<run-id>
+```
+
+`experiment` 顺序执行部署/既有部署校验、组合运行、离线分析，状态保存在 `runs/experiments/<id>/experiment.json`；每个组合仍写入自己的 `runs/<run-id>/`。其中 `phase_events.jsonl`、`target_registry.json`、`profiling/collector_status.json` 和 `reports/profiling_analysis.*` 可用于复核；原始 perf 数据仅在本地私有目录。`analyze-run` 不连接目标系统，可用原归档重新计算。缺少可验证阶段边界的 runner 会明确记为 `phase_boundary_unavailable`，不会把整轮耗时伪装成单个阶段。
+
+硬件采集需要 Linux、`perf`、相应 PMU/容器 cgroup 权限；`best_effort` 在 macOS 或权限不足时保留客户端阶段指标并标记硬件 `skipped`，`required` 会在正式请求前拒绝。工具不会执行 `sudo` 或修改内核权限。`--pressure-test` 仍需独立的多 Agent 压测实现，目前不能与 `experiment` 使用。

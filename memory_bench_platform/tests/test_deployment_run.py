@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import yaml
 
 from memory_bench_platform.deployment_lifecycle import deploy
@@ -32,6 +33,38 @@ def test_run_deployment_routes_each_combination_and_summarizes(tmp_path, monkeyp
     summaries = list((tmp_path / "runs").glob("suite-*/suite_summary.json"))
     assert len(summaries) == 1
     assert len(json.loads(summaries[0].read_text())["combinations"]) == 2
+
+
+def test_deployment_run_forwards_profile_to_each_child(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    path.write_text(yaml.safe_dump(raw))
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(yaml.safe_dump({"schema": "profiling/1", "targets": ["memory"]}))
+    docker = RecordingDocker()
+    deploy(path, tmp_path, docker)
+    seen = []
+    run_deployment("suite", tmp_path, None, docker,
+        lambda argv, *, env, cwd: seen.append((argv, env)) or 0, profiling_config=profile)
+    assert len(seen) == 2
+    assert all(argv[-2:] == ["--profiling-config", str(profile)] for argv, _ in seen)
+    assert all(len(json.loads(env["MEMORY_BENCH_PROFILE_TARGETS"])) == 1 for _, env in seen)
+
+
+def test_deployment_drift_blocks_profiled_child(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    path.write_text(yaml.safe_dump(raw))
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(yaml.safe_dump({"schema": "profiling/1", "targets": ["memory"]}))
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    container = next(iter(state.restart_counts))
+    docker.containers[container]["RestartCount"] = 1
+    seen = []
+    with pytest.raises(ValueError, match="not ready"):
+        run_deployment("suite", tmp_path, None, docker,
+                       lambda argv, *, env, cwd: seen.append(argv) or 0,
+                       profiling_config=profile)
+    assert seen == []
 
 
 def test_shared_second_agent_warmup_targets_its_own_container(tmp_path):

@@ -10,7 +10,7 @@ import subprocess
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .integration import run_agent_task, run_memory_plugin_task, run_memory_task
@@ -593,7 +593,8 @@ def _qa_group_key(case, steps, integration):
 def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                   runtime_context: WorkflowRuntimeContext | None = None,
                   cases: list[CaseRecord], steps: list[StepRecord],
-                  execution_spec: ExecutionSpec, run_dir: Path) -> dict[str, list]:
+                  execution_spec: ExecutionSpec, run_dir: Path,
+                  phase_sink=None, target_ids: list[str] | None = None) -> dict[str, list]:
     runtime_context = runtime_context or WorkflowRuntimeContext(
         run_id=run_id, run_dir=str(run_dir), benchmark_id="", agent_id=agent_id, memory_id=memory_id)
     integration = runtime_context.memory_integration
@@ -619,9 +620,64 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
         else:
             groups.append([case])
             keys.append(key)
+    def group_phase(group):
+        case_steps = [by_case[case.case_id] for case in group]
+        if all(steps and all(step.operator_kind == "memory" and
+                             step.inputs.get("action") == "ingest" for step in steps)
+               for steps in case_steps):
+            return "ingest"
+        if all(steps and all(step.operator_kind == "poll" for step in steps)
+               for steps in case_steps):
+            return "drain"
+        if all(case.reference.get("evaluation_target") == "qa_answer" for case in group):
+            if integration == "backend_direct" and all(
+                len(steps) == 2 and steps[0].operator_kind == "memory" and
+                steps[0].inputs.get("action") == "recall" and
+                steps[1].operator_kind == "agent" for steps in case_steps):
+                return "recall"
+            if integration == "agent_plugin" and all(
+                len(steps) == 1 and steps[0].operator_kind == "agent" for steps in case_steps):
+                return "recall"
+        if all(steps and all(step.operator_kind == "memory" and
+                             step.inputs.get("action") == "recall" for step in steps)
+               for steps in case_steps):
+            return "recall"
+        return None
+
+    batches = []
+    for group in groups:
+        phase = group_phase(group)
+        if batches and batches[-1][0] == phase:
+            batches[-1][1].append(group)
+        else:
+            batches.append((phase, [group]))
+    selected_phases = [phase for phase, _ in batches if phase is not None]
+    if phase_sink is not None and phase_sink.session.config.mode == "required" and any(
+        phase is None and any(step.operator_kind in {"memory", "memory_plugin"}
+                              for group in batch for case in group for step in by_case[case.case_id])
+        for phase, batch in batches
+    ):
+        raise ValueError("phase_boundary_unavailable")
+    missing_phases = (set(phase_sink.session.config.phases) - set(selected_phases)
+                      if phase_sink is not None else set())
+    if integration == "backend_direct" and "recall" in selected_phases:
+        missing_phases.discard("drain")
+    if phase_sink is not None and phase_sink.session.config.mode == "required" and (
+            len(selected_phases) != len(set(selected_phases)) or missing_phases):
+        from .profiling_run import mark_phase_unavailable
+        mark_phase_unavailable(phase_sink)
+        raise RuntimeError("phase_boundary_unavailable")
+    if phase_sink is not None and len(selected_phases) != len(set(selected_phases)):
+        # Interleaved stages cannot be represented by one capture per phase.
+        from .profiling_run import mark_phase_unavailable
+        mark_phase_unavailable(phase_sink)
+        phase_sink = None
     outputs, statuses, failures = {}, {}, {}
     progress = run_dir / "records" / "case-progress"
     progress.mkdir(parents=True, exist_ok=True)
+    client_event_path = run_dir / "profiling_client_events.jsonl" if phase_sink is not None else None
+    if client_event_path is not None:
+        client_event_path.touch()
 
     def archive(case, output):
         target = progress / (hashlib.sha256(case.case_id.encode()).hexdigest() + ".json")
@@ -634,7 +690,7 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
 
     with ThreadPoolExecutor(max_workers=execution_spec.qa_concurrency) as qa_pool, \
          ThreadPoolExecutor(max_workers=execution_spec.judge_concurrency) as judge_pool:
-        for group in groups:
+      def run_group(group, phase):
             # Drain both pools at checkpoint/sample boundaries, before any writes.
             remaining = iter(group)
             pending = {}
@@ -667,6 +723,17 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                         if output["_failure_kind"]:
                             failures[case.case_id] = output["_failure_kind"]
                         archive(case, output)
+                        if client_event_path is not None and phase in {"ingest", "drain", "recall"}:
+                            timed = [item for item in output["step_results"]
+                                     if item.started_at is not None and item.ended_at is not None]
+                            if timed:
+                                started = min(item.started_at for item in timed).astimezone(timezone.utc)
+                                ended = max(item.ended_at for item in timed).astimezone(timezone.utc)
+                                with client_event_path.open("a", encoding="utf-8") as stream:
+                                    stream.write(json.dumps({"run_id": run_id, "request_id": case.case_id,
+                                        "operation": {"ingest": "add", "drain": "drain", "recall": "search"}[phase],
+                                        "started_utc": started.isoformat(), "ended_utc": ended.isoformat(),
+                                        "status": "ok" if output["_execution_status"] == "passed" else "failed"}) + "\n")
                         if output["_judge_job"] is not None:
                             judge = judge_pool.submit(copy_context().run, _judge_case, run_id, case, output["_judge_job"], runtime_context)
                             pending[judge] = ("judge", case)
@@ -677,5 +744,25 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                         output["traces"].extend(traces)
                         output["_judge_job"] = None
                         archive(case, output)
+      drain_recorded = False
+      for phase, batch in batches:
+        if (phase_sink is not None and phase == "recall" and not drain_recorded and
+                "drain" in phase_sink.session.config.phases and "drain" not in selected_phases and
+                integration == "backend_direct"):
+            phase_sink.run_phase("drain", target_ids or [], lambda: None, applicable=False)
+            drain_recorded = True
+        def run_batch():
+            for group in batch:
+                run_group(group, phase)
+        if phase_sink is not None and phase in phase_sink.session.config.phases:
+            phase_sink.run_phase(phase, target_ids or [], run_batch,
+                                 request_count=lambda: sum(len(group) for group in batch))
+            if phase_sink.session.config.mode == "required" and phase_sink.invalid_profile:
+                raise RuntimeError("invalid_profile")
+        else:
+            run_batch()
+    if phase_sink is not None and missing_phases:
+        from .profiling_run import mark_phase_unavailable
+        mark_phase_unavailable(phase_sink)
     # Stable report order is independent of completion order.
     return {key: [item for case in cases for item in outputs[case.case_id][key]] for key in _RESULT_FIELDS}

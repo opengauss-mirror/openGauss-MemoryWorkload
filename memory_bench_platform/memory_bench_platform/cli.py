@@ -5,7 +5,7 @@ from . import token_usage
 import argparse
 import json
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import traceback
@@ -105,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_undeploy = sub.add_parser("undeploy")
     p_undeploy.add_argument("--deployment", required=True)
 
+    p_experiment = sub.add_parser("experiment")
+    p_experiment.add_argument("--config", type=Path, required=True)
+    p_experiment.add_argument("--profiling-config", type=Path, required=True)
+    p_experiment.add_argument("--pressure-test")
+    p_experiment.add_argument("--cleanup-owned-deployment", action="store_true")
+
     p_plan = sub.add_parser("plan-run")
     p_plan.add_argument("--benchmark", required=True)
     p_plan.add_argument("--agent", required=True)
@@ -158,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=ExplicitIntegration,
     )
     p_run.add_argument("--hardware-profile")
+    p_run.add_argument("--profiling-config", type=Path)
     run_data = p_run.add_mutually_exclusive_group()
     run_data.add_argument("--data-path")
     run_data.add_argument("--workload-config")
@@ -832,6 +839,19 @@ def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "experiment":
+        from .deployment_docker import DockerClient
+        from .profiling_experiment import run_experiment
+        try:
+            result = run_experiment(args.config, args.profiling_config, Path.cwd(), DockerClient(),
+                pressure_test=args.pressure_test,
+                cleanup_owned_deployment=args.cleanup_owned_deployment)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(str(result.archive_dir))
+        if result.status != "completed":
+            raise SystemExit(1)
+        return
     if args.command in {"deploy", "undeploy"} or (args.command == "run" and args.deployment):
         from .deployment_docker import DockerClient
         from .deployment_lifecycle import deploy, status, undeploy
@@ -860,7 +880,10 @@ def main(argv: list[str] | None = None) -> None:
                              if getattr(args, name, None)]
                 if conflicts or getattr(args, "memory_integration_explicit", False):
                     parser.error("--deployment cannot be combined with manual run selection options")
-                rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker)
+                profile_options = ({"profiling_config": args.profiling_config}
+                                   if args.profiling_config is not None else {})
+                rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker,
+                                    **profile_options)
                 if rc:
                     raise SystemExit(rc)
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
@@ -1024,6 +1047,10 @@ def main(argv: list[str] | None = None) -> None:
         args.memory_integration,
     )
     entrypoint = resolve_benchmark_entrypoint(args.benchmark, getattr(args, "entrypoint", None))
+    profiling_config = None
+    if args.profiling_config is not None:
+        from .profiling_config import load_profiling_config
+        profiling_config = load_profiling_config(args.profiling_config)
     if entrypoint.entrypoint_kind == "external_runner" and any(
         getattr(args, name, None) not in (None, 1) for name in ("qa_concurrency", "judge_concurrency")
     ):
@@ -1058,6 +1085,10 @@ def main(argv: list[str] | None = None) -> None:
                     "memory_integration": args.memory_integration,
                     "memory_plugin_id": run_contract["selection"].get("memory_plugin_id"),
                     "version_overrides": version_overrides or None,
+                    "profiling": ({"mode": profiling_config.mode,
+                                   "hardware": profiling_config.hardware.model_dump(),
+                                   "quality_gates": profiling_config.quality_gates.model_dump()}
+                                  if profiling_config is not None else None),
                 }.items()
                 if value
             }
@@ -1183,6 +1214,15 @@ def main(argv: list[str] | None = None) -> None:
             )
             env.update(build_external_runner_env(run_record.version_selection))
             env.update(trace_environment)
+            env.pop("MEMORY_BENCH_PROFILING_CONFIG", None)
+            if profiling_config is not None:
+                if args.benchmark == "production-http-replay" and entrypoint.entrypoint_id == "replay":
+                    env["MEMORY_BENCH_PROFILING_CONFIG"] = str(args.profiling_config.resolve())
+                else:
+                    from .profiling_run import mark_phase_unavailable, prepare_phase_sink
+                    if profiling_config.mode == "required":
+                        raise ValueError("phase_boundary_unavailable")
+                    mark_phase_unavailable(prepare_phase_sink(profiling_config, run_dir, run_record.run_id))
             monitor.start_background_sampling()
             try:
                 runner_result = execute_external_runner(
@@ -1424,6 +1464,17 @@ def main(argv: list[str] | None = None) -> None:
             )
             raise
 
+    phase_sink = None
+    profile_trace_cursor = None
+    profile_trace_started = None
+    if profiling_config is not None:
+        from .profiling_run import prepare_phase_sink
+        phase_sink = prepare_phase_sink(profiling_config, run_dir, run_record.run_id)
+        if profiling_config.internal_trace.source == "file":
+            from .profiling_trace_import import _stage_map, capture_trace_cursor
+            _stage_map(profiling_config.internal_trace.stage_map)
+            profile_trace_cursor = capture_trace_cursor(profiling_config.internal_trace.path)
+            profile_trace_started = datetime.now(timezone.utc)
     monitor = ResourceMonitor(run_dir / "artifacts" / "monitor", Path.cwd(), "/", "lo")
     monitor.setup_writers()
     monitor.start_background_sampling()
@@ -1452,6 +1503,8 @@ def main(argv: list[str] | None = None) -> None:
                 steps=steps,
                 execution_spec=execution_spec,
                 run_dir=run_dir,
+                phase_sink=phase_sink,
+                target_ids=list(phase_sink.session.targets) if phase_sink else None,
             )
     except Exception as exc:
         execution_error = exc
@@ -1472,6 +1525,19 @@ def main(argv: list[str] | None = None) -> None:
             if token_usage.enabled():
                 token_usage.best_effort(token_usage.rebuild, run_dir)
             monitor.stop_background_sampling()
+            if profile_trace_cursor is not None:
+                try:
+                    from .profiling_trace_import import TraceRunScope, import_trace
+                    import_trace(profiling_config.internal_trace.path, profile_trace_cursor,
+                        TraceRunScope(run_record.run_id,
+                            {target.physical_instance_id for target in phase_sink.session.targets.values()},
+                            set(), set(), profile_trace_started, datetime.now(timezone.utc),
+                            profiling_config.internal_trace.max_raw_bytes),
+                        profiling_config.internal_trace.stage_map, run_dir)
+                except Exception as exc:
+                    if execution_error is None:
+                        execution_error = exc
+                        execution_traceback = traceback.format_exc()
             if trace_runtime is not None:
                 try:
                     trace_verification_payload, trace_metric_rows = _stop_and_archive_trace_runtime(

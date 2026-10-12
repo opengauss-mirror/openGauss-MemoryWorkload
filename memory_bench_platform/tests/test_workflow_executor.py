@@ -2,6 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import urllib.error
 
+import pytest
+
 from memory_bench_platform.protocol import (
     CaseRecord,
     ExecutionSpec,
@@ -10,6 +12,78 @@ from memory_bench_platform.protocol import (
     WorkflowRuntimeContext,
 )
 from memory_bench_platform.workflow import execute_cases
+
+
+def test_workflow_profiles_true_contiguous_memory_stages(monkeypatch, tmp_path: Path):
+    from memory_bench_platform import workflow
+
+    calls = []
+    class Sink:
+        session = SimpleNamespace(config=SimpleNamespace(phases=["ingest", "recall"], mode="best_effort"))
+        def run_phase(self, phase, targets, operation, **kwargs):
+            calls.append(("start", phase, targets))
+            result = operation()
+            calls.append(("stop", phase, kwargs["request_count"]()))
+            return result
+
+    def fake_case(**kwargs):
+        calls.append(("case", kwargs["case"].case_id))
+        return {"_execution_status": "passed", "_failure_kind": None, "_judge_job": None,
+                "step_results": [], "traces": [], "judge_results": [], "metrics": [], "artifacts": []}
+
+    monkeypatch.setattr(workflow, "_execute_case", fake_case)
+    cases = [CaseRecord(case_id=f"c{n}", run_id="r", title="case", goal="goal",
+                        capability="memory/question-answering", reference={}) for n in range(3)]
+    steps = [StepRecord(step_id=f"s{n}", case_id=f"c{n}", name="memory", operator_kind="memory",
+                        inputs={"action": "ingest" if n < 2 else "recall", "content": "fact"})
+             for n in range(3)]
+    execute_cases(run_id="r", agent_id="generic-cli", memory_id="openviking",
+                  cases=cases, steps=steps, execution_spec=ExecutionSpec(), run_dir=tmp_path,
+                  phase_sink=Sink(), target_ids=["memory"])
+    assert calls == [("start", "ingest", ["memory"]), ("case", "c0"), ("case", "c1"),
+                     ("stop", "ingest", 2), ("start", "recall", ["memory"]),
+                     ("case", "c2"), ("stop", "recall", 1)]
+
+
+@pytest.mark.parametrize("actions, phases", [
+    (["ingest", "recall", "ingest"], ["ingest", "recall"]),
+    (["ingest"], ["setup", "ingest"]),
+])
+def test_required_profile_rejects_unmeasurable_phases_before_requests(
+    monkeypatch, tmp_path: Path, actions, phases
+):
+    from memory_bench_platform import workflow
+
+    executed = []
+    class Session:
+        config = SimpleNamespace(phases=phases, mode="required")
+        targets = {"memory": object()}
+        handles = {}
+        def _persist(self):
+            pass
+    class Sink:
+        session = Session()
+        invalid_profile = False
+        def run_phase(self, phase, targets, operation, **kwargs):
+            return operation()
+    sink = Sink()
+    def fake_case(**kwargs):
+        executed.append(kwargs["case"].case_id)
+        return {"_execution_status": "passed", "_failure_kind": None, "_judge_job": None,
+                "step_results": [], "traces": [], "judge_results": [], "metrics": [], "artifacts": []}
+    monkeypatch.setattr(workflow, "_execute_case", fake_case)
+    cases = [CaseRecord(case_id=f"c{n}", run_id="r", title="case", goal="goal",
+                        capability="memory/question-answering", reference={})
+             for n in range(len(actions))]
+    steps = [StepRecord(step_id=f"s{n}", case_id=f"c{n}", name="memory", operator_kind="memory",
+                        inputs={"action": action, "content": "fact"})
+             for n, action in enumerate(actions)]
+    with pytest.raises(RuntimeError, match="phase_boundary_unavailable"):
+        execute_cases(run_id="r", agent_id="generic-cli", memory_id="openviking",
+                      cases=cases, steps=steps, execution_spec=ExecutionSpec(), run_dir=tmp_path,
+                      phase_sink=sink, target_ids=["memory"])
+    assert executed == []
+    assert sink.invalid_profile is True
 
 
 def test_workflow_retries_failed_step(monkeypatch, tmp_path: Path):

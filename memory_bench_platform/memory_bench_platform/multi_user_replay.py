@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections import deque
@@ -18,6 +19,11 @@ from .multi_user_config import MultiUserConfig, identity, preflight, replay_modu
 from .multi_user_report import RequestEvent, summarize, write_reports
 from .multi_user_runtime import InstanceRuntime
 from .protocol import RenderedTaskInput
+from .profiling_config import ProfilingConfig
+from .profiling_perf import ProfilerSession
+from .profiling_phase import PhaseSink
+from .profiling_targets import TargetIdentity, resolve_targets
+from .profiling_trace_import import TraceRunScope, _stage_map, capture_trace_cursor, import_trace
 
 
 def _snapshot(config, run_id):
@@ -86,6 +92,7 @@ class Replay:
     def __init__(self, config, output_dir, run_id, environments):
         self.config, self.output_dir, self.run_id = config, output_dir, run_id
         self.origin = time.monotonic()
+        self.origin_utc = datetime.now(timezone.utc)
         self.runtimes = {name: InstanceRuntime(name, config.instances[name], env, run_id, output_dir,
                          [u for u in config.users if u.instance == name]) for name, env in environments.items()}
         self.setup_ms = {}
@@ -93,6 +100,7 @@ class Replay:
         self.events = []
         self.windows = {}
         self.interrupted = False
+        self.profile_invalid = False
 
     def records(self, user, operation):
         uid = identity(self.run_id, user.id)
@@ -321,7 +329,7 @@ class Replay:
         status = "completed" if all(u["status"] == "completed" for u in users.values()) else "failed"
         if any(r.cleanup_failed for r in self.runtimes.values()): status = "failed"
         return {"schema": "multi-user-report/1", "run_id": self.run_id, "mode": self.config.mode,
-            "model_mode": self.config.model_mode, "status": "interrupted" if self.interrupted else status,
+            "model_mode": self.config.model_mode, "status": "invalid_profile" if self.profile_invalid else "interrupted" if self.interrupted else status,
             "latency_kind": "agent_end_to_end" if self.config.mode == "openclaw" else "memory_call_including_add_settle",
             "users": users, "instances": instances,
             "overall": {op: summarize(self.events, op, self.windows.get(op, 0)) for op in operations},
@@ -329,7 +337,8 @@ class Replay:
             "limitations": ["internal_stages_unavailable", "quality_unavailable", "hardware_collectors_skipped", "tokens_unavailable"]}
 
 
-def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
+def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str, *,
+                   profiling_config: ProfilingConfig | None = None):
     from pydantic import TypeAdapter
     from .multi_user_config import Alias
     TypeAdapter(Alias).validate_python(run_id)
@@ -338,8 +347,32 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
         config = _snapshot_workloads(config, Path(temporary))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=False)
-        (output_dir / "run_config.json").write_text(json.dumps(_snapshot(config, run_id), indent=2), encoding="utf-8")
+        snapshot = _snapshot(config, run_id)
+        if profiling_config is not None:
+            snapshot["profiling"] = {"mode": profiling_config.mode,
+                "hardware": profiling_config.hardware.model_dump(),
+                "quality_gates": profiling_config.quality_gates.model_dump()}
         replay = Replay(config, output_dir, run_id, environments)
+        snapshot["request_time_origin_utc"] = replay.origin_utc.isoformat()
+        (output_dir / "run_config.json").write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        sink = None
+        cursor = None
+        if profiling_config is not None:
+            explicit = []
+            for name, instance in config.instances.items():
+                if name not in replay.runtimes:
+                    continue
+                identity_spec = profiling_config.external_targets.get(name)
+                explicit.append(TargetIdentity(name, "memory" if instance.kind == "memory" else "agent",
+                    name, instance.deployment,
+                    cgroup_path=identity_spec.cgroup_path if identity_spec else None,
+                    host_pid=identity_spec.host_pid if identity_spec else None,
+                    cpu_scope=identity_spec.cpu_scope if identity_spec else None))
+            targets = resolve_targets(profiling_config, None, explicit)
+            sink = PhaseSink(output_dir, run_id, ProfilerSession(profiling_config, targets, output_dir))
+            if profiling_config.internal_trace.source == "file":
+                _stage_map(profiling_config.internal_trace.stage_map)
+                cursor = capture_trace_cursor(profiling_config.internal_trace.path)
         try:
             with (output_dir / "request_events.jsonl").open("w", encoding="utf-8") as stream:
                 for name, runtime in replay.runtimes.items():
@@ -351,19 +384,57 @@ def run_multi_user(config: MultiUserConfig, output_dir: Path, run_id: str):
                         runtime.state = "setup_failed"
                     finally:
                         replay.setup_ms[name] = (time.monotonic()-started)*1000
-                replay.phase("add", stream)
-                if config.mode == "openclaw": replay.phase("drain", stream)
+                def measured(operation, phase, applicable=True):
+                    if sink is None or phase not in profiling_config.phases:
+                        if applicable: replay.phase(operation, stream)
+                        return
+                    before = len(replay.events)
+                    ids = [target.target_id for target in sink.session.targets.values()
+                           if replay.runtimes[target.physical_instance_id].state == "ready"]
+                    sink.run_phase(phase, ids,
+                        lambda: replay.phase(operation, stream) if applicable else None,
+                        applicable=applicable,
+                        request_count=lambda: len(replay.events) - before)
+                    if profiling_config.mode == "required" and sink.invalid_profile:
+                        replay.profile_invalid = True
+                        raise RuntimeError("invalid_profile")
+                measured("add", "ingest")
+                measured("drain", "drain", config.mode == "openclaw")
                 for runtime in replay.runtimes.values():
                     if runtime.state == "ready":
                         try: runtime.set_phase("qa")
                         except Exception: runtime.state = "phase_failed"
-                replay.phase("search", stream)
+                measured("search", "recall")
         except BaseException:
-            replay.interrupted = True
+            replay.interrupted = not replay.profile_invalid
             raise
         finally:
+            replay_failed = sys.exc_info()[0] is not None
             for runtime in reversed(list(replay.runtimes.values())):
                 try: runtime.stop()
                 except Exception: runtime.cleanup_failed = True
+            trace_error = None
+            if cursor is not None:
+                try:
+                    now = datetime.now(timezone.utc)
+                    events = replay.events
+                    import_trace(profiling_config.internal_trace.path, cursor,
+                        TraceRunScope(run_id, set(replay.runtimes),
+                            {identity(run_id, user.id) for user in config.users},
+                            {event["request_id"] for event in events},
+                            datetime.fromisoformat(snapshot["started_at"]), now,
+                            profiling_config.internal_trace.max_raw_bytes),
+                        profiling_config.internal_trace.stage_map, output_dir)
+                except Exception as exc:
+                    trace_error = exc
+                finally:
+                    if cursor.stream is not None:
+                        cursor.stream.close()
+            if trace_error is not None and profiling_config.mode == "required":
+                replay.profile_invalid = True
             report = write_reports(output_dir, replay.report())
+            if trace_error is not None:
+                if not replay_failed:
+                    raise trace_error
+                print(f"trace import also failed: {trace_error}", file=sys.stderr)
         return report

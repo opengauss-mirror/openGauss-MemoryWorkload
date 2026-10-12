@@ -6,6 +6,7 @@ import hashlib
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -29,7 +30,8 @@ def _invoke_native(argv: list[str], *, env: dict[str, str], cwd: Path) -> int:
 
 
 def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: DockerClient,
-                   invoke: Callable[..., int] = _invoke_native) -> int:
+                   invoke: Callable[..., int] = _invoke_native,
+                   profiling_config: Path | None = None) -> int:
     store = DeploymentStore(cwd)
     store.acquire_lock(name)
     try:
@@ -79,6 +81,14 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                         "--run-id", f"{suite_id}-{combo.id}"]
                 if combo.entrypoint:
                     argv += ["--entrypoint", combo.entrypoint]
+                if profiling_config is not None:
+                    from .profiling_config import load_profiling_config
+                    from .profiling_targets import resolve_targets
+                    profile = load_profiling_config(profiling_config)
+                    scoped = state.model_copy(update={"containers": {group.project_key: state.containers[group.project_key]}})
+                    targets = resolve_targets(profile, scoped, [], docker=docker)
+                    env["MEMORY_BENCH_PROFILE_TARGETS"] = json.dumps([asdict(target) for target in targets])
+                    argv += ["--profiling-config", str(profiling_config)]
                 record = {"combination": combo.id, "memory_instance": group.memory_instance_id,
                           "run_id": f"{suite_id}-{combo.id}", "status": "pending"}
                 summary["combinations"].append(record)

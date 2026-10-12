@@ -699,6 +699,183 @@ def test_cli_workload_config_runs_and_analyzes(tmp_path, monkeypatch, memory_ada
               "--workload-config", str(path), "--data-path", str(tmp_path)])
 
 
+def test_multi_user_analyze_profiles_without_run_json(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_report import import_report
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    assert not (out / "run.json").exists()
+    (out / "profiling").mkdir()
+    (out / "target_registry.json").write_text(json.dumps({"schema": "target-registry/1",
+        "targets": [{"target_id": "memory-i", "physical_instance_id": "i"}]}))
+    (out / "phase_events.jsonl").write_text(json.dumps({
+        "schema": "phase-event/1", "run_id": "r", "target_id": "memory-i", "phase_id": "ingest",
+        "start_utc": "2026-01-01T00:00:00+00:00", "end_utc": "2026-01-01T00:00:01+00:00",
+        "start_monotonic_ns": 1, "end_monotonic_ns": 1000000001,
+        "state": "completed", "request_count": 0, "warmup": False}) + "\n")
+    (out / "profiling" / "collector_status.json").write_text(json.dumps({
+        "schema": "collector-status/1", "items": [{"target_id": "memory-i", "phase_id": "ingest",
+        "state": "skipped", "reason": "unsupported_platform"}]}))
+    import_report(out)
+    assert (out / "reports" / "profiling_analysis.json").exists()
+    assert "profiling_analysis.html" in (out / "report.html").read_text()
+    assert "profiling" not in json.loads((out / "summary.json").read_text())
+
+
+def test_invalid_multi_user_binding_blocks_profile_report(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_report import import_report
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r")
+    first, *rest = (out / "request_events.jsonl").read_text().splitlines()
+    changed = json.loads(first)
+    changed["instance_id"] = "wrong"
+    (out / "request_events.jsonl").write_text("\n".join([json.dumps(changed), *rest]) + "\n")
+    (out / "profiling").mkdir()
+    with pytest.raises(ValueError, match="invalid multi-user report"):
+        import_report(out)
+    assert not (out / "reports" / "profiling_analysis.json").exists()
+
+
+def test_backend_direct_phases_ingest_and_recall(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.profiling_config import ProfilingConfig
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    profile = ProfilingConfig.model_validate({"schema": "profiling/1", "targets": ["i"]})
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r", profiling_config=profile)
+    phases = [json.loads(line) for line in (out / "phase_events.jsonl").read_text().splitlines()]
+    assert [(p["phase_id"], p["target_id"]) for p in phases] == [("ingest", "i"), ("drain", "i"), ("recall", "i")]
+    assert phases[1]["state"] == "not_applicable"
+    status = json.loads((out / "profiling" / "collector_status.json").read_text())
+    assert all(item["state"] == "skipped" for item in status["items"])
+    from memory_bench_platform.profiling_analysis import analyze_profiling_archive
+    report = analyze_profiling_archive(out)
+    assert report.summary["phases"]["i:ingest"]["count"] >= 1
+
+
+def test_profile_selection_does_not_collect_unselected_ingest(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.profiling_config import ProfilingConfig
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    profile = ProfilingConfig.model_validate({"schema": "profiling/1", "targets": ["i"],
+                                              "phases": ["recall"]})
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r", profiling_config=profile)
+    assert [json.loads(line)["phase_id"] for line in (out / "phase_events.jsonl").read_text().splitlines()] == ["recall"]
+
+
+def test_required_profile_blocks_formal_requests(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.profiling_config import ProfilingConfig
+    path, _ = config_file(tmp_path)
+    sent = []
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: sent.append(1))
+    profile = ProfilingConfig.model_validate({"schema": "profiling/1", "targets": ["i"], "mode": "required"})
+    with pytest.raises(RuntimeError):
+        run_multi_user(load_config(path), tmp_path / "out", "r", profiling_config=profile)
+    assert sent == []
+    assert (tmp_path / "out" / "request_events.jsonl").read_text() == ""
+
+
+def test_run_cli_accepts_profiling_config_for_multi_user(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import integration
+    from memory_bench_platform.cli import main
+    from memory_bench_platform.protocol import MemoryTaskOutput
+    path, _ = config_file(tmp_path)
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(yaml.safe_dump({"schema": "profiling/1", "targets": ["i"]}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(integration, "run_memory_task", lambda *a, **kw: MemoryTaskOutput(
+        status="ok", state="completed", operation={"session_id": "s"}))
+    main(["run", "--benchmark", "production-http-replay", "--agent", "none",
+          "--workload-config", str(path), "--profiling-config", str(profile), "--run-id", "r"])
+    assert (tmp_path / "runs" / "r" / "phase_events.jsonl").exists()
+
+
+def test_openclaw_profile_has_drain_phase(tmp_path, monkeypatch):
+    from memory_bench_platform import multi_user_replay
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import Replay, run_multi_user
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.profiling_config import ProfilingConfig
+    path, _ = config_file(tmp_path, mode="openclaw")
+    monkeypatch.setattr(multi_user_replay, "preflight", lambda config: {"i": {}})
+    monkeypatch.setattr(InstanceRuntime, "start", lambda self: setattr(self, "state", "ready"))
+    monkeypatch.setattr(InstanceRuntime, "set_phase", lambda self, phase: None)
+    monkeypatch.setattr(InstanceRuntime, "stop", lambda self: None)
+    monkeypatch.setattr(Replay, "phase", lambda self, operation, stream: None)
+    profile = ProfilingConfig.model_validate({"schema": "profiling/1", "targets": ["i"]})
+    out = tmp_path / "out"
+    run_multi_user(load_config(path), out, "r", profiling_config=profile)
+    phases = [json.loads(line)["phase_id"] for line in (out / "phase_events.jsonl").read_text().splitlines()]
+    assert phases == ["ingest", "drain", "recall"]
+
+
+def test_profile_setup_interrupt_keeps_empty_event_log(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import run_multi_user
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.profiling_config import ProfilingConfig
+    path, _ = config_file(tmp_path)
+    monkeypatch.setattr(InstanceRuntime, "start", lambda self: (_ for _ in ()).throw(KeyboardInterrupt()))
+    profile = ProfilingConfig.model_validate({"schema": "profiling/1", "targets": ["i"]})
+    out = tmp_path / "out"
+    with pytest.raises(KeyboardInterrupt):
+        run_multi_user(load_config(path), out, "r", profiling_config=profile)
+    assert (out / "request_events.jsonl").read_text() == ""
+    assert (out / "profiling" / "collector_status.json").exists()
+
+
+def test_trace_failure_does_not_mask_multi_user_failure(tmp_path, monkeypatch, memory_adapter):
+    from memory_bench_platform import multi_user_replay
+    from memory_bench_platform.multi_user_config import load_config
+    from memory_bench_platform.multi_user_replay import Replay, run_multi_user
+    from memory_bench_platform.multi_user_runtime import InstanceRuntime
+    from memory_bench_platform.profiling_config import ProfilingConfig
+    path, _ = config_file(tmp_path)
+    source = tmp_path / "memory.log"
+    source.write_text("")
+    stage_map = tmp_path / "stage-map.json"
+    stage_map.write_text(json.dumps({"schema": "stage-map/1", "stages": {}}))
+    profile = ProfilingConfig.model_validate({"schema": "profiling/1", "targets": ["i"],
+        "internal_trace": {"source": "file", "path": str(source), "stage_map": str(stage_map)}})
+    monkeypatch.setattr(InstanceRuntime, "start", lambda self: setattr(self, "state", "ready"))
+    monkeypatch.setattr(InstanceRuntime, "stop", lambda self: None)
+    monkeypatch.setattr(Replay, "phase", lambda self, operation, stream:
+                        (_ for _ in ()).throw(RuntimeError("replay failed")))
+    monkeypatch.setattr(multi_user_replay, "import_trace", lambda *_args, **_kwargs:
+                        (_ for _ in ()).throw(RuntimeError("trace failed")))
+    out = tmp_path / "out"
+    with pytest.raises(RuntimeError, match="replay failed"):
+        run_multi_user(load_config(path), out, "r", profiling_config=profile)
+    assert json.loads((out / "summary.json").read_text())["status"] == "interrupted"
+
+
 def test_import_rejects_unknown_nested_fields(tmp_path, monkeypatch, memory_adapter):
     from memory_bench_platform import integration
     from memory_bench_platform.multi_user_config import load_config
