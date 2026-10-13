@@ -71,9 +71,15 @@ def probe(backend, run_dir, *, ready_timeout=120, invoke=None):
                 if call("status", {"operation": operation}, timeout=remaining).state == "completed":
                     break
                 time.sleep(min(1, max(0, deadline - time.monotonic())))
-        recalled = call("recall", {"query": "Which city does Nora live in?", "node_limit": 3})
-        if recalled.state != "completed" or "hangzhou" not in str(recalled.output.get("evidence_text", "")).lower():
-            raise RuntimeError("Written fact was not recovered in completed recall evidence")
+        deadline = time.monotonic() + ready_timeout
+        while True:
+            recalled = call("recall", {"query": "Which city does Nora live in?", "node_limit": 3},
+                            timeout=max(0.001, deadline - time.monotonic()))
+            if recalled.state == "completed" and "hangzhou" in str(recalled.output.get("evidence_text", "")).lower():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Written fact was not recovered in completed recall evidence")
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
         isolated = call("recall", {"scope_id": run_id + ":empty", "query": "Which city does Nora live in?", "node_limit": 3})
         if isolated.state != "completed" or isolated.output.get("evidence_text") or isolated.output.get("memories"):
             raise RuntimeError("Empty episode recall was not completed and empty")

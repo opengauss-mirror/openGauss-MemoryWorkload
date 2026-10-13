@@ -161,11 +161,15 @@ def test_case_results_use_expected_step_id_without_case_prefix():
         case_id="case-1",
         passed=True,
         score=1.0,
+        retry_count=1,
+        attempt_errors=["TimeoutError"],
     )
 
     rows = _extract_case_result_rows([case], [judge], [step_result])
 
     assert rows[0]["response"] == "expected"
+    assert rows[0]["retry_count"] == 1
+    assert rows[0]["attempt_errors"] == ["TimeoutError"]
 
 
 def test_case_results_extract_retrieval_evidence():

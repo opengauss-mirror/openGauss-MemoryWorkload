@@ -3,6 +3,7 @@ import json
 import pytest
 import yaml
 
+from memory_bench_platform.deployment_compose import render_project
 from memory_bench_platform.deployment_config import (
     apply_config_overrides,
     load_deployment,
@@ -53,6 +54,52 @@ def test_shared_memory_group_is_resolved_once(tmp_path):
     assert groups[0].combination_ids == ("claw-common", "worker-common")
     assert groups[0].shared_memory_instance_id == "mem0-common"
     assert groups[0].memory_template.skill == "mem0"
+
+
+def test_deployment_uses_configured_network_subnets(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["network_subnets"] = {"mem0-common": {
+        "storage_net": "10.253.246.0/28",
+        "agent_net_claw_common": "10.253.247.0/28",
+    }}
+    path.write_text(yaml.safe_dump(raw))
+    group, = resolve_groups(load_deployment(path))
+    project = render_project(group, "suite", {})
+    assert project["networks"]["storage_net"]["ipam"]["config"] == [{"subnet": "10.253.246.0/28"}]
+    assert project["networks"]["agent_net_claw_common"]["ipam"]["config"] == [{"subnet": "10.253.247.0/28"}]
+    assert project["networks"]["agent_net_worker_common"] == {}
+
+
+def test_deployment_rejects_overlapping_network_subnets(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["network_subnets"] = {"mem0-common": {
+        "storage_net": "10.253.246.0/28",
+        "agent_net_claw_common": "10.253.246.0/28",
+    }}
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="overlapping network subnets"):
+        load_deployment(path)
+
+
+@pytest.mark.parametrize("subnet", ["10.253.246.0/31", "10.253.246.1/32"])
+def test_deployment_rejects_subnet_without_container_capacity(tmp_path, subnet):
+    path, raw = fixture_config(tmp_path)
+    raw["network_subnets"] = {"mem0-common": {"agent_net_claw_common": subnet}}
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="network subnet too small: mem0-common/agent_net_claw_common"):
+        load_deployment(path)
+
+
+def test_deployment_checks_actual_storage_members(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["vectors"] = {"vec": {"image": {"name": "example/vector:1"},
+                             "container_port": 19530, "healthcheck": ["CMD", "true"]}}
+    raw["shared_memory_instances"]["mem0-common"]["vector"] = "vec"
+    raw["memories"]["mem0"]["service_endpoints"] = {"VECTOR_URL": "vector"}
+    raw["network_subnets"] = {"mem0-common": {"storage_net": "10.253.246.0/30"}}
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="network subnet too small: mem0-common/storage_net"):
+        load_deployment(path)
 
 
 @pytest.mark.parametrize("successes", [0, -1])

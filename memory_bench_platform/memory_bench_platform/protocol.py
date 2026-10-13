@@ -330,6 +330,8 @@ class JudgeResult(BaseModel):
     label: str | None = None
     passed: bool | None = None
     rationale: str | None = None
+    retry_count: int = 0
+    attempt_errors: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     raw_output_ref: str | None = None
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import re
 from pathlib import Path
 from typing import Literal
@@ -34,6 +35,7 @@ class ConfigFile(StrictModel):
     source: Path
     target: str
     format: Literal["json", "yaml"]
+    mode: Literal["0600", "0644"] = "0600"
     parameters: dict[str, Parameter]
 
 
@@ -169,6 +171,7 @@ class DeploymentConfig(StrictModel):
     gateway_pools: dict[str, GatewayPool] = Field(default_factory=dict)
     shared_memory_instances: dict[str, SharedMemory] = Field(default_factory=dict)
     combinations: list[Combination]
+    network_subnets: dict[str, dict[str, str]] = Field(default_factory=dict)
     pressure_tests: list[dict] = Field(default_factory=list)
     source_path: Path | None = Field(default=None, exclude=True)
     agent_config_overrides: dict[str, dict[str, object]] = Field(default_factory=dict, exclude=True)
@@ -179,6 +182,7 @@ class DeploymentGroup(StrictModel):
     project_key: str
     source_root: Path
     combination_ids: tuple[str, ...]
+    network_subnets: dict[str, str] = Field(default_factory=dict)
     shared_memory_instance_id: str | None
     combinations: tuple[Combination, ...]
     agents: dict[str, Service]
@@ -331,6 +335,26 @@ def load_deployment(path: Path) -> DeploymentConfig:
         memory_id = combo.memory or config.shared_memory_instances[combo.memory_instance].memory
         resolve_run_skill_bundle(combo.benchmark, config.agents[combo.agent].skill,
                                  config.memories[memory_id].skill, combo.memory_integration)
+    group_combos: dict[str, list[Combination]] = {}
+    for combo in config.combinations:
+        group_combos.setdefault(combo.memory_instance or combo.id, []).append(combo)
+    selected_subnets: list[ipaddress.IPv4Network] = []
+    for group_id, networks in config.network_subnets.items():
+        if group_id not in group_combos:
+            raise ValueError(f"unknown network subnet group: {group_id}")
+        allowed = {"storage_net", *("agent_net_" + combo.id.replace("-", "_") for combo in group_combos[group_id])}
+        for name, value in networks.items():
+            if name not in allowed:
+                raise ValueError(f"unknown network subnet: {group_id}/{name}")
+            try:
+                subnet = ipaddress.ip_network(value, strict=True)
+            except ValueError as exc:
+                raise ValueError(f"invalid network subnet: {group_id}/{name}") from exc
+            if not isinstance(subnet, ipaddress.IPv4Network):
+                raise ValueError(f"invalid network subnet: {group_id}/{name}")
+            if any(subnet.overlaps(other) for other in selected_subnets):
+                raise ValueError("overlapping network subnets")
+            selected_subnets.append(subnet)
     physical_names: dict[str, set[str]] = {}
     for combo in config.combinations:
         group_key = combo.memory_instance or combo.id
@@ -398,6 +422,16 @@ def load_deployment(path: Path) -> DeploymentConfig:
                     raise ValueError("shared preparation target cannot be agent")
                 if shared and preparation is shared.preparation and step.target == "mock" and not shared.mock:
                     raise ValueError("shared preparation target requires shared mock")
+    if config.network_subnets:
+        from .deployment_compose import render_project
+        for group in resolve_groups(config):
+            if not group.network_subnets:
+                continue
+            services = render_project(group, config.name, {})["services"]
+            for name, value in group.network_subnets.items():
+                members = sum(name in service["networks"] for service in services.values())
+                if ipaddress.ip_network(value).num_addresses - 3 < members:
+                    raise ValueError(f"network subnet too small: {group.project_key}/{name}")
     return config
 
 
@@ -441,6 +475,7 @@ def resolve_groups(config: DeploymentConfig) -> tuple[DeploymentGroup, ...]:
         memory_mock_id = shared.mock if shared else combos[0].mock
         groups.append(DeploymentGroup(
             project_key=key, source_root=config.source_path.parent, combination_ids=tuple(c.id for c in combos),
+            network_subnets=config.network_subnets.get(key, {}),
             shared_memory_instance_id=key if shared else None, combinations=tuple(combos),
             agents={c.id: config.agents[c.agent] for c in combos},
             gateway_pools={c.id: config.gateway_pools[c.gateway_pool] for c in combos if c.gateway_pool},

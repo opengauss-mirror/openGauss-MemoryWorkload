@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
+import urllib.error
 import urllib.request
 
 from .protocol import JudgeInput, JudgeResult
@@ -240,6 +242,7 @@ def run_llm_judge(
 
     api_format = str(runtime_config.get("api_format") or "openai").strip().lower()
     timeout = float(runtime_config.get("timeout_seconds") or 60)
+    deadline = time.monotonic() + timeout
     max_tokens = int(runtime_config.get("max_tokens") or os.environ.get("MEMORY_BENCH_JUDGE_MAX_TOKENS", "256"))
     try:
         prompt = _judge_prompt(runtime_config, judge_input, actual)
@@ -293,9 +296,25 @@ def run_llm_judge(
         method="POST",
     )
     opener = urlopen or urllib.request.urlopen
+    attempts = 0
+    attempt_errors: list[str] = []
     try:
-        with opener(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8") or "{}")
+        for attempt in range(3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("judge deadline exceeded")
+            try:
+                attempts += 1
+                with opener(request, timeout=remaining) as response:
+                    payload = json.loads(response.read().decode("utf-8") or "{}")
+                break
+            except (TimeoutError, urllib.error.URLError) as exc:
+                attempt_errors.append(f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError)
+                                      else type(exc).__name__)
+                retryable = not isinstance(exc, urllib.error.HTTPError) or exc.code in {429, 500, 502, 503, 504}
+                if not retryable or attempt == 2:
+                    raise
+                time.sleep(min(attempt + 1, max(0, deadline - time.monotonic())))
         content = _llm_response_text(payload, api_format)
         passed, rationale = _parse_llm_grade(content)
     except Exception as exc:
@@ -307,6 +326,8 @@ def run_llm_judge(
             label="judge-error",
             passed=None,
             rationale=f"LLM judge failed: {type(exc).__name__}: {exc}",
+            retry_count=max(0, attempts - 1),
+            attempt_errors=attempt_errors,
         )
 
     return JudgeResult(
@@ -317,4 +338,6 @@ def run_llm_judge(
         label="correct" if passed else "wrong",
         passed=passed,
         rationale=rationale or ("LLM judge marked the answer correct." if passed else "LLM judge marked the answer wrong."),
+        retry_count=max(0, attempts - 1),
+        attempt_errors=attempt_errors,
     )

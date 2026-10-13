@@ -47,7 +47,8 @@ def test_summary_excludes_ungraded_judge_failures_from_benchmark_score():
         )
     ]
     judges = [
-        JudgeResult(judge_id="q1", run_id="run-1", case_id="q1", passed=True, score=1.0),
+        JudgeResult(judge_id="q1", run_id="run-1", case_id="q1", passed=True, score=1.0,
+                    retry_count=1, attempt_errors=["URLError"]),
         JudgeResult(
             judge_id="q2",
             run_id="run-1",
@@ -55,6 +56,8 @@ def test_summary_excludes_ungraded_judge_failures_from_benchmark_score():
             passed=None,
             score=None,
             label="judge-error",
+            retry_count=2,
+            attempt_errors=["TimeoutError", "HTTP 502", "TimeoutError"],
         ),
     ]
 
@@ -69,6 +72,8 @@ def test_summary_excludes_ungraded_judge_failures_from_benchmark_score():
     assert summary["evaluation_coverage"] == 0.5
     assert summary["checkpoint_ready_rate"] == 1.0
     assert summary["readiness_latency_ms"] == 125.0
+    assert summary["judge_retry_count"] == 3
+    assert summary["judge_retried_cases"] == 2
 
     invalid = _apply_native_run_validity(summary)
     assert invalid["run_validity"]["valid"] is False

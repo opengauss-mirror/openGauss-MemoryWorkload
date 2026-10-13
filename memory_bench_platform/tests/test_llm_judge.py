@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sys
+from urllib.error import URLError
 
+from memory_bench_platform import judges
 from memory_bench_platform.judges import run_llm_judge
 from memory_bench_platform.protocol import JudgeInput
 from skills.benchmarks.locomo.scripts import score_predictions
@@ -86,7 +88,7 @@ def test_llm_judge_uses_semantic_grade(monkeypatch):
     assert result.label == "correct"
     assert result.rationale == "The two date formats are equivalent."
     assert captured["url"] == "https://judge.example/v1/chat/completions"
-    assert captured["timeout"] == 12
+    assert 0 < captured["timeout"] <= 12
     assert captured["body"]["model"] == "judge-model"
     assert "7 May 2023" in captured["body"]["messages"][1]["content"]
     assert "May 7, 2023" in captured["body"]["messages"][1]["content"]
@@ -145,6 +147,56 @@ def test_llm_judge_timeout_is_ungraded(monkeypatch):
     assert result.passed is None
     assert result.score is None
     assert result.label == "judge-error"
+
+
+def test_llm_judge_retries_transient_transport_failure(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+    calls = 0
+
+    def opener(request, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise URLError("handshake timed out")
+        return _FakeResponse({"choices": [{"message": {"content": '{"is_correct":"CORRECT"}'}}]})
+
+    result = run_llm_judge(
+        "run-1", _input(),
+        runtime_config={"profile": "locomo_qa@1", "env": {
+            "api_key": "TEST_JUDGE_KEY", "base_url": "TEST_JUDGE_URL", "model": "TEST_JUDGE_MODEL"}},
+        urlopen=opener,
+    )
+    assert result.passed is True
+    assert calls == 2
+    assert result.retry_count == 1
+    assert result.attempt_errors == ["URLError"]
+
+
+def test_llm_judge_timeout_is_total_budget(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+    clock = {"now": 0.0}
+    timeouts = []
+    monkeypatch.setattr(judges.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(judges.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+
+    def opener(request, timeout):
+        timeouts.append(timeout)
+        clock["now"] += timeout
+        raise TimeoutError("judge timed out")
+
+    result = run_llm_judge(
+        "run-1", _input(), runtime_config={"profile": "locomo_qa@1", "timeout_seconds": 3,
+            "env": {"api_key": "TEST_JUDGE_KEY", "base_url": "TEST_JUDGE_URL", "model": "TEST_JUDGE_MODEL"}},
+        urlopen=opener,
+    )
+    assert timeouts == [3]
+    assert result.label == "judge-error"
+    assert result.retry_count == 0
+    assert result.attempt_errors == ["TimeoutError"]
 
 
 def test_longmemeval_prompt_uses_question_type(monkeypatch):

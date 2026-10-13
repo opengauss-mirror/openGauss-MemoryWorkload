@@ -39,6 +39,25 @@ def test_agent_free_lifecycle_and_isolation(tmp_path):
     assert (tmp_path / "probe/probe.json").exists()
 
 
+def test_probe_waits_for_written_fact_to_be_searchable(tmp_path, monkeypatch):
+    invoke, requests = fake_backend()
+    recalls = 0
+
+    def delayed_recall(request):
+        nonlocal recalls
+        result = invoke(request)
+        if request.action == "recall" and not request.inputs["scope_id"].endswith(":empty"):
+            recalls += 1
+            if recalls == 1:
+                result["output"] = {"evidence_text": ""}
+        return result
+
+    monkeypatch.setattr("memory_bench_platform.memory_probe.time.sleep", lambda _: None)
+    report = probe("mem0", tmp_path / "probe", invoke=delayed_recall, ready_timeout=1)
+    assert report["status"] == "passed"
+    assert [r.action for r in requests] == ["ingest", "recall", "recall", "recall"]
+
+
 @pytest.mark.parametrize("options", [{"leak": True}, {"fail_flush": True}, {"pending": True}])
 def test_failures_are_recorded_without_write_retries(tmp_path, options):
     invoke, requests = fake_backend(**options)

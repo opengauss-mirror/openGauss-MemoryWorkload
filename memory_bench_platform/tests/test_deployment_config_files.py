@@ -24,3 +24,14 @@ def test_shared_memory_uses_one_copy_and_sources_stay_unchanged(tmp_path):
     assert len(mounts["memory"]) == 1
     assert agent_copy.parent.stat().st_mode & 0o777 == 0o700
     assert agent_copy.stat().st_mode & 0o777 == 0o600
+
+
+def test_nonroot_service_can_read_opted_in_config_copy(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["agents"]["claw"]["config_files"]["runtime"]["mode"] = "0644"
+    path.write_text(yaml.safe_dump(raw))
+    group, = resolve_groups(load_deployment(path))
+    mounts = prepare_instance_configs(group, tmp_path / "generated")
+    agent_copy = Path(mounts["agent_claw_common"][0]["source"])
+    assert agent_copy.stat().st_mode & 0o777 == 0o644
+    assert agent_copy.parent.stat().st_mode & 0o777 == 0o700
