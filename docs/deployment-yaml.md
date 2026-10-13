@@ -90,7 +90,7 @@ combinations:
 
 默认配置副本权限为 `0600`。以非 root 用户运行的容器可在对应 `config_files` 项中设置 `mode: '0644'`；生成目录仍为 `0700`，副本只读挂载，但容器内其他用户也能读取该文件。仅在文件不含明文凭据时使用。
 
-Docker 默认地址池耗尽时，可用 `network_subnets` 给每个组合组的网络指定未占用的 IPv4 网段。例如 `network_subnets: {claw-mem0: {storage_net: 10.253.246.0/28, agent_net_claw_mem0: 10.253.247.0/28}}`。组键为组合 ID（共享记忆时为共享实例 ID），Agent 网络名由组合 ID 中的 `-` 转为 `_`。未指定的网络仍由 Docker 自动分配；配置校验会拒绝未知网络、无效网段和配置内重叠网段。
+Docker 默认地址池耗尽时，可用 `network_subnets` 给每个组合组的网络指定未占用的 IPv4 网段。例如 `network_subnets: {claw-mem0: {storage_net: 10.253.246.0/28, agent_net_claw_mem0: 10.253.247.0/28}}`。组键为组合 ID（共享记忆时为共享实例 ID），Agent 网络名由组合 ID 中的 `-` 转为 `_`。未指定的网络仍由 Docker 自动分配；配置校验会拒绝未知网络、无效网段、配置内重叠网段，以及扣除网络地址、广播地址和网关地址后不足以容纳实际服务数的网段。
 
 可选的 `vectors`、`graphs`、`mocks` 与组合中的 `vector`、`graph`、`mock` 引用按需要创建。数据库模板使用与服务相同的 `image`、`container_port`、`healthcheck`、`state_mounts` 和 `resources` 字段。Mock 模板使用 `endpoints` 声明命名端口，例如 `chat`、`embedding`；被组合或共享记忆实例选中的 Mock 会启动，顶层未被选中的 Mock 模板不会启动。服务通过 `service_endpoints` 的 `mock.chat` 等名字接入其端点。记忆系统引用向量库或图数据库时，必须声明对应 `service_endpoints`。Agent 插件模式须声明 `memory` 引用。宿主端口只绑定 127.0.0.1，部署后查询实际端口。
 

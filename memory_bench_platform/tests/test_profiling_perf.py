@@ -19,15 +19,21 @@ def _target():
 
 
 def test_parse_perf_stat_with_cgroup_column():
-    rows = _parse_stat("1415458982;;cycles;docker/cid;505794240;100.00;2.799;GHz\n")
+    rows = _parse_stat("1415458982;;cycles;docker/cid;505794240;100.00;2.799;GHz\n", has_cgroup=True)
     assert rows[0]["value"] == 1415458982
     assert rows[0]["event_runtime"] == 505794240
     assert rows[0]["running_fraction"] == 1.0
 
 
+def test_parse_perf_stat_with_numeric_cgroup_name():
+    rows = _parse_stat("100;;cycles;123;1000000000;100.00\n", has_cgroup=True)
+    assert rows[0]["event_runtime"] == 1000000000
+    assert rows[0]["running_fraction"] == 1.0
+
+
 class FakeProcess:
     pid = 1234
-    def __init__(self, stderr="1000;;cycles;1000;100.00\n500;;instructions;1000;100.00\n"):
+    def __init__(self, stderr="1000;;cycles;test;1000;100.00\n500;;instructions;test;1000;100.00\n"):
         self.stderr = stderr
         self.signaled = False
 
@@ -107,7 +113,7 @@ def test_counter_running_below_090_invalid(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_perf
     monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
     session = ProfilerSession(_config(), [_target()], tmp_path,
-        command_factory=lambda *a, **k: FakeProcess("1000;;cycles;1000;50.00\n"),
+        command_factory=lambda *a, **k: FakeProcess("1000;;cycles;test;1000;50.00\n"),
         probe=lambda target, config: CapabilityResult("ready", None, "basic"))
     status = session.stop_phase(session.start_phase("ingest", ["memory-i"]))
     assert status[0].state == "invalid" and status[0].reason == "low_running_fraction"
@@ -153,7 +159,7 @@ def test_timeout_kills_process_group_descendants(tmp_path):
 def test_topdown_l1_writes_four_valid_shares(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_perf
     monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
-    raw = "".join(f"{count};;{event};1000;100.00;{share};%\n"
+    raw = "".join(f"{count};;{event};test;1000;100.00;{share};%\n"
                   for count, event, share in (
                       (1000, "topdown-fe-bound", 20),
                       (2000, "topdown-bad-spec", 30),
@@ -174,7 +180,7 @@ def test_topdown_l1_writes_four_valid_shares(tmp_path, monkeypatch):
 def test_topdown_does_not_treat_counter_values_as_percentages(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_perf
     monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
-    raw = "".join(f"25;;{event};1000;100.00\n" for event in (
+    raw = "".join(f"25;;{event};test;1000;100.00\n" for event in (
         "topdown-fe-bound", "topdown-bad-spec", "topdown-be-bound", "topdown-retiring"))
     session = ProfilerSession(_config(hardware={"stat": "topdown_l1"}), [_target()], tmp_path,
         command_factory=lambda *a, **k: FakeProcess(raw),
@@ -186,7 +192,7 @@ def test_topdown_does_not_treat_counter_values_as_percentages(tmp_path, monkeypa
 def test_topdown_slot_counts_are_normalized_when_metric_is_absent(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_perf
     monkeypatch.setattr(profiling_perf.os, "killpg", lambda pid, sig: None)
-    raw = "".join(f"{count};slots;{event};1000;100.00\n"
+    raw = "".join(f"{count};slots;{event};test;1000;100.00\n"
                   for count, event in ((1000, "topdown-fe-bound"),
                                        (2000, "topdown-bad-spec"),
                                        (3000, "topdown-be-bound"),

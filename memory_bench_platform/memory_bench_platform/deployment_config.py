@@ -422,6 +422,16 @@ def load_deployment(path: Path) -> DeploymentConfig:
                     raise ValueError("shared preparation target cannot be agent")
                 if shared and preparation is shared.preparation and step.target == "mock" and not shared.mock:
                     raise ValueError("shared preparation target requires shared mock")
+    if config.network_subnets:
+        from .deployment_compose import render_project
+        for group in resolve_groups(config):
+            if not group.network_subnets:
+                continue
+            services = render_project(group, config.name, {})["services"]
+            for name, value in group.network_subnets.items():
+                members = sum(name in service["networks"] for service in services.values())
+                if ipaddress.ip_network(value).num_addresses - 3 < members:
+                    raise ValueError(f"network subnet too small: {group.project_key}/{name}")
     return config
 
 

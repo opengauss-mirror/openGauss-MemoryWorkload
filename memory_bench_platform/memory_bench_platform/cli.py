@@ -340,6 +340,8 @@ def _extract_case_result_rows(cases: list[CaseRecord], judge_results: list, step
                 "passed": judge.passed,
                 "score": judge.score,
                 "rationale": judge.rationale,
+                "retry_count": judge.retry_count,
+                "attempt_errors": judge.attempt_errors,
             }
         )
     return rows
@@ -432,6 +434,8 @@ def _summarize_native_evaluation(
         "case_passed": passed_cases,
         "case_failed": failed_cases,
         "case_ungraded": ungraded_cases,
+        "judge_retry_count": sum(item.retry_count for item in judge_results),
+        "judge_retried_cases": sum(item.retry_count > 0 for item in judge_results),
         "benchmark_score": raw_benchmark_score,
         "raw_benchmark_score": raw_benchmark_score,
         "evaluation_coverage": evaluation_coverage,

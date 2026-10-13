@@ -182,7 +182,7 @@ class ProfilerSession:
                     handle.state, handle.reason = "invalid", "raw_size_limit"
             if handle.state == "running":
                 try:
-                    counters = _parse_stat(raw)
+                    counters = _parse_stat(raw, has_cgroup=True)
                 except ValueError:
                     handle.state, handle.reason = "invalid", "unparseable_counter"
                 else:
@@ -274,7 +274,7 @@ class ProfilerSession:
         return True
 
 
-def _parse_stat(raw: str) -> list[dict]:
+def _parse_stat(raw: str, *, has_cgroup: bool = False) -> list[dict]:
     result = []
     for line in raw.splitlines():
         parts = line.split(";")
@@ -284,12 +284,7 @@ def _parse_stat(raw: str) -> list[dict]:
         if "not supported" in value or "not counted" in value:
             raise ValueError("unsupported counter")
         try:
-            runtime_index = 3
-            if len(parts) > 3 and parts[3]:
-                try:
-                    float(parts[3])
-                except ValueError:
-                    runtime_index = 4  # perf adds a cgroup column after the event name
+            runtime_index = 4 if has_cgroup else 3
             fraction_index = runtime_index + 1
             fraction = float(parts[fraction_index].rstrip("%")) / 100 if len(parts) > fraction_index and parts[fraction_index] else 1.0
             row = {"event": event, "unit": parts[1].strip(), "value": float(value), "running_fraction": fraction,
