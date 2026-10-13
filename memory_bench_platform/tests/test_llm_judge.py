@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from urllib.error import URLError
 
 from memory_bench_platform.judges import run_llm_judge
 from memory_bench_platform.protocol import JudgeInput
@@ -145,6 +146,29 @@ def test_llm_judge_timeout_is_ungraded(monkeypatch):
     assert result.passed is None
     assert result.score is None
     assert result.label == "judge-error"
+
+
+def test_llm_judge_retries_transient_transport_failure(monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
+    monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
+    monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
+    calls = 0
+
+    def opener(request, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise URLError("handshake timed out")
+        return _FakeResponse({"choices": [{"message": {"content": '{"is_correct":"CORRECT"}'}}]})
+
+    result = run_llm_judge(
+        "run-1", _input(),
+        runtime_config={"profile": "locomo_qa@1", "env": {
+            "api_key": "TEST_JUDGE_KEY", "base_url": "TEST_JUDGE_URL", "model": "TEST_JUDGE_MODEL"}},
+        urlopen=opener,
+    )
+    assert result.passed is True
+    assert calls == 2
 
 
 def test_longmemeval_prompt_uses_question_type(monkeypatch):

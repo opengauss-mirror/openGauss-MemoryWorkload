@@ -15,7 +15,7 @@ from typing import Callable
 
 from .profiling_archive import CollectorStatus
 from .profiling_config import ProfilingConfig
-from .profiling_targets import CapabilityResult, TargetIdentity, probe_target, target_drifted
+from .profiling_targets import CapabilityResult, TargetIdentity, perf_cgroup_name, probe_target, target_drifted
 
 
 @dataclass
@@ -78,8 +78,8 @@ class ProfilerSession:
                     continue
                 events = ("cycles,instructions,task-clock,cache-misses,branches,branch-misses" if capability.event_group == "basic" else
                           "topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound")
-                argv = ["perf", "stat", "-x", ";", "--no-big-num", "-a", "-G", target.cgroup_path,
-                        "-e", events, "--", "sleep", "infinity"]
+                argv = ["perf", "stat", "-x", ";", "--no-big-num", "-a", "-e", events,
+                        "-G", perf_cgroup_name(target.cgroup_path), "--", "sleep", "infinity"]
                 try:
                     handle.process = self.command_factory(argv, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -90,7 +90,7 @@ class ProfilerSession:
                         raw_dir = self.root / "raw" / target_id / phase_id
                         raw_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                         record_path = raw_dir / "perf.data"
-                        record_argv = ["perf", "record", "-a", "-G", target.cgroup_path,
+                        record_argv = ["perf", "record", "-a", "-e", "cycles", "-G", perf_cgroup_name(target.cgroup_path),
                                        "-o", str(record_path), "--", "sleep", "infinity"]
                         handle.record_process = self.command_factory(record_argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -284,11 +284,19 @@ def _parse_stat(raw: str) -> list[dict]:
         if "not supported" in value or "not counted" in value:
             raise ValueError("unsupported counter")
         try:
-            fraction = float(parts[4].rstrip("%")) / 100 if len(parts) > 4 and parts[4] else 1.0
+            runtime_index = 3
+            if len(parts) > 3 and parts[3]:
+                try:
+                    float(parts[3])
+                except ValueError:
+                    runtime_index = 4  # perf adds a cgroup column after the event name
+            fraction_index = runtime_index + 1
+            fraction = float(parts[fraction_index].rstrip("%")) / 100 if len(parts) > fraction_index and parts[fraction_index] else 1.0
             row = {"event": event, "unit": parts[1].strip(), "value": float(value), "running_fraction": fraction,
-                   "event_runtime": float(parts[3]) if len(parts) > 3 and parts[3] else None}
-            if (len(parts) > 6 and parts[5] and parts[6].strip().lower() in {"%", "percent"}):
-                row["metric_percent"] = float(parts[5])
+                   "event_runtime": float(parts[runtime_index]) if len(parts) > runtime_index and parts[runtime_index] else None}
+            if (len(parts) > fraction_index + 2 and parts[fraction_index + 1]
+                    and parts[fraction_index + 2].strip().lower() in {"%", "percent"}):
+                row["metric_percent"] = float(parts[fraction_index + 1])
             if not all(math.isfinite(number) for number in row.values() if isinstance(number, float)):
                 raise ValueError("invalid perf stat row")
             result.append(row)

@@ -88,6 +88,8 @@ def render_project(group: DeploymentGroup, deployment_name: str,
     volumes: dict[str, object] = {}
     agent_networks = {id_: "agent_net_" + id_.replace("-", "_") for id_ in group.combination_ids}
     networks.update({network: {} for network in agent_networks.values()})
+    for name, subnet in group.network_subnets.items():
+        networks[name] = {"ipam": {"config": [{"subnet": subnet}]}}
     memory_networks = [*agent_networks.values(), "storage_net"]
     independent_mock = group.memory_mock_template if not group.shared_memory_instance_id else None
     mock_memory_name = "mock_memory" if group.shared_memory_instance_id else "mock"

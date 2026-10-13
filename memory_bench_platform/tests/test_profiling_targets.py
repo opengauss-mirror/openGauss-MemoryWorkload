@@ -1,6 +1,6 @@
 from memory_bench_platform.deployment_store import DeploymentState
 from memory_bench_platform.profiling_config import ProfilingConfig
-from memory_bench_platform.profiling_targets import TargetIdentity, probe_target, resolve_targets
+from memory_bench_platform.profiling_targets import TargetIdentity, _cgroup_for_pid, perf_cgroup_name, probe_target, resolve_targets
 
 
 def _config(**kwargs):
@@ -70,3 +70,12 @@ def test_external_pid_must_belong_to_declared_cgroup(monkeypatch):
                         lambda pid: "/sys/fs/cgroup/actual")
     result = probe_target(target, _config(), None)
     assert result.state == "invalid" and result.reason == "target_identity_mismatch"
+
+
+def test_cgroup_v1_perf_event_identity(monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "read_text", lambda self, **kwargs: "12:perf_event:/docker/cid\n11:cpu:/docker/cid\n")
+    monkeypatch.setattr(Path, "is_dir", lambda self: True)
+    path = _cgroup_for_pid(42)
+    assert path == "/sys/fs/cgroup/perf_event/docker/cid"
+    assert perf_cgroup_name(path) == "docker/cid"

@@ -56,6 +56,19 @@ def test_reanalysis_rebuilds_same_report(tmp_path):
     assert "Overall" in (run / "reports" / "profiling_analysis.html").read_text()
 
 
+def test_not_applicable_drain_does_not_mark_hardware_incomplete(tmp_path):
+    run = _fixture(tmp_path)
+    with (run / "phase_events.jsonl").open("a") as stream:
+        stream.write(json.dumps({
+            "schema": "phase-event/1", "run_id": "run1", "target_id": "memory-i", "phase_id": "drain",
+            "start_utc": "2026-01-01T00:00:01+00:00", "end_utc": "2026-01-01T00:00:01+00:00",
+            "start_monotonic_ns": 1000000010, "end_monotonic_ns": 1000000010,
+            "state": "not_applicable", "request_count": 0, "warmup": False}) + "\n")
+    report = analyze_profiling_archive(run)
+    assert report.summary["collector_coverage"]["rate"] == 1.0
+    assert "hardware_incomplete" not in report.summary["limitations"]
+
+
 def test_counter_running_below_090_invalid(tmp_path):
     report = analyze_profiling_archive(_fixture(tmp_path, running="0.50"))
     assert report.summary["hardware"]["memory-i:ingest"]["state"] == "invalid"

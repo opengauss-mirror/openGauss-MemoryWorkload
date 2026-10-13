@@ -38,9 +38,11 @@ def _copy_service(service: Service, root: Path, destination: Path, overrides: di
         destination.chmod(0o700)
         output = destination / f"{key}.{config_file.format}"
         serialized = (json.dumps(data, ensure_ascii=False, indent=2) + "\n") if config_file.format == "json" else yaml.safe_dump(data, allow_unicode=True)
-        descriptor = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        mode = int(config_file.mode, 8)
+        descriptor = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(serialized)
+        output.chmod(mode)
         mounts.append({"type": "bind", "source": str(output), "target": config_file.target, "read_only": True})
     return mounts
 

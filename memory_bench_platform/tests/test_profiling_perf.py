@@ -6,7 +6,7 @@ import time
 import pytest
 
 from memory_bench_platform.profiling_config import ProfilingConfig
-from memory_bench_platform.profiling_perf import ProfilerSession
+from memory_bench_platform.profiling_perf import ProfilerSession, _parse_stat
 from memory_bench_platform.profiling_targets import CapabilityResult, TargetIdentity
 
 
@@ -16,6 +16,13 @@ def _config(**changes):
 
 def _target():
     return TargetIdentity("memory-i", "memory", "i", "external", cgroup_path="/sys/fs/cgroup/test", cpu_scope="0-3")
+
+
+def test_parse_perf_stat_with_cgroup_column():
+    rows = _parse_stat("1415458982;;cycles;docker/cid;505794240;100.00;2.799;GHz\n")
+    assert rows[0]["value"] == 1415458982
+    assert rows[0]["event_runtime"] == 505794240
+    assert rows[0]["running_fraction"] == 1.0
 
 
 class FakeProcess:

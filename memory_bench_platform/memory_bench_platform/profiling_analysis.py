@@ -215,7 +215,7 @@ def analyze_profiling_archive(run_dir: Path) -> ProfilingAnalysis | None:
     measured = len([phase for phase in archive.phases if phase.state != "not_applicable"])
     completed = sum(item.get("state") == "completed" for item in hardware.values())
     degraded = sorted({item.get("reason") or item["state"] for item in hardware.values()
-                       if item.get("state") != "completed"})
+                       if item.get("state") != "completed" and item.get("reason") != "not_applicable"})
     summary = {"schema": "profiling-analysis/1", "run_id": archive.phases[0].run_id if archive.phases else None,
                "model_mode": _model_mode(run_dir),
                "phases": _phase_metrics(archive, clients), "overall": overall, "hardware": hardware,

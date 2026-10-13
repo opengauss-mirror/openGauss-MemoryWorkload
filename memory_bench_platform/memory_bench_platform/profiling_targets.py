@@ -81,7 +81,15 @@ def _cgroup_for_pid(pid: int) -> str | None:
             relative = line.split("::", 1)[1].lstrip("/")
             candidate = Path("/sys/fs/cgroup") / relative
             return str(candidate) if candidate.is_dir() else None
+        fields = line.split(":", 2)
+        if len(fields) == 3 and "perf_event" in fields[1].split(","):
+            candidate = Path("/sys/fs/cgroup/perf_event") / fields[2].lstrip("/")
+            return str(candidate) if candidate.is_dir() else None
     return None
+
+
+def perf_cgroup_name(path: str) -> str:
+    return path.removeprefix("/sys/fs/cgroup/perf_event/").removeprefix("/sys/fs/cgroup/")
 
 
 def _changed(target: TargetIdentity, docker) -> bool:
@@ -123,7 +131,7 @@ def probe_target(target: TargetIdentity, config: ProfilingConfig, docker=None,
         if version.returncode != 0:
             return CapabilityResult("skipped", "perf_unavailable")
         events = "cycles,instructions,task-clock,cache-misses,branches,branch-misses" if config.hardware.stat == "basic" else "topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound"
-        probe = command([perf, "stat", "-a", "-G", str(cgroup), "-e", events, "--", "sleep", "0.01"],
+        probe = command([perf, "stat", "-a", "-e", events, "-G", perf_cgroup_name(str(cgroup)), "--", "sleep", "0.01"],
                         capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return CapabilityResult("skipped", "perf_probe_failed")

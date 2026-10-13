@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
+import urllib.error
 import urllib.request
 
 from .protocol import JudgeInput, JudgeResult
@@ -294,8 +296,16 @@ def run_llm_judge(
     )
     opener = urlopen or urllib.request.urlopen
     try:
-        with opener(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8") or "{}")
+        for attempt in range(3):
+            try:
+                with opener(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8") or "{}")
+                break
+            except (TimeoutError, urllib.error.URLError) as exc:
+                retryable = not isinstance(exc, urllib.error.HTTPError) or exc.code in {429, 500, 502, 503, 504}
+                if not retryable or attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
         content = _llm_response_text(payload, api_format)
         passed, rationale = _parse_llm_grade(content)
     except Exception as exc:
