@@ -105,6 +105,43 @@ def test_iter_records_preserves_payload_and_replaces_only_empty_user(tmp_path: P
     assert record.top_level_fields == ("messages", "user_id")
 
 
+def test_mem0_sample_adapter_maps_real_dialogue_and_search(tmp_path: Path):
+    add, search = _valid_dataset(tmp_path)
+    _write_row(add, {"user_id": "", "conversation_id": "c1", "messages": [
+        {"role": "user", "content": "A long user message"},
+        {"role": "assistant", "content": "A reply"},
+    ]})
+    _write_row(search, {"user_id": "", "query": "What was said?", "memory_limit_number": 7})
+    module = _module()
+    config = module.ReplayConfig(data_path=tmp_path, output_dir=tmp_path / "out", run_id="run-7",
+                                 memory_id="mem0", agent_id="generic-cli", adapter_mode="mem0-sample")
+    add_record = next(module.iter_replay_records(add, "add", config.run_id))
+    search_record = next(module.iter_replay_records(search, "search", config.run_id))
+    ingest = module._task_input(config, add_record, "ingest")
+    recall = module._task_input(config, search_record, "recall")
+    assert ingest.inputs["scope_id"] == recall.inputs["scope_id"]
+    assert "user: A long user message" in ingest.inputs["content"]
+    assert "assistant: A reply" in ingest.inputs["content"]
+    assert recall.inputs["query"] == "What was said?"
+    assert recall.inputs["top_k"] == 7
+    assert ingest.inputs["request_id"] == add_record.request_id
+    assert "raw_request" not in ingest.inputs
+
+
+def test_mem0_sample_capture_and_replay_keep_identity_with_shared_namespace(tmp_path: Path):
+    add, _ = _valid_dataset(tmp_path)
+    _write_row(add, {"user_id": "", "messages": [{"role": "user", "content": "hello"}]})
+    module = _module()
+    scopes = []
+    for run_id in ("capture", "replay"):
+        config = module.ReplayConfig(data_path=tmp_path, output_dir=tmp_path / run_id,
+                                     run_id=run_id, memory_id="mem0", agent_id="generic-cli",
+                                     adapter_mode="mem0-sample", identity_namespace="sample-20")
+        record = next(module.iter_replay_records(add, "add", run_id))
+        scopes.append(module._task_input(config, record, "ingest").inputs["scope_id"])
+    assert scopes[0] == scopes[1]
+
+
 def test_iter_records_preserves_nonempty_user_and_stable_hash(tmp_path: Path):
     path = tmp_path / "openmem_search_sample.jsonl"
     _write_row(path, {"query": "needle", "user_id": "existing"})
