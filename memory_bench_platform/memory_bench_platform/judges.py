@@ -286,7 +286,7 @@ def run_llm_judge(
             "max_tokens": max_tokens,
         }
 
-    user_agent = os.environ.get("MEMORY_BENCH_JUDGE_USER_AGENT")
+    user_agent = os.environ.get("MEMORY_BENCH_JUDGE_USER_AGENT", "memory-bench/1")
     if user_agent:
         headers["User-Agent"] = user_agent
     request = urllib.request.Request(

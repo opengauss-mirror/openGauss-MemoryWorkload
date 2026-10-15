@@ -42,12 +42,14 @@ def _input() -> JudgeInput:
 
 
 def test_llm_judge_uses_semantic_grade(monkeypatch):
+    monkeypatch.delenv("MEMORY_BENCH_JUDGE_USER_AGENT", raising=False)
     monkeypatch.setenv("TEST_JUDGE_KEY", "secret")
     monkeypatch.setenv("TEST_JUDGE_URL", "https://judge.example/v1")
     monkeypatch.setenv("TEST_JUDGE_MODEL", "judge-model")
     captured = {}
 
     def fake_urlopen(request, timeout):
+        captured["user_agent"] = request.get_header("User-agent")
         captured["url"] = request.full_url
         captured["timeout"] = timeout
         captured["body"] = json.loads(request.data.decode("utf-8"))
@@ -90,6 +92,7 @@ def test_llm_judge_uses_semantic_grade(monkeypatch):
     assert captured["url"] == "https://judge.example/v1/chat/completions"
     assert 0 < captured["timeout"] <= 12
     assert captured["body"]["model"] == "judge-model"
+    assert captured["user_agent"] == "memory-bench/1"
     assert "7 May 2023" in captured["body"]["messages"][1]["content"]
     assert "May 7, 2023" in captured["body"]["messages"][1]["content"]
 
