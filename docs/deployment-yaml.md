@@ -86,6 +86,19 @@ combinations:
 
 `deploy` 给三个 Gateway 分别生成配置副本和 state 卷，并在其健康后启动 Pool；`run --deployment ... --combination claw-mem0` 访问 Pool 的宿主回环端口。`--agent-config 'claw-mem0:log_level="debug"'` 对三个副本应用相同的允许字段覆盖。每个组合拥有独立 Pool；即使多个组合共用记忆实例，也不会共用 Pool 的用户分配表。部署和运行会核对 Pool 上游、容器重启及配置漂移；报告只保留脱敏的用户分配和各上游请求量。未配置 `gateway_pool` 的组合仍使用一个 Agent 容器。启用 Pool 的组合不能使用指向 Agent 容器的 `preparation.seed` 或 `preparation.warmup` 命令，因为容器内命令不会经过 Pool。当前 `pressure_tests` 仍由部署命令拒绝，多用户压测需要单独实现。
 
+### OpenClaw IPv4 提供方域名
+
+若 OpenClaw 容器所在网络只能访问 IPv4，而模型提供方域名同时返回 A 和 AAAA 记录，可在对应 Agent 模板中显式设置域名列表：
+
+```yaml
+agents:
+  claw:
+    environment:
+      MEMORY_BENCH_IPV4_ONLY_HOSTS: codex.example.com,embedding.example.com
+```
+
+设置后，`deploy` 将仓库中的 `skills/agents/openclaw/scripts/ipv4_provider_dns.cjs` 只读挂载到每个 OpenClaw 容器的 `/opt/memory-bench/ipv4_provider_dns.cjs`，并在已有 `NODE_OPTIONS` 后追加 `--require=/opt/memory-bench/ipv4_provider_dns.cjs`。Node 启动时会预加载脚本，仅对列表中的域名强制 IPv4 查询；未配置时不会挂载或预加载。部署后可检查生成的 Compose 配置中该容器的 `environment.NODE_OPTIONS` 和 `volumes`，并在容器内运行 `node -e 'require("node:dns").lookup("codex.example.com", {all:true}, (error, addresses) => { if (error) throw error; console.log(addresses) })'` 验证返回的地址族。域名应替换为实际提供方域名，且该域名需要有可用的 A 记录。
+
 `image.archive` 可省略；指定时先执行 `docker load`，再检查镜像名。当前不校验 archive SHA256 或架构。相对路径以部署 YAML 所在目录为基准。`config_files` 只支持 JSON/YAML、已有字段的 RFC 6901 路径，以及 `string`、`integer`、`number`、`boolean` 四种标量类型。每个物理实例的配置副本只读挂载到容器，原文件不变。生成目录默认位于当前工作目录的 `.memory-bench/deployments/<name>/`，清理部署时删除。
 
 默认配置副本权限为 `0600`。以非 root 用户运行的容器可在对应 `config_files` 项中设置 `mode: '0644'`；生成目录仍为 `0700`，副本只读挂载，但容器内其他用户也能读取该文件。仅在文件不含明文凭据时使用。

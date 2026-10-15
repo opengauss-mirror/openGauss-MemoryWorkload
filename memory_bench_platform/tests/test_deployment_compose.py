@@ -1,3 +1,9 @@
+import json
+import os
+import shutil
+import subprocess
+import yaml
+
 from memory_bench_platform.deployment_config import apply_config_overrides, load_deployment, resolve_groups
 from memory_bench_platform.deployment_config_files import prepare_instance_configs
 from memory_bench_platform.deployment_compose import render_project, required_resources
@@ -16,6 +22,46 @@ def pooled_fixture(tmp_path):
     raw["combinations"][0].update(gateway_pool="pool", agent_replicas=3)
     path.write_text(yaml.safe_dump(raw))
     return path, raw
+
+
+def test_openclaw_ipv4_dns_config_reaches_node_lookup(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["agents"]["claw"]["environment"] = {
+        "MEMORY_BENCH_IPV4_ONLY_HOSTS": "provider.example",
+        "NODE_OPTIONS": "--max-old-space-size=256",
+    }
+    path.write_text(yaml.safe_dump(raw))
+    group = resolve_groups(load_deployment(path))[0]
+    agent = render_project(group, "suite", {})["services"]["agent_claw_common"]
+    other = render_project(group, "suite", {})["services"]["agent_worker_common"]
+    mount, = [volume for volume in agent["volumes"] if volume["target"].endswith("ipv4_provider_dns.cjs")]
+    assert mount["read_only"] is True
+    assert agent["environment"]["NODE_OPTIONS"] == f"--max-old-space-size=256 --require={mount['target']}"
+    assert "NODE_OPTIONS" not in other["environment"]
+
+    if shutil.which("node") is None:
+        return
+    preload = tmp_path / "probe.cjs"
+    preload.write_text("""
+const dns = require('node:dns');
+global.dnsCalls = [];
+dns.lookup = (host, options, callback) => {
+  global.dnsCalls.push([host, options]);
+  callback(null, '127.0.0.1', 4);
+};
+""")
+    probe = """
+const dns = require('node:dns');
+dns.lookup('provider.example', {}, () => {});
+dns.lookup('other.example', {}, () => {});
+process.stdout.write(JSON.stringify(global.dnsCalls));
+"""
+    node_options = agent["environment"]["NODE_OPTIONS"].replace(mount["target"], mount["source"])
+    env = {**os.environ, **agent["environment"], "NODE_OPTIONS": f"--require={preload} {node_options}"}
+    result = subprocess.run(["node", "-e", probe], env=env, text=True, capture_output=True, check=True)
+    calls = json.loads(result.stdout)
+    assert calls[0][1]["family"] == 4
+    assert "family" not in calls[1][1]
 
 
 def test_shared_project_rendering_and_resource_count(tmp_path):

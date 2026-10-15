@@ -6,6 +6,10 @@ import hashlib
 from pathlib import Path
 
 from .deployment_config import DeploymentGroup, Service
+from .paths import SKILLS_ROOT
+
+
+_OPENCLAW_DNS_SCRIPT = "/opt/memory-bench/ipv4_provider_dns.cjs"
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,12 @@ def _service(template: Service, root: Path, mounts: list[dict[str, object]], net
     if ports:
         result["ports"] = ports
     volumes = list(mounts)
+    if template.skill == "openclaw" and result["environment"].get("MEMORY_BENCH_IPV4_ONLY_HOSTS"):
+        script = SKILLS_ROOT / "agents/openclaw/scripts/ipv4_provider_dns.cjs"
+        volumes.append({"type": "bind", "source": str(script.resolve()),
+                        "target": _OPENCLAW_DNS_SCRIPT, "read_only": True})
+        options = result["environment"].get("NODE_OPTIONS", "").strip()
+        result["environment"]["NODE_OPTIONS"] = f"{options} --require={_OPENCLAW_DNS_SCRIPT}".strip()
     for mount in template.config_mounts:
         volumes.append({"type": "bind", "source": str((root / mount.source).resolve()),
                         "target": mount.target, "read_only": True})
