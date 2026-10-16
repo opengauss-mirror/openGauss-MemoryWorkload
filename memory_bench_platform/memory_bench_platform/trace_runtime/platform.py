@@ -117,8 +117,8 @@ def build_trace_runtime_config(
                 default_match, default_scope = DEFAULT_MATCHING[protocol]
                 channels[str(name)] = TraceChannelConfig(
                     protocol=protocol,
-                    match_mode=default_match,
-                    order_scope=default_scope,
+                    match_mode=dependency.get("match_mode", default_match),
+                    order_scope=dependency.get("order_scope", default_scope),
                 )
     if not channels:
         raise ValueError("trace runtime requires at least one channel")

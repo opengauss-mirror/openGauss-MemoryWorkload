@@ -17,6 +17,7 @@ SCRIPT = (
     / "skills/benchmarks/production-http-replay/scripts/run_replay.py"
 )
 VALIDATE_SCRIPT = SCRIPT.with_name("validate.py")
+MEM0_VALIDATE_SCRIPT = SCRIPT.parents[2] / "production-mem0-sample/scripts/validate.py"
 
 
 def _module():
@@ -103,6 +104,116 @@ def test_iter_records_preserves_payload_and_replaces_only_empty_user(tmp_path: P
     assert record.request_id.startswith("add-000001-")
     assert record.payload_size_bytes > 0
     assert record.top_level_fields == ("messages", "user_id")
+
+
+def test_mem0_sample_adapter_maps_real_dialogue_and_search(tmp_path: Path):
+    add, search = _valid_dataset(tmp_path)
+    _write_row(add, {"user_id": "", "conversation_id": "c1", "messages": [
+        {"role": "user", "content": "A long user message"},
+        {"role": "assistant", "content": "A reply"},
+    ]})
+    _write_row(search, {"user_id": "", "query": "What was said?", "memory_limit_number": 7})
+    module = _module()
+    config = module.ReplayConfig(data_path=tmp_path, output_dir=tmp_path / "out", run_id="run-7",
+                                 memory_id="mem0", agent_id="generic-cli", adapter_mode="mem0-sample")
+    add_record = next(module.iter_replay_records(add, "add", config.run_id))
+    search_record = next(module.iter_replay_records(search, "search", config.run_id))
+    ingest = module._task_input(config, add_record, "ingest")
+    recall = module._task_input(config, search_record, "recall")
+    assert ingest.inputs["scope_id"] == recall.inputs["scope_id"]
+    assert "user: A long user message" in ingest.inputs["content"]
+    assert "assistant: A reply" in ingest.inputs["content"]
+    assert recall.inputs["query"] == "What was said?"
+    assert recall.inputs["top_k"] == 7
+    assert ingest.inputs["request_id"] == add_record.request_id
+    assert "raw_request" not in ingest.inputs
+
+
+def test_mem0_sample_capture_and_replay_keep_identity_with_shared_namespace(tmp_path: Path):
+    add, _ = _valid_dataset(tmp_path)
+    _write_row(add, {"user_id": "", "messages": [{"role": "user", "content": "hello"}]})
+    module = _module()
+    scopes = []
+    for run_id in ("capture", "replay"):
+        config = module.ReplayConfig(data_path=tmp_path, output_dir=tmp_path / run_id,
+                                     run_id=run_id, memory_id="mem0", agent_id="generic-cli",
+                                     adapter_mode="mem0-sample", identity_namespace="sample-20")
+        record = next(module.iter_replay_records(add, "add", run_id))
+        scopes.append(module._task_input(config, record, "ingest").inputs["scope_id"])
+    assert scopes[0] == scopes[1]
+
+
+def test_mem0_sample_mixed_users_keep_add_search_scopes_isolated(tmp_path: Path):
+    add, search = _valid_dataset(tmp_path)
+    users = ["", "anonymous", "replay-run-7", "a:b", "a:b:c", '["empty"]']
+    for path, operation in ((add, "add"), (search, "search")):
+        path.write_text("".join(json.dumps({"request": {
+            "user_id": user, **({"messages": [{"role": "user", "content": "hello"}]}
+                              if operation == "add" else {"query": "hello"})
+        }}) + "\n" for user in users), encoding="utf-8")
+    module = _module()
+    config = module.ReplayConfig(data_path=tmp_path, output_dir=tmp_path / "out", run_id="run-7",
+                                 memory_id="mem0", agent_id="generic-cli", adapter_mode="mem0-sample")
+    add_scopes = [module._task_input(config, row, "ingest").inputs["scope_id"]
+                  for row in module.iter_replay_records(add, "add", config.run_id)]
+    search_scopes = [module._task_input(config, row, "recall").inputs["scope_id"]
+                     for row in module.iter_replay_records(search, "search", config.run_id)]
+    assert add_scopes == search_scopes
+    assert len(set(add_scopes)) == len(users)
+
+
+@pytest.mark.parametrize(("operation", "invalid"), [
+    ("add", {"messages": []}),
+    ("add", {"messages": [{"role": "user", "content": 42}]}),
+    ("add", {"messages": [{"role": "bot", "content": "hello"}]}),
+    ("add", {"messages": [{"role": "user", "content": ""}]}),
+    ("add", {"messages": [{"role": "user", "content": " \t\n"}]}),
+    ("search", {"query": " "}),
+    ("search", {"query": 42}),
+    ("search", {"query": "hello", "memory_limit_number": 0}),
+    ("search", {"query": "hello", "memory_limit_number": True}),
+    ("search", {"query": "hello", "memory_limit_number": 2.5}),
+])
+def test_mem0_sample_validation_rejects_bad_mapping_before_any_write(
+    tmp_path: Path, operation: str, invalid: dict
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    add = data / "sample_add.jsonl"
+    search = data / "sample_search.jsonl"
+    valid_add = {"user_id": "alice", "messages": [{"role": "user", "content": "hello"}]}
+    valid_search = {"user_id": "alice", "query": "hello"}
+    add.write_text(json.dumps({"request": valid_add}) + "\n", encoding="utf-8")
+    search.write_text(json.dumps({"request": valid_search}) + "\n", encoding="utf-8")
+    target = add if operation == "add" else search
+    target.open("a", encoding="utf-8").write(json.dumps({"request": {"user_id": "alice", **invalid}}) + "\n")
+    validator = subprocess.run([sys.executable, str(MEM0_VALIDATE_SCRIPT), str(data)],
+                               capture_output=True, text=True)
+    assert validator.returncode == 2
+    module = _module()
+    config = module.ReplayConfig(data_path=data, output_dir=tmp_path / "out", run_id="run-7",
+                                 memory_id="mem0", agent_id="generic-cli", adapter_mode="mem0-sample")
+    calls = []
+    with pytest.raises(ValueError, match="line 2"):
+        module.execute_replay(config, lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert calls == []
+
+
+def test_mem0_sample_validation_requires_user_id(tmp_path: Path):
+    add, search = _valid_dataset(tmp_path)
+    _write_row(add, {"messages": [{"role": "user", "content": "hello"}]})
+    _write_row(search, {"user_id": "alice", "query": "hello"})
+    result = subprocess.run([sys.executable, str(MEM0_VALIDATE_SCRIPT), str(tmp_path)],
+                            capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "user_id" in result.stderr
+    module = _module()
+    config = module.ReplayConfig(data_path=tmp_path, output_dir=tmp_path / "out", run_id="run-7",
+                                 memory_id="mem0", agent_id="generic-cli", adapter_mode="mem0-sample")
+    calls = []
+    with pytest.raises(ValueError, match="user_id"):
+        module.execute_replay(config, lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert calls == []
 
 
 def test_iter_records_preserves_nonempty_user_and_stable_hash(tmp_path: Path):

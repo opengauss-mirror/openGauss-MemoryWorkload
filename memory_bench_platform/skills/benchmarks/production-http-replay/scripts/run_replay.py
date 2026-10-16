@@ -37,6 +37,7 @@ class ReplayRecord:
     line_number: int
     request_id: str
     request: dict[str, Any]
+    source_user_id: Any
     payload_sha256: str
     payload_size_bytes: int
     top_level_fields: tuple[str, ...]
@@ -61,6 +62,8 @@ class ReplayConfig:
     drain_timeout_seconds: float = 600.0
     model_mode: str = "real-model"
     perf_trace_path: Path | None = None
+    adapter_mode: str = "openmem-v1"
+    identity_namespace: str | None = None
 
     def __post_init__(self) -> None:
         if self.add_concurrency < 1 or self.search_concurrency < 1:
@@ -82,6 +85,8 @@ class ReplayConfig:
             raise ValueError(
                 "production replay requires backend_direct memory integration"
             )
+        if self.adapter_mode not in {"openmem-v1", "mem0-sample"}:
+            raise ValueError(f"unsupported replay adapter: {self.adapter_mode}")
 
 
 @dataclass(frozen=True)
@@ -236,13 +241,39 @@ def parse_replay_record(line: str, source: Path, operation: Operation,
     return ReplayRecord(
         operation=operation, line_number=line_number,
         request_id=_request_id(operation, line_number, digest, run_id),
-        request=replay_request, payload_sha256=digest,
+        request=replay_request, source_user_id=request.get("user_id"), payload_sha256=digest,
         payload_size_bytes=len(canonical), top_level_fields=tuple(sorted(request)),
         baseline=_baseline(envelope.get("response")),
     )
 
 
-def validate_dataset(path: Path) -> dict[str, Any]:
+def _validate_mem0_record(record: ReplayRecord, source: Path) -> None:
+    prefix = f"{source.name}: line {record.line_number}: "
+    if not isinstance(record.source_user_id, str):
+        raise ValueError(prefix + "mem0 sample requires text user_id")
+    raw = record.request
+    if record.operation == "add":
+        messages = raw.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(prefix + "mem0 sample add requires messages")
+        for message in messages:
+            if (not isinstance(message, dict)
+                    or message.get("role") not in {"user", "assistant", "system"}
+                    or not isinstance(message.get("content"), str)):
+                raise ValueError(prefix + "mem0 sample add requires text role/content messages")
+        if not any(message["content"].strip() for message in messages):
+            raise ValueError(prefix + "mem0 sample add requires nonempty content")
+    else:
+        query = raw.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError(prefix + "mem0 sample search requires nonempty query")
+        if "memory_limit_number" in raw:
+            limit = raw["memory_limit_number"]
+            if type(limit) is not int or not 1 <= limit <= 1000:
+                raise ValueError(prefix + "mem0 sample memory_limit_number must be an integer from 1 to 1000")
+
+
+def validate_dataset(path: Path, *, adapter_mode: str = "openmem-v1") -> dict[str, Any]:
     dataset = discover_dataset(path)
     records = {
         "add": iter_replay_records(dataset.add_path, "add", "validation"),
@@ -254,6 +285,8 @@ def validate_dataset(path: Path) -> dict[str, Any]:
         count = 0
         unique_shapes: set[tuple[str, ...]] = set()
         for record in items:
+            if adapter_mode == "mem0-sample":
+                _validate_mem0_record(record, dataset.add_path if operation == "add" else dataset.search_path)
             count += 1
             unique_shapes.add(record.top_level_fields)
         counts[operation] = count
@@ -273,7 +306,7 @@ def _runtime_context(config: ReplayConfig) -> WorkflowRuntimeContext:
     return WorkflowRuntimeContext(
         run_id=config.run_id,
         run_dir=str(config.run_dir or config.output_dir),
-        benchmark_id="production-http-replay",
+        benchmark_id=os.environ.get("BENCHMARK_ID", "production-http-replay"),
         agent_id=config.agent_id,
         memory_id=config.memory_id,
         memory_integration="backend_direct",
@@ -288,12 +321,33 @@ def _task_input(
     operation: dict[str, Any] | None = None,
 ) -> MemoryTaskInput:
     inputs: dict[str, Any] = {
-        "source_protocol": "openmem-v1",
+        "source_protocol": config.adapter_mode,
         "source_operation": record.operation,
         "request_id": record.request_id,
     }
     if action == "status":
         inputs["operation"] = copy.deepcopy(operation or {})
+    elif config.adapter_mode == "mem0-sample":
+        raw = record.request
+        identity = (["empty"] if record.source_user_id == ""
+                    else ["id", record.source_user_id])
+        inputs["scope_id"] = "production-sample:" + json.dumps(
+            [config.identity_namespace or config.run_id, identity],
+            ensure_ascii=False, separators=(",", ":"))
+        if action == "ingest":
+            messages = raw.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("mem0 sample add requires messages")
+            parts = []
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") not in {"user", "assistant", "system"} or not isinstance(message.get("content"), str):
+                    raise ValueError("mem0 sample add requires text role/content messages")
+                parts.append(f"{message['role']}: {message['content']}")
+            inputs["content"] = "\n".join(parts)
+        else:
+            inputs["query"] = raw.get("query")
+            if "memory_limit_number" in raw:
+                inputs["top_k"] = raw["memory_limit_number"]
     else:
         inputs["raw_request"] = copy.deepcopy(record.request)
     return MemoryTaskInput(
@@ -585,7 +639,7 @@ def _write_run_config(config: ReplayConfig) -> None:
     run_config = {
         "schema": "production-replay-config/1",
         "run_id": config.run_id,
-        "benchmark_id": "production-http-replay",
+        "benchmark_id": os.environ.get("BENCHMARK_ID", "production-http-replay"),
         "memory_id": config.memory_id,
         "agent_id": config.agent_id,
         "memory_integration": config.memory_integration,
@@ -597,7 +651,15 @@ def _write_run_config(config: ReplayConfig) -> None:
         "request_timeout_seconds": config.request_timeout_seconds,
         "poll_interval_seconds": config.poll_interval_seconds,
         "drain_timeout_seconds": config.drain_timeout_seconds,
-        "identity_policy": "empty-user-id-to-replay-run-id",
+        "identity_policy": ("mem0-sample-namespace" if config.adapter_mode == "mem0-sample"
+                            else "empty-user-id-to-replay-run-id"),
+        "adapter_mode": config.adapter_mode,
+        "identity_namespace": config.identity_namespace,
+        "unmapped_openmem_fields": (["conversation_id", "agent_id", "app_id", "info", "tags", "source",
+                                     "async_mode", "allow_memory_view", "allow_public", "filter", "relativity",
+                                     "include_preference", "include_tool_memory", "preference_limit_number",
+                                     "tool_memory_limit_number", "context_format"]
+                                    if config.adapter_mode == "mem0-sample" else []),
     }
     (config.output_dir / "run_config.json").write_text(
         json.dumps(run_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -631,8 +693,9 @@ def execute_replay(
     # Validate both complete files before submitting any writes. Keep inputs
     # unchanged during replay; this streaming pass does not retain the dataset.
     for operation, path in (("add", dataset.add_path), ("search", dataset.search_path)):
-        for _ in iter_replay_records(path, operation, config.run_id):
-            pass
+        for record in iter_replay_records(path, operation, config.run_id):
+            if config.adapter_mode == "mem0-sample":
+                _validate_mem0_record(record, path)
     _write_run_config(config)
     targets = target_ids or []
     def measured(phase, operation, *, applicable=True):
@@ -733,6 +796,8 @@ def main() -> None:
                 "MEMORY_BENCH_REPLAY_DRAIN_TIMEOUT_SECONDS", 600
             ),
             model_mode=os.environ.get("MEMORY_BENCH_MODEL_MODE", "real-model"),
+            adapter_mode=os.environ.get("MEMORY_BENCH_REPLAY_ADAPTER_MODE", "openmem-v1"),
+            identity_namespace=os.environ.get("MEMORY_BENCH_REPLAY_IDENTITY_NAMESPACE"),
             perf_trace_path=(
                 Path(os.environ["MEMORY_BENCH_PERF_TRACE_PATH"])
                 if os.environ.get("MEMORY_BENCH_PERF_TRACE_PATH")

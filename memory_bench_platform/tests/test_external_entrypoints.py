@@ -699,3 +699,41 @@ def test_production_replay_external_runner_builds_platform_archive(
         assert (run_dir / relative).is_file()
     summary = json.loads((run_dir / "reports/summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == expected_status
+
+
+@pytest.mark.parametrize("mode", ["required", "best_effort"])
+def test_mem0_sample_cli_passes_profiling_to_replay_runner(monkeypatch, tmp_path: Path, mode: str):
+    from memory_bench_platform import cli as cli_module
+
+    profile = tmp_path / "profiling.yaml"
+    profile.write_text(f"schema: profiling/1\nmode: {mode}\ntargets: [memory]\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "ResourceMonitor", _Monitor)
+    monkeypatch.setattr(cli_module, "_plan_from_args", lambda args: type("Plan", (), {
+        "run_id": "run-mem0-profile", "benchmark_id": args.benchmark,
+        "agent_id": args.agent, "benchmark_version": None, "agent_version": None,
+        "memory_backend": args.memory_backend, "hardware_profile": None,
+    })())
+    monkeypatch.setattr(cli_module, "build_run_contract", lambda *args, **kwargs: {
+        "selection": {"benchmark_id": "production-mem0-sample", "agent_id": "generic-cli",
+                      "memory_id": "mem0", "memory_integration": "backend_direct",
+                      "memory_plugin_id": None}
+    })
+    monkeypatch.setattr(cli_module, "build_version_selection", lambda *args, **kwargs: {
+        "selection_mode": "latest_official_release_tag", "overridden": False, "targets": []
+    })
+
+    class ReachedRunner(Exception):
+        pass
+
+    def _check_runner(entrypoint, env, cwd=None):
+        assert entrypoint.entrypoint_id == "replay"
+        assert env["MEMORY_BENCH_PROFILING_CONFIG"] == str(profile.resolve())
+        raise ReachedRunner
+
+    monkeypatch.setattr(cli_module, "execute_external_runner", _check_runner)
+    with pytest.raises(ReachedRunner):
+        cli_module.main(["run", "--benchmark", "production-mem0-sample",
+                         "--entrypoint", "replay", "--agent", "generic-cli",
+                         "--memory-backend", "mem0", "--data-path", str(tmp_path),
+                         "--profiling-config", str(profile)])

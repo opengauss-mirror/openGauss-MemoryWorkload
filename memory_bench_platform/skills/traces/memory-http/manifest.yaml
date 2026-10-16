@@ -1,0 +1,12 @@
+kind: trace
+id: memory-http
+version: 0.1.0
+protocols: [memory-http]
+entry:
+  server: scripts/serve.py
+runtime:
+  request_path: /
+capabilities:
+  capture: true
+  replay: true
+  streaming: false
