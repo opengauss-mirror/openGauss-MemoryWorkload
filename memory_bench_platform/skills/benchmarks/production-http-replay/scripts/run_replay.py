@@ -261,7 +261,7 @@ def _validate_mem0_record(record: ReplayRecord, source: Path) -> None:
                     or message.get("role") not in {"user", "assistant", "system"}
                     or not isinstance(message.get("content"), str)):
                 raise ValueError(prefix + "mem0 sample add requires text role/content messages")
-        if not "\n".join(f"{message['role']}: {message['content']}" for message in messages).strip():
+        if not any(message["content"].strip() for message in messages):
             raise ValueError(prefix + "mem0 sample add requires nonempty content")
     else:
         query = raw.get("query")

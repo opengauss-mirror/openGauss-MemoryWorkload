@@ -48,3 +48,5 @@ model_dependencies:
   mem0_http:
     protocol: memory-http
     base_url_env: MEM0_API_URL
+    match_mode: ordered
+    order_scope: global

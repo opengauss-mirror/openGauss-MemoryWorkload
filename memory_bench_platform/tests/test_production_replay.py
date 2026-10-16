@@ -166,6 +166,8 @@ def test_mem0_sample_mixed_users_keep_add_search_scopes_isolated(tmp_path: Path)
     ("add", {"messages": []}),
     ("add", {"messages": [{"role": "user", "content": 42}]}),
     ("add", {"messages": [{"role": "bot", "content": "hello"}]}),
+    ("add", {"messages": [{"role": "user", "content": ""}]}),
+    ("add", {"messages": [{"role": "user", "content": " \t\n"}]}),
     ("search", {"query": " "}),
     ("search", {"query": 42}),
     ("search", {"query": "hello", "memory_limit_number": 0}),
