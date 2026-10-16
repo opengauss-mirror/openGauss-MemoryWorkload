@@ -37,6 +37,7 @@ class ReplayRecord:
     line_number: int
     request_id: str
     request: dict[str, Any]
+    source_user_id: Any
     payload_sha256: str
     payload_size_bytes: int
     top_level_fields: tuple[str, ...]
@@ -240,13 +241,39 @@ def parse_replay_record(line: str, source: Path, operation: Operation,
     return ReplayRecord(
         operation=operation, line_number=line_number,
         request_id=_request_id(operation, line_number, digest, run_id),
-        request=replay_request, payload_sha256=digest,
+        request=replay_request, source_user_id=request.get("user_id"), payload_sha256=digest,
         payload_size_bytes=len(canonical), top_level_fields=tuple(sorted(request)),
         baseline=_baseline(envelope.get("response")),
     )
 
 
-def validate_dataset(path: Path) -> dict[str, Any]:
+def _validate_mem0_record(record: ReplayRecord, source: Path) -> None:
+    prefix = f"{source.name}: line {record.line_number}: "
+    if not isinstance(record.source_user_id, str):
+        raise ValueError(prefix + "mem0 sample requires text user_id")
+    raw = record.request
+    if record.operation == "add":
+        messages = raw.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(prefix + "mem0 sample add requires messages")
+        for message in messages:
+            if (not isinstance(message, dict)
+                    or message.get("role") not in {"user", "assistant", "system"}
+                    or not isinstance(message.get("content"), str)):
+                raise ValueError(prefix + "mem0 sample add requires text role/content messages")
+        if not "\n".join(f"{message['role']}: {message['content']}" for message in messages).strip():
+            raise ValueError(prefix + "mem0 sample add requires nonempty content")
+    else:
+        query = raw.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError(prefix + "mem0 sample search requires nonempty query")
+        if "memory_limit_number" in raw:
+            limit = raw["memory_limit_number"]
+            if type(limit) is not int or not 1 <= limit <= 1000:
+                raise ValueError(prefix + "mem0 sample memory_limit_number must be an integer from 1 to 1000")
+
+
+def validate_dataset(path: Path, *, adapter_mode: str = "openmem-v1") -> dict[str, Any]:
     dataset = discover_dataset(path)
     records = {
         "add": iter_replay_records(dataset.add_path, "add", "validation"),
@@ -258,6 +285,8 @@ def validate_dataset(path: Path) -> dict[str, Any]:
         count = 0
         unique_shapes: set[tuple[str, ...]] = set()
         for record in items:
+            if adapter_mode == "mem0-sample":
+                _validate_mem0_record(record, dataset.add_path if operation == "add" else dataset.search_path)
             count += 1
             unique_shapes.add(record.top_level_fields)
         counts[operation] = count
@@ -300,10 +329,11 @@ def _task_input(
         inputs["operation"] = copy.deepcopy(operation or {})
     elif config.adapter_mode == "mem0-sample":
         raw = record.request
-        user_id = raw["user_id"]
-        if user_id == f"replay-{config.run_id}":
-            user_id = "anonymous"
-        inputs["scope_id"] = f"production-sample:{config.identity_namespace or config.run_id}:{user_id}"
+        identity = (["empty"] if record.source_user_id == ""
+                    else ["id", record.source_user_id])
+        inputs["scope_id"] = "production-sample:" + json.dumps(
+            [config.identity_namespace or config.run_id, identity],
+            ensure_ascii=False, separators=(",", ":"))
         if action == "ingest":
             messages = raw.get("messages")
             if not isinstance(messages, list) or not messages:
@@ -663,8 +693,9 @@ def execute_replay(
     # Validate both complete files before submitting any writes. Keep inputs
     # unchanged during replay; this streaming pass does not retain the dataset.
     for operation, path in (("add", dataset.add_path), ("search", dataset.search_path)):
-        for _ in iter_replay_records(path, operation, config.run_id):
-            pass
+        for record in iter_replay_records(path, operation, config.run_id):
+            if config.adapter_mode == "mem0-sample":
+                _validate_mem0_record(record, path)
     _write_run_config(config)
     targets = target_ids or []
     def measured(phase, operation, *, applicable=True):

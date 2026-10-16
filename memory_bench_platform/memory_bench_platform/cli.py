@@ -1220,7 +1220,7 @@ def main(argv: list[str] | None = None) -> None:
             env.update(trace_environment)
             env.pop("MEMORY_BENCH_PROFILING_CONFIG", None)
             if profiling_config is not None:
-                if args.benchmark == "production-http-replay" and entrypoint.entrypoint_id == "replay":
+                if args.benchmark in {"production-http-replay", "production-mem0-sample"} and entrypoint.entrypoint_id == "replay":
                     env["MEMORY_BENCH_PROFILING_CONFIG"] = str(args.profiling_config.resolve())
                 else:
                     from .profiling_run import mark_phase_unavailable, prepare_phase_sink
