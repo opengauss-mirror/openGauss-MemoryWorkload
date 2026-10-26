@@ -363,6 +363,9 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 if golden_mode == "build":
                     _golden_after_seed(group, rendered, state.containers[group.project_key],
                                        compose_file, docker, golden_manifest)
+                    for service_name in ("vector", "memory"):
+                        cid = state.containers[group.project_key][service_name]
+                        state.ports[group.project_key][service_name] = _ports(docker.inspect(cid))
                 prepared["golden_volume"] = {
                     "name": group.preparation.golden_volume.name,
                     "mode": "built" if golden_mode == "build" else "reused",

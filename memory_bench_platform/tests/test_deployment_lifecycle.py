@@ -180,6 +180,25 @@ def test_golden_volume_build_then_reuse_skips_seed_and_keeps_source_unchanged(tm
     assert docker.volumes["milvus_locomo_golden"] == golden
 
 
+def test_golden_build_tracks_ports_reassigned_after_seal(tmp_path):
+    path, _ = golden_fixture(tmp_path)
+
+    class ReassignedPortsDocker(GoldenRecordingDocker):
+        def compose_up(self, project, file, env=None):
+            super().compose_up(project, file, env)
+            if self.golden_events.count("compose_up") == 2:
+                for name in ("memory", "vector"):
+                    ports = self.containers[f"{project}_{name}"]["NetworkSettings"]["Ports"]
+                    for bindings in ports.values():
+                        bindings[0]["HostPort"] = str(int(bindings[0]["HostPort"]) + 1)
+
+    docker = ReassignedPortsDocker()
+    deployed = deploy(path, tmp_path, docker)
+
+    assert deployed.ports["mem0-common"]["memory"]["8080/tcp"] == 28081
+    assert status("suite", tmp_path, docker).ready
+
+
 def test_golden_volume_rejects_changed_baseline_before_compose(tmp_path):
     path, raw = golden_fixture(tmp_path)
     docker = GoldenRecordingDocker()
