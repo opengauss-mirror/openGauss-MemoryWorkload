@@ -114,16 +114,45 @@ class PreparationStep(StrictModel):
         return self
 
 
+class GoldenIndex(StrictModel):
+    type: Literal["HNSW"]
+    metric: Literal["L2"]
+    M: int = Field(gt=0)
+    ef_construction: int = Field(alias="efConstruction", gt=0)
+
+
+class GoldenVolume(StrictModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    helper_image: str = Field(min_length=1)
+    collection: str = Field(min_length=1)
+    users: list[str] = Field(min_length=1)
+    count_per_user: int = Field(gt=0)
+    dimensions: int = Field(gt=0)
+    seed_version: str = Field(min_length=1)
+    index: GoldenIndex
+    finalize: PreparationStep
+
+    @model_validator(mode="after")
+    def unique_users(self):
+        if any(not user for user in self.users) or len(set(self.users)) != len(self.users):
+            raise ValueError("Golden volume users must be nonempty and unique")
+        return self
+
+
 class Preparation(StrictModel):
     seed: PreparationStep = Field(default_factory=PreparationStep)
     readiness: PreparationStep = Field(default_factory=PreparationStep)
     warmup: PreparationStep = Field(default_factory=PreparationStep)
     seed_resource_boost: Resources | None = None
+    golden_volume: GoldenVolume | None = None
 
     @model_validator(mode="after")
     def seed_needs_readiness(self):
         if self.seed.enabled and not self.readiness.enabled:
             raise ValueError("seed requires readiness")
+        if self.golden_volume and not (self.seed.enabled and self.readiness.enabled
+                                       and self.golden_volume.finalize.enabled):
+            raise ValueError("Golden volume requires seed, readiness and finalize")
         return self
 
 
@@ -413,7 +442,14 @@ def load_deployment(path: Path) -> DeploymentConfig:
         if shared:
             preparations.append(combo.preparation)
         for preparation in preparations:
-            for step in (preparation.seed, preparation.readiness, preparation.warmup):
+            if preparation.golden_volume:
+                mounts = config.vectors[vector].state_mounts if vector else []
+                if len(mounts) != 1 or mounts[0].host_visible:
+                    raise ValueError("Golden volume requires one named vector state mount")
+            steps = (preparation.seed, preparation.readiness, preparation.warmup)
+            if preparation.golden_volume:
+                steps += (preparation.golden_volume.finalize,)
+            for step in steps:
                 if not step.enabled:
                     continue
                 if step.target not in available | {"agent"}:

@@ -18,6 +18,8 @@ from .deployment_config import (DeploymentConfig, DeploymentGroup, Service,
                                 _pointer_value, apply_config_overrides, load_deployment, resolve_groups)
 from .deployment_config_files import prepare_instance_configs
 from .deployment_docker import DockerClient
+from .deployment_golden import (classify_volume, expected_manifest,
+                                validate_finalize_summary, validate_seed_summary)
 from .deployment_store import DeploymentState, DeploymentStore
 
 
@@ -151,20 +153,23 @@ def _pool_issues(group: DeploymentGroup, ports: dict[str, dict[str, int]]) -> li
     return issues
 
 
-def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], docker: DockerClient) -> dict:
+def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], docker: DockerClient,
+                         *, golden_manifest: dict | None = None, skip_seed: bool = False) -> dict:
     prep = group.preparation
     outcome = {"seed": False, "readiness": False}
     boost = prep.seed_resource_boost
     vector_id = containers.get("vector")
     boosted = False
     try:
-        if prep.seed.enabled:
+        if prep.seed.enabled and not skip_seed:
             if boost:
                 if not vector_id or not group.vector_template or not group.vector_template.resources:
                     raise DeploymentFailed("seed_resource_boost requires a vector with original resource limits")
                 docker.update_resources(vector_id, cpus=boost.cpus, memory_mb=boost.memory_mb)
                 boosted = True
-            docker.exec_json(containers[_target_service(group, prep.seed.target)], prep.seed.command)
+            seed_summary = docker.exec_json(containers[_target_service(group, prep.seed.target)], prep.seed.command)
+            if golden_manifest is not None:
+                validate_seed_summary(seed_summary, golden_manifest)
             outcome["seed"] = True
         if prep.readiness.enabled:
             deadline = time.monotonic() + prep.readiness.timeout_seconds
@@ -187,6 +192,79 @@ def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], doc
         if result.get("ready") is not True:
             raise DeploymentFailed("baseline not ready after resource restoration")
     return outcome
+
+
+def _golden_volume_names(rendered: dict) -> tuple[str, str]:
+    mount, = [item for item in rendered["services"]["vector"]["volumes"]
+              if item["type"] == "volume"]
+    key = mount["source"]
+    return key, f"{rendered['name']}_{key}"
+
+
+def _golden_mount_issue(inspect: dict, rendered: dict) -> str | None:
+    _, name = _golden_volume_names(rendered)
+    target = next(item["target"] for item in rendered["services"]["vector"]["volumes"]
+                  if item["type"] == "volume")
+    if not any(item.get("Name") == name and item.get("Destination") == target
+               for item in inspect.get("Mounts", [])):
+        return "Runtime volume mount changed"
+    return None
+
+
+def _golden_before_deploy(group: DeploymentGroup, rendered: dict,
+                          docker: DockerClient) -> tuple[dict, str, float]:
+    spec = group.preparation.golden_volume
+    manifest = expected_manifest(spec, "vector", docker.inspect_image(group.vector_template.image.name)["Id"])
+    if not docker.volume_exists(spec.name):
+        return manifest, "build", 0.0
+    if classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest) != "ready":
+        raise DeploymentFailed("Golden volume is not ready")
+    if docker.attached_volume_containers(spec.name):
+        raise DeploymentFailed("Golden volume is attached to a container")
+    key, runtime = _golden_volume_names(rendered)
+    if docker.volume_exists(runtime):
+        raise DeploymentFailed("Runtime volume already exists")
+    started = time.monotonic()
+    docker.create_volume(runtime, project=rendered["name"], volume_key=key)
+    try:
+        if docker.volume_entries(runtime, spec.helper_image):
+            raise DeploymentFailed("Runtime volume already contains data")
+        docker.copy_volume(spec.name, runtime, spec.helper_image)
+        classify_volume(docker.volume_entries(runtime, spec.helper_image), manifest)
+    except BaseException:
+        docker.remove_volume(runtime)
+        raise
+    return manifest, "reuse", time.monotonic() - started
+
+
+def _golden_after_seed(group: DeploymentGroup, rendered: dict, containers: dict[str, str],
+                       compose_file: Path, docker: DockerClient, manifest: dict) -> None:
+    spec = group.preparation.golden_volume
+    result = docker.exec_json(containers[_target_service(group, spec.finalize.target)],
+                              spec.finalize.command,
+                              timeout_seconds=spec.finalize.timeout_seconds)
+    validate_finalize_summary(result, manifest)
+    docker.stop_container(containers["memory"])
+    docker.stop_container(containers["vector"])
+    _, runtime = _golden_volume_names(rendered)
+    if docker.running_volume_containers(runtime):
+        raise DeploymentFailed("Runtime volume is still in use")
+    if docker.volume_exists(spec.name):
+        raise DeploymentFailed("Golden volume appeared during baseline build")
+    docker.create_volume(spec.name)
+    if docker.volume_entries(spec.name, spec.helper_image):
+        raise DeploymentFailed("Golden volume already contains data")
+    docker.copy_volume(runtime, spec.name, spec.helper_image)
+    docker.write_volume_manifest(spec.name, manifest, spec.helper_image)
+    classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest)
+    docker.compose_up(rendered["name"], compose_file, env=os.environ.copy())
+    for service_name in ("vector", "memory"):
+        if docker.compose_ps(rendered["name"], compose_file, service_name) != containers[service_name]:
+            raise DeploymentFailed(f"{service_name} was replaced after Golden seal")
+    readiness = group.preparation.readiness
+    if docker.exec_json(containers[_target_service(group, readiness.target)],
+                        readiness.command).get("ready") is not True:
+        raise DeploymentFailed("baseline not ready after Golden seal")
 
 
 def _target_service(group: DeploymentGroup, target: str) -> str:
@@ -249,6 +327,11 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 names = group.agent_config_overrides.get(instance, {}) if service_name.startswith("agent_") else group.memory_config_overrides
                 state.config_origins[f"{group.project_key}/{service_name}"] = sorted(names)
             store.write_atomic(state)
+            golden_manifest = None
+            golden_mode = None
+            clone_seconds = 0.0
+            if group.preparation.golden_volume:
+                golden_manifest, golden_mode, clone_seconds = _golden_before_deploy(group, rendered, docker)
             started.append((project, compose_file))
             docker.compose_up(project, compose_file, env=os.environ.copy())
             for service_name, template in _service_templates(group, rendered).items():
@@ -264,12 +347,29 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                     state.restart_counts[cid] = int(inspect.get("RestartCount", 0))
                     state.start_times[cid] = str(inspect.get("State", {}).get("StartedAt", ""))
                 problems = _verify_service(docker, cid, template, rendered["services"][service_name], expected_image)
+                if service_name == "vector" and group.preparation.golden_volume:
+                    issue = _golden_mount_issue(inspect, rendered)
+                    if issue:
+                        problems.append(issue)
                 if problems:
                     raise DeploymentFailed(f"{service_name}: {', '.join(problems)}")
             pool_problems = _pool_issues(group, state.ports[group.project_key])
             if pool_problems:
                 raise DeploymentFailed("; ".join(pool_problems))
-            state.preparation[group.project_key] = _execute_preparation(group, state.containers[group.project_key], docker)
+            prepared = _execute_preparation(
+                group, state.containers[group.project_key], docker,
+                golden_manifest=golden_manifest, skip_seed=golden_mode == "reuse")
+            if golden_manifest is not None:
+                if golden_mode == "build":
+                    _golden_after_seed(group, rendered, state.containers[group.project_key],
+                                       compose_file, docker, golden_manifest)
+                prepared["golden_volume"] = {
+                    "name": group.preparation.golden_volume.name,
+                    "mode": "built" if golden_mode == "build" else "reused",
+                    "runtime_volume": _golden_volume_names(rendered)[1],
+                    "clone_seconds": round(clone_seconds, 3),
+                }
+            state.preparation[group.project_key] = prepared
             store.write_atomic(state)
         state.ready = True
         store.write_atomic(state)
@@ -329,6 +429,10 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
                     continue
                 drift.extend(f"{service_name}: {issue}" for issue in _verify_service(
                     docker, cid, template, rendered["services"][service_name], state.image_ids[cid]))
+                if service_name == "vector" and group.preparation.golden_volume:
+                    issue = _golden_mount_issue(docker.inspect(cid), rendered)
+                    if issue:
+                        drift.append(f"vector: {issue}")
                 if _ports(docker.inspect(cid)) != state.ports[group_key][service_name]:
                     drift.append(f"published ports changed: {service_name}")
                 if cid in state.restart_counts and int(docker.inspect(cid).get("RestartCount", 0)) != state.restart_counts[cid]:

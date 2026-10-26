@@ -31,3 +31,33 @@ def test_exec_rejects_invalid_json():
     with pytest.raises(ValueError):
         docker.exec_json("container", ["check"])
 
+
+def test_golden_volume_docker_copy_mounts_source_read_only_and_writes_manifest_via_stdin():
+    calls = []
+
+    def recorder(args, **kwargs):
+        calls.append((args, kwargs.get("input"), kwargs.get("timeout")))
+        stdout = '{"etcd":null}' if args[1:3] == ["run", "--rm"] and "/data:ro" in " ".join(args) else ""
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    docker = DockerClient(recorder)
+    assert docker.volume_entries("golden", "python:3.11-alpine") == {"etcd": None}
+    docker.copy_volume("golden", "runtime", "python:3.11-alpine")
+    docker.write_volume_manifest("golden", {"users": ["user-001"]}, "python:3.11-alpine")
+    copy_args, _, copy_timeout = calls[1]
+    assert "golden:/source:ro" in copy_args
+    assert "runtime:/target" in copy_args
+    assert "runtime:/target:ro" not in copy_args
+    assert copy_timeout == 3600
+    assert json.loads(calls[2][1]) == {"users": ["user-001"]}
+
+
+def test_golden_finalize_docker_exec_honors_compaction_timeout():
+    calls = []
+
+    def recorder(args, **kwargs):
+        calls.append((args, kwargs["timeout"]))
+        return subprocess.CompletedProcess(args, 0, '{"status":"complete"}', "")
+
+    DockerClient(recorder).exec_json("milvus", ["compact"], timeout_seconds=3600)
+    assert calls == [(["docker", "exec", "-i", "milvus", "compact"], 3600)]

@@ -6,7 +6,7 @@ import yaml
 
 from memory_bench_platform.deployment_lifecycle import DeploymentFailed, deploy, status, undeploy
 from memory_bench_platform.deployment_store import DeploymentStore
-from test_deployment_config import fixture_config
+from test_deployment_config import fixture_config, golden_fixture
 from test_deployment_compose import pooled_fixture
 
 
@@ -61,7 +61,7 @@ class RecordingDocker:
     def inspect(self, container):
         return self.containers[container]
 
-    def exec_json(self, container, command, input_data=None):
+    def exec_json(self, container, command, input_data=None, **kwargs):
         self.exec_calls.append((container, command))
         if command == ["seed"] and self.fail_seed:
             raise RuntimeError("seed failed")
@@ -81,6 +81,224 @@ class RecordingDocker:
 
     def update_resources(self, container, **kwargs):
         self.boosts.append((container, kwargs))
+
+
+class GoldenRecordingDocker(RecordingDocker):
+    def __init__(self):
+        super().__init__()
+        self.volumes = {}
+        self.golden_events = []
+
+    def compose_up(self, project, file, env=None):
+        super().compose_up(project, file, env)
+        for name in self.projects[project]["volumes"]:
+            self.volumes.setdefault(f"{project}_{name}", {})
+        for service_name, spec in self.projects[project]["services"].items():
+            container = self.containers[f"{project}_{service_name}"]
+            container["Mounts"] = [item for item in container["Mounts"] if "Name" not in item]
+            for mount in spec.get("volumes", []):
+                if mount["type"] == "volume":
+                    container["Mounts"].append({
+                        "Name": f"{project}_{mount['source']}",
+                        "Destination": mount["target"],
+                    })
+        self.golden_events.append("compose_up")
+
+    def compose_down(self, project, file):
+        super().compose_down(project, file)
+        for name in list(self.volumes):
+            if name.startswith(project + "_"):
+                del self.volumes[name]
+
+    def exec_json(self, container, command, input_data=None, **kwargs):
+        if command == ["seed"]:
+            self.golden_events.append("seed")
+            project = container.rsplit("_memory", 1)[0]
+            self.volumes[f"{project}_vector_0"]["etcd"] = None
+            return {"inserted": 20, "deleted_dynamic": 0, "deleted_seed": 0,
+                    "results": [{"user_id": user, "validated_count": 10, "reused": False}
+                                for user in ("user-001", "user-002")]}
+        if command == ["compact"]:
+            self.golden_events.append("compact")
+            return {"status": "complete", "collections": [
+                {"collection": "memory_001", "state": "Completed"}]}
+        return super().exec_json(container, command, input_data)
+
+    def volume_exists(self, name):
+        return name in self.volumes
+
+    def volume_entries(self, name, helper_image):
+        return dict(self.volumes[name])
+
+    def create_volume(self, name, *, project=None, volume_key=None):
+        assert name not in self.volumes
+        self.volumes[name] = {}
+
+    def copy_volume(self, source, target, helper_image):
+        assert not self.volumes[target]
+        self.volumes[target] = dict(self.volumes[source])
+        self.golden_events.append(f"copy:{source}->{target}")
+
+    def write_volume_manifest(self, name, manifest, helper_image):
+        from memory_bench_platform.deployment_golden import MARKER
+        self.volumes[name][MARKER] = manifest
+        self.golden_events.append("seal")
+
+    def running_volume_containers(self, name):
+        return []
+
+    def attached_volume_containers(self, name):
+        return []
+
+    def stop_container(self, container):
+        self.golden_events.append(f"stop:{container.rsplit('_', 1)[-1]}")
+
+    def remove_volume(self, name):
+        self.volumes.pop(name, None)
+
+
+def test_golden_volume_build_then_reuse_skips_seed_and_keeps_source_unchanged(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    docker = GoldenRecordingDocker()
+    first = deploy(path, tmp_path, docker)
+    assert first.ready
+    golden = dict(docker.volumes["milvus_locomo_golden"])
+    assert first.preparation["mem0-common"]["golden_volume"]["mode"] == "built"
+    assert docker.golden_events.index("seed") < docker.golden_events.index("compact")
+    assert docker.golden_events.index("compact") < docker.golden_events.index("seal")
+
+    raw["name"] = "suite2"
+    raw["vectors"]["milvus"]["image"]["name"] = "example/milvus:2"
+    path.write_text(yaml.safe_dump(raw))
+    docker.golden_events.clear()
+    second = deploy(path, tmp_path, docker)
+    assert second.ready
+    assert second.preparation["mem0-common"]["golden_volume"]["mode"] == "reused"
+    assert "seed" not in docker.golden_events
+    assert "compact" not in docker.golden_events
+    assert any(event.startswith("copy:milvus_locomo_golden->") for event in docker.golden_events)
+    assert docker.volumes["milvus_locomo_golden"] == golden
+
+
+def test_golden_volume_rejects_changed_baseline_before_compose(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    docker = GoldenRecordingDocker()
+    deploy(path, tmp_path, docker)
+    raw["name"] = "suite2"
+    raw["shared_memory_instances"]["mem0-common"]["preparation"]["golden_volume"]["users"] = ["other"]
+    path.write_text(yaml.safe_dump(raw))
+    before = len(docker.golden_events)
+    with pytest.raises(DeploymentFailed, match="does not match"):
+        deploy(path, tmp_path, docker)
+    assert "compose_up" not in docker.golden_events[before:]
+
+
+def test_golden_volume_rejects_incomplete_source_before_compose(tmp_path):
+    path, _ = golden_fixture(tmp_path)
+    docker = GoldenRecordingDocker()
+    docker.volumes["milvus_locomo_golden"] = {"etcd": None}
+    with pytest.raises(DeploymentFailed, match="incomplete"):
+        deploy(path, tmp_path, docker)
+    assert "compose_up" not in docker.golden_events
+
+
+def test_golden_volume_rejects_attached_source_before_clone(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    docker = GoldenRecordingDocker()
+    deploy(path, tmp_path, docker)
+    raw["name"] = "suite2"
+    path.write_text(yaml.safe_dump(raw))
+    docker.attached_volume_containers = lambda name: ["old-container"]
+    before = len(docker.golden_events)
+    with pytest.raises(DeploymentFailed, match="attached"):
+        deploy(path, tmp_path, docker)
+    assert "compose_up" not in docker.golden_events[before:]
+
+
+def test_golden_volume_preserves_preexisting_runtime_volume_on_preflight_failure(tmp_path):
+    from memory_bench_platform.deployment_config import load_deployment, resolve_groups
+    from memory_bench_platform.deployment_compose import render_project
+
+    path, raw = golden_fixture(tmp_path)
+    docker = GoldenRecordingDocker()
+    deploy(path, tmp_path, docker)
+    raw["name"] = "suite2"
+    path.write_text(yaml.safe_dump(raw))
+    group, = resolve_groups(load_deployment(path))
+    project = render_project(group, "suite2", {}, tmp_path / ".memory-bench/deployments/suite2")["name"]
+    runtime = f"{project}_vector_0"
+    docker.volumes[runtime] = {"existing": None}
+    with pytest.raises(DeploymentFailed, match="Runtime volume already exists"):
+        deploy(path, tmp_path, docker)
+    assert docker.volumes[runtime] == {"existing": None}
+
+
+def test_golden_volume_clone_failure_removes_only_new_runtime_volume(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+
+    class FailedCloneDocker(GoldenRecordingDocker):
+        fail_copy = False
+
+        def copy_volume(self, source, target, helper_image):
+            if self.fail_copy:
+                self.volumes[target]["partial"] = None
+                raise RuntimeError("copy interrupted")
+            super().copy_volume(source, target, helper_image)
+
+    docker = FailedCloneDocker()
+    deploy(path, tmp_path, docker)
+    golden = dict(docker.volumes["milvus_locomo_golden"])
+    raw["name"] = "suite2"
+    path.write_text(yaml.safe_dump(raw))
+    docker.fail_copy = True
+    with pytest.raises(DeploymentFailed, match="copy interrupted"):
+        deploy(path, tmp_path, docker)
+    assert docker.volumes["milvus_locomo_golden"] == golden
+    assert not any(name.startswith("mb_suite2_") for name in docker.volumes)
+
+
+def test_golden_volume_does_not_seal_unvalidated_seed(tmp_path):
+    path, _ = golden_fixture(tmp_path)
+
+    class BadSeedDocker(GoldenRecordingDocker):
+        def exec_json(self, container, command, input_data=None, **kwargs):
+            result = super().exec_json(container, command, input_data, **kwargs)
+            if command == ["seed"]:
+                result["deleted_dynamic"] = 1
+            return result
+
+    docker = BadSeedDocker()
+    with pytest.raises(DeploymentFailed, match="clean baseline"):
+        deploy(path, tmp_path, docker)
+    assert "milvus_locomo_golden" not in docker.volumes
+
+
+def test_golden_volume_does_not_seal_incomplete_compaction(tmp_path):
+    path, _ = golden_fixture(tmp_path)
+
+    class BadCompactionDocker(GoldenRecordingDocker):
+        def exec_json(self, container, command, input_data=None, **kwargs):
+            result = super().exec_json(container, command, input_data, **kwargs)
+            if command == ["compact"]:
+                result["collections"] = []
+            return result
+
+    docker = BadCompactionDocker()
+    with pytest.raises(DeploymentFailed, match="compaction"):
+        deploy(path, tmp_path, docker)
+    assert "milvus_locomo_golden" not in docker.volumes
+
+
+def test_golden_volume_status_rejects_replaced_runtime_mount(tmp_path):
+    path, _ = golden_fixture(tmp_path)
+    docker = GoldenRecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    assert status("suite", tmp_path, docker).ready
+    vector_id = state.containers["mem0-common"]["vector"]
+    docker.containers[vector_id]["Mounts"][-1]["Name"] = "different-volume"
+    checked = status("suite", tmp_path, docker)
+    assert not checked.ready
+    assert any("Runtime volume mount changed" in item for item in checked.drift)
 
 
 def test_deploy_status_detects_config_drift_and_undeploy(tmp_path):
