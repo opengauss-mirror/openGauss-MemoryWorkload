@@ -1,5 +1,8 @@
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -141,6 +144,10 @@ class GoldenRecordingDocker(RecordingDocker):
         assert name not in self.volumes
         self.volumes[name] = {}
 
+    @contextmanager
+    def claim_golden(self, name, helper_image):
+        yield
+
     def copy_volume(self, source, target, helper_image):
         assert not self.volumes[target]
         self.volumes[target] = dict(self.volumes[source])
@@ -204,6 +211,102 @@ def test_golden_build_tracks_ports_reassigned_after_seal(tmp_path):
 
     assert deployed.ports["mem0-common"]["memory"]["8080/tcp"] == 28081
     assert status("suite", tmp_path, docker).ready
+
+
+def test_golden_restart_waits_for_configured_consecutive_readiness(tmp_path, monkeypatch):
+    path, raw = golden_fixture(tmp_path)
+    readiness = raw["shared_memory_instances"]["mem0-common"]["preparation"]["readiness"]
+    readiness.update(timeout_seconds=30, consecutive_successes=2)
+    path.write_text(yaml.safe_dump(raw))
+    monkeypatch.setattr("memory_bench_platform.deployment_lifecycle.time.sleep", lambda _: None)
+
+    class LoadingIndexDocker(GoldenRecordingDocker):
+        ready_results = iter([True, True, False, True, True])
+
+        def exec_json(self, container, command, input_data=None, **kwargs):
+            if command == ["ready"]:
+                self.exec_calls.append((container, command))
+                return {"ready": next(self.ready_results)}
+            return super().exec_json(container, command, input_data, **kwargs)
+
+    docker = LoadingIndexDocker()
+    state = deploy(path, tmp_path, docker)
+
+    assert state.ready
+    assert sum(command == ["ready"] for _, command in docker.exec_calls) == 5
+
+
+def test_golden_build_pulls_uncached_vector_image_during_compose(tmp_path):
+    path, _ = golden_fixture(tmp_path)
+
+    class PullingDocker(GoldenRecordingDocker):
+        def inspect_image(self, name):
+            if name == "example/milvus:1" and not self.projects:
+                raise RuntimeError("image not cached")
+            return super().inspect_image(name)
+
+    docker = PullingDocker()
+    state = deploy(path, tmp_path, docker)
+
+    assert state.ready
+    assert docker.volumes["milvus_locomo_golden"][".memory-bench-golden.json"]["image_id"] == "sha256:example/milvus:1"
+
+
+def test_concurrent_deployments_cannot_publish_same_golden_volume(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    raw["name"] = "suite2"
+    second_path = tmp_path / "deployment2.yaml"
+    second_path.write_text(yaml.safe_dump(raw))
+
+    class ConcurrentDocker(GoldenRecordingDocker):
+        def __init__(self):
+            super().__init__()
+            self.first_checks = threading.Barrier(2)
+            self.checks = threading.local()
+            self.publish_lock = threading.Lock()
+            self.second_claim = threading.Event()
+
+        def volume_exists(self, name):
+            exists = super().volume_exists(name)
+            if name == "milvus_locomo_golden":
+                count = getattr(self.checks, "count", 0) + 1
+                self.checks.count = count
+                if count == 1:
+                    self.first_checks.wait(timeout=5)
+            return exists
+
+        def create_volume(self, name, *, project=None, volume_key=None):
+            if name == "milvus_locomo_golden":
+                self.volumes.setdefault(name, {})
+            else:
+                super().create_volume(name, project=project, volume_key=volume_key)
+
+        def copy_volume(self, source, target, helper_image):
+            if target == "milvus_locomo_golden":
+                self.volumes[target].update(self.volumes[source])
+            else:
+                super().copy_volume(source, target, helper_image)
+
+        @contextmanager
+        def claim_golden(self, name, helper_image):
+            if not self.publish_lock.acquire(blocking=False):
+                self.second_claim.set()
+                raise RuntimeError("Golden volume publication is locked")
+            try:
+                assert self.second_claim.wait(timeout=5)
+                yield
+            finally:
+                self.publish_lock.release()
+
+    docker = ConcurrentDocker()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(deploy, config, tmp_path, docker) for config in (path, second_path)]
+        errors = [future.exception(timeout=10) for future in futures]
+
+    assert sum(error is None for error in errors) == 1
+    assert sum(isinstance(error, DeploymentFailed) and "locked" in str(error) for error in errors) == 1
+    golden = docker.volumes["milvus_locomo_golden"]
+    assert golden[".memory-bench-golden.json"]["data_sha256"] == docker.volume_digest("milvus_locomo_golden", "python:3.11-alpine")
 
 
 def test_golden_volume_rejects_changed_baseline_before_compose(tmp_path):
@@ -468,11 +571,11 @@ def test_false_readiness_receipt_does_not_mark_deployment_ready(tmp_path):
     path.write_text(yaml.safe_dump(raw))
 
     class NotReadyDocker(RecordingDocker):
-        def exec_json(self, container, command, input_data=None):
+        def exec_json(self, container, command, input_data=None, **kwargs):
             if command == ["ready"]:
                 self.exec_calls.append((container, command))
                 return {"ready": False}
-            return super().exec_json(container, command, input_data)
+            return super().exec_json(container, command, input_data, **kwargs)
 
     docker = NotReadyDocker()
     with pytest.raises(DeploymentFailed, match="baseline readiness timed out"):

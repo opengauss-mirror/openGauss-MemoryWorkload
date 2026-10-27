@@ -76,3 +76,17 @@ def test_volume_digest_mounts_data_and_helper_read_only():
     assert any(value.endswith("/deployment_volume_digest.py:/opt/volume_digest.py:ro") for value in args)
     assert args[-3:] == ["/opt/volume_digest.py", "/data", ".memory-bench-golden.json"]
     assert timeout == 3600
+
+
+def test_golden_claim_uses_daemon_unique_container_and_releases_it():
+    calls = []
+
+    def recorder(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "claim-id\n" if args[1] == "create" else "", "")
+
+    docker = DockerClient(recorder)
+    with docker.claim_golden("shared_golden", "python:3.11-alpine"):
+        assert calls[0][1:3] == ["create", "--name"]
+        assert "python:3.11-alpine" in calls[0]
+    assert calls[-1] == ["docker", "rm", "claim-id"]

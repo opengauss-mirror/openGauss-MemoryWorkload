@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 from .deployment_compose import render_project, required_resources
-from .deployment_config import (DeploymentConfig, DeploymentGroup, Service,
+from .deployment_config import (DeploymentConfig, DeploymentGroup, PreparationStep, Service,
                                 _pointer_value, apply_config_overrides, load_deployment, resolve_groups)
 from .deployment_config_files import prepare_instance_configs
 from .deployment_docker import DockerClient
@@ -153,6 +153,18 @@ def _pool_issues(group: DeploymentGroup, ports: dict[str, dict[str, int]]) -> li
     return issues
 
 
+def _wait_readiness(step: PreparationStep, container: str, docker: DockerClient) -> None:
+    deadline = time.monotonic() + step.timeout_seconds
+    consecutive = 0
+    while (remaining := deadline - time.monotonic()) > 0:
+        result = docker.exec_json(container, step.command, timeout_seconds=remaining)
+        consecutive = consecutive + 1 if result.get("ready") is True else 0
+        if consecutive >= step.consecutive_successes:
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise DeploymentFailed("baseline readiness timed out")
+
+
 def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], docker: DockerClient,
                          *, golden_manifest: dict | None = None, skip_seed: bool = False) -> dict:
     prep = group.preparation
@@ -173,17 +185,8 @@ def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], doc
                 validate_seed_summary(seed_summary, golden_manifest)
             outcome["seed"] = True
         if prep.readiness.enabled:
-            deadline = time.monotonic() + prep.readiness.timeout_seconds
-            consecutive = 0
-            while time.monotonic() < deadline:
-                result = docker.exec_json(containers[_target_service(group, prep.readiness.target)], prep.readiness.command)
-                consecutive = consecutive + 1 if result.get("ready") is True else 0
-                if consecutive >= prep.readiness.consecutive_successes:
-                    outcome["readiness"] = True
-                    break
-                time.sleep(1)
-            if not outcome["readiness"]:
-                raise DeploymentFailed("baseline readiness timed out")
+            _wait_readiness(prep.readiness, containers[_target_service(group, prep.readiness.target)], docker)
+            outcome["readiness"] = True
     finally:
         if boosted:
             old = group.vector_template.resources
@@ -215,7 +218,7 @@ def _golden_mount_issue(inspect: dict, rendered: dict) -> str | None:
 def _golden_before_deploy(group: DeploymentGroup, rendered: dict,
                           docker: DockerClient) -> tuple[dict, str, float]:
     spec = group.preparation.golden_volume
-    manifest = expected_manifest(spec, "vector", docker.inspect_image(group.vector_template.image.name)["Id"])
+    manifest = expected_manifest(spec, "vector", "")
     key, runtime = _golden_volume_names(rendered)
     if docker.volume_exists(runtime):
         raise DeploymentFailed("Runtime volume already exists")
@@ -253,24 +256,23 @@ def _golden_after_seed(group: DeploymentGroup, rendered: dict, containers: dict[
     if docker.running_volume_containers(runtime):
         raise DeploymentFailed("Runtime volume is still in use")
     runtime_digest = docker.volume_digest(runtime, spec.helper_image)
-    if docker.volume_exists(spec.name):
-        raise DeploymentFailed("Golden volume appeared during baseline build")
-    docker.create_volume(spec.name)
-    if docker.volume_entries(spec.name, spec.helper_image):
-        raise DeploymentFailed("Golden volume already contains data")
-    docker.copy_volume(runtime, spec.name, spec.helper_image)
-    if docker.volume_digest(spec.name, spec.helper_image) != runtime_digest:
-        raise DeploymentFailed("Golden volume data digest mismatch after copy")
-    docker.write_volume_manifest(spec.name, {**manifest, "data_sha256": runtime_digest}, spec.helper_image)
-    classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest, runtime_digest)
+    with docker.claim_golden(spec.name, spec.helper_image):
+        if docker.volume_exists(spec.name):
+            raise DeploymentFailed("Golden volume appeared during baseline build")
+        docker.create_volume(spec.name)
+        if docker.volume_entries(spec.name, spec.helper_image):
+            raise DeploymentFailed("Golden volume already contains data")
+        docker.copy_volume(runtime, spec.name, spec.helper_image)
+        if docker.volume_digest(spec.name, spec.helper_image) != runtime_digest:
+            raise DeploymentFailed("Golden volume data digest mismatch after copy")
+        docker.write_volume_manifest(spec.name, {**manifest, "data_sha256": runtime_digest}, spec.helper_image)
+        classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest, runtime_digest)
     docker.compose_up(rendered["name"], compose_file, env=os.environ.copy())
     for service_name in ("vector", "memory"):
         if docker.compose_ps(rendered["name"], compose_file, service_name) != containers[service_name]:
             raise DeploymentFailed(f"{service_name} was replaced after Golden seal")
     readiness = group.preparation.readiness
-    if docker.exec_json(containers[_target_service(group, readiness.target)],
-                        readiness.command).get("ready") is not True:
-        raise DeploymentFailed("baseline not ready after Golden seal")
+    _wait_readiness(readiness, containers[_target_service(group, readiness.target)], docker)
 
 
 def _target_service(group: DeploymentGroup, target: str) -> str:
@@ -349,6 +351,8 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 state.ports[group.project_key][service_name] = _ports(inspect)
                 expected_image = docker.inspect_image(template.image.name)["Id"]
                 state.image_ids[cid] = expected_image
+                if service_name == "vector" and golden_manifest is not None:
+                    golden_manifest["image_id"] = expected_image
                 if service_name.startswith(("agent_", "gateway_pool_")):
                     state.restart_counts[cid] = int(inspect.get("RestartCount", 0))
                     state.start_times[cid] = str(inspect.get("State", {}).get("StartedAt", ""))

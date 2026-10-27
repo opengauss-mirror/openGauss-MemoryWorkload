@@ -1,9 +1,11 @@
 """Small injectable Docker CLI boundary for deployment operations."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -96,6 +98,19 @@ class DockerClient:
             args += ["--label", f"com.docker.compose.project={project}",
                      "--label", f"com.docker.compose.volume={volume_key}"]
         self._run([*args, name])
+
+    @contextmanager
+    def claim_golden(self, name: str, helper_image: str):
+        lock_name = "memory-bench-golden-" + hashlib.sha256(name.encode()).hexdigest()
+        container = self._run(["docker", "create", "--name", lock_name,
+                               "--label", f"memory-bench.golden-lock={name}",
+                               "--entrypoint", "python3", helper_image, "-c", "pass"]).strip()
+        if not container:
+            raise RuntimeError("Docker did not return a Golden lock container ID")
+        try:
+            yield
+        finally:
+            self._run(["docker", "rm", container])
 
     def running_volume_containers(self, name: str) -> list[str]:
         return self._run(["docker", "ps", "-q", "--filter", f"volume={name}"]).splitlines()
