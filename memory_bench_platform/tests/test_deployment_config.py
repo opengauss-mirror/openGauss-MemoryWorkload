@@ -47,6 +47,54 @@ def fixture_config(tmp_path):
     return path, raw
 
 
+def golden_fixture(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    raw["vectors"] = {"milvus": {
+        "image": {"name": "example/milvus:1"}, "container_port": 19530,
+        "healthcheck": ["CMD", "true"], "state_mounts": [{"target": "/var/lib/milvus"}],
+    }}
+    raw["shared_memory_instances"]["mem0-common"]["vector"] = "milvus"
+    raw["memories"]["mem0"]["service_endpoints"] = {"VECTOR_URL": "vector"}
+    raw["shared_memory_instances"]["mem0-common"]["preparation"] = {
+        "seed": {"enabled": True, "target": "memory", "command": ["seed"]},
+        "readiness": {"enabled": True, "target": "memory", "command": ["ready"]},
+        "golden_volume": {
+            "name": "milvus_locomo_golden", "helper_image": "python:3.11-alpine",
+            "collection": "memory_001", "users": ["user-001", "user-002"],
+            "count_per_user": 10, "dimensions": 1024, "seed_version": "seed-v1",
+            "index": {"type": "HNSW", "metric": "L2", "M": 16, "efConstruction": 200},
+            "finalize": {"enabled": True, "target": "memory", "command": ["compact"]},
+        },
+    }
+    path.write_text(yaml.safe_dump(raw))
+    return path, raw
+
+
+def test_golden_volume_requires_single_named_vector_mount(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    assert load_deployment(path).shared_memory_instances["mem0-common"].preparation.golden_volume.name == "milvus_locomo_golden"
+    raw["vectors"]["milvus"]["state_mounts"] = [{"target": "/var/lib/milvus", "host_visible": True}]
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="Golden volume requires one named vector state mount"):
+        load_deployment(path)
+
+
+def test_golden_volume_requires_seed_readiness_and_finalize(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    raw["shared_memory_instances"]["mem0-common"]["preparation"]["golden_volume"]["finalize"]["enabled"] = False
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="Golden volume requires seed, readiness and finalize"):
+        load_deployment(path)
+
+
+def test_golden_volume_rejects_unknown_finalize_target(tmp_path):
+    path, raw = golden_fixture(tmp_path)
+    raw["shared_memory_instances"]["mem0-common"]["preparation"]["golden_volume"]["finalize"]["target"] = "missing"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="invalid preparation target"):
+        load_deployment(path)
+
+
 def test_shared_memory_group_is_resolved_once(tmp_path):
     path, _ = fixture_config(tmp_path)
     groups = resolve_groups(load_deployment(path))

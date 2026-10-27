@@ -1,8 +1,11 @@
 """Small injectable Docker CLI boundary for deployment operations."""
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -12,9 +15,9 @@ class DockerClient:
         self.command = command
 
     def _run(self, args: list[str], *, input_text: str | None = None,
-             env: dict[str, str] | None = None) -> str:
+             env: dict[str, str] | None = None, timeout: int = 300) -> str:
         result = self.command(args, input=input_text, text=True, capture_output=True,
-                              check=False, timeout=300, env=env)
+                              check=False, timeout=timeout, env=env)
         if result.returncode:
             raise RuntimeError(f"Docker command failed ({result.returncode}): {' '.join(args[:5])}: {result.stderr.strip()}")
         return result.stdout
@@ -41,9 +44,11 @@ class DockerClient:
     def inspect(self, container: str) -> dict:
         return json.loads(self._run(["docker", "inspect", container]))[0]
 
-    def exec_json(self, container: str, command: list[str], input_data: object | None = None) -> dict:
+    def exec_json(self, container: str, command: list[str], input_data: object | None = None,
+                  *, timeout_seconds: int = 300) -> dict:
         raw = self._run(["docker", "exec", "-i", container, *command],
-                        input_text=json.dumps(input_data) if input_data is not None else None)
+                        input_text=json.dumps(input_data) if input_data is not None else None,
+                        timeout=timeout_seconds)
         try:
             result = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -60,3 +65,83 @@ class DockerClient:
         if memory_mb is not None:
             args += ["--memory", f"{memory_mb}m"]
         self._run([*args, container])
+
+    def volume_exists(self, name: str) -> bool:
+        names = self._run(["docker", "volume", "ls", "-q", "--filter", f"name=^{name}$"])
+        return name in names.splitlines()
+
+    def volume_entries(self, name: str, helper_image: str) -> dict:
+        script = (
+            "import json,pathlib; p=pathlib.Path('/data'); "
+            "m=p/'.memory-bench-golden.json'; "
+            "print(json.dumps({x.name:json.loads(x.read_text()) if x==m else None "
+            "for x in p.iterdir()}))"
+        )
+        return json.loads(self._run(["docker", "run", "--rm", "-v", f"{name}:/data:ro",
+                                     "--entrypoint", "python3", helper_image, "-c", script]))
+
+    def volume_digest(self, name: str, helper_image: str) -> str:
+        from .deployment_golden import MARKER
+
+        script = Path(__file__).with_name("deployment_volume_digest.py").resolve()
+        digest = self._run(["docker", "run", "--rm", "-v", f"{name}:/data:ro",
+                            "-v", f"{script}:/opt/volume_digest.py:ro", "--entrypoint", "python3",
+                            helper_image, "/opt/volume_digest.py", "/data", MARKER], timeout=3600).strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("volume digest helper returned an invalid SHA-256")
+        return digest
+
+    def create_volume(self, name: str, *, project: str | None = None,
+                      volume_key: str | None = None) -> None:
+        args = ["docker", "volume", "create"]
+        if project and volume_key:
+            args += ["--label", f"com.docker.compose.project={project}",
+                     "--label", f"com.docker.compose.volume={volume_key}"]
+        self._run([*args, name])
+
+    @contextmanager
+    def claim_golden(self, name: str, helper_image: str):
+        lock_name = "memory-bench-golden-" + hashlib.sha256(name.encode()).hexdigest()
+        container = self._run(["docker", "create", "--name", lock_name,
+                               "--label", f"memory-bench.golden-lock={name}",
+                               "--entrypoint", "python3", helper_image, "-c", "pass"]).strip()
+        if not container:
+            raise RuntimeError("Docker did not return a Golden lock container ID")
+        try:
+            yield
+        finally:
+            self._run(["docker", "rm", container])
+
+    def running_volume_containers(self, name: str) -> list[str]:
+        return self._run(["docker", "ps", "-q", "--filter", f"volume={name}"]).splitlines()
+
+    def attached_volume_containers(self, name: str) -> list[str]:
+        return self._run(["docker", "ps", "-aq", "--filter", f"volume={name}"]).splitlines()
+
+    def copy_volume(self, source: str, target: str, helper_image: str) -> None:
+        script = (
+            "set -eu; "
+            "need=$(du -sk /source | cut -f1); "
+            "free=$(df -Pk /target | tail -1 | awk '{print $4}'); "
+            "test \"$free\" -ge \"$((need * 11 / 10))\" || "
+            "{ echo 'not enough disk space to clone Golden volume' >&2; exit 1; }; "
+            "cp -a /source/. /target/; sync"
+        )
+        self._run(["docker", "run", "--rm", "-v", f"{source}:/source:ro",
+                   "-v", f"{target}:/target", "--entrypoint", "sh", helper_image, "-c", script],
+                  timeout=3600)
+
+    def write_volume_manifest(self, name: str, manifest: dict,
+                              helper_image: str) -> None:
+        script = ("import json,pathlib,sys; "
+                  "pathlib.Path('/data/.memory-bench-golden.json').write_text("
+                  "json.dumps(json.load(sys.stdin),sort_keys=True)+'\\n')")
+        self._run(["docker", "run", "--rm", "-i", "-v", f"{name}:/data",
+                   "--entrypoint", "python3", helper_image, "-c", script],
+                  input_text=json.dumps(manifest))
+
+    def stop_container(self, container: str) -> None:
+        self._run(["docker", "stop", "-t", "120", container])
+
+    def remove_volume(self, name: str) -> None:
+        self._run(["docker", "volume", "rm", name])
