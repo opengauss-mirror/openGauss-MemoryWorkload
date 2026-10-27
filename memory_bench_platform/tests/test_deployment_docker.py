@@ -61,3 +61,18 @@ def test_golden_finalize_docker_exec_honors_compaction_timeout():
 
     DockerClient(recorder).exec_json("milvus", ["compact"], timeout_seconds=3600)
     assert calls == [(["docker", "exec", "-i", "milvus", "compact"], 3600)]
+
+
+def test_volume_digest_mounts_data_and_helper_read_only():
+    calls = []
+
+    def recorder(args, **kwargs):
+        calls.append((args, kwargs["timeout"]))
+        return subprocess.CompletedProcess(args, 0, "a" * 64 + "\n", "")
+
+    assert DockerClient(recorder).volume_digest("golden", "python:3.11-alpine") == "a" * 64
+    args, timeout = calls[0]
+    assert "golden:/data:ro" in args
+    assert any(value.endswith("/deployment_volume_digest.py:/opt/volume_digest.py:ro") for value in args)
+    assert args[-3:] == ["/opt/volume_digest.py", "/data", ".memory-bench-golden.json"]
+    assert timeout == 3600

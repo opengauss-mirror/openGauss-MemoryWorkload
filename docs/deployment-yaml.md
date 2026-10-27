@@ -127,7 +127,7 @@ shared_memory_instances:
     memory: mem0
     vector: milvus
     preparation:
-      seed: {enabled: true, target: memory, command: [python, /app/seed.py]}
+      seed: {enabled: true, target: memory, command: [python, /app/seed.py], timeout_seconds: 3600}
       readiness: {enabled: true, target: memory, command: [python, /app/index_ready.py]}
       golden_volume:
         name: milvus_locomo_golden
@@ -143,6 +143,6 @@ shared_memory_instances:
 
 上例的命令和镜像仅示意：`seed` 必须返回 `inserted`、`deleted_dynamic: 0`、`deleted_seed: 0`，以及每个用户的 `user_id`、`validated_count` 和 `reused: false`；`finalize` 必须在 flush 和 compaction 完成后返回 `{"status":"complete","collections":[{"collection":"memory_001","state":"Completed"}]}`。`readiness` 必须验证当前镜像下 HNSW 索引已加载且稳定，并返回 `{"ready":true}`。辅助镜像需要 `python3`、`sh`、`cp -a`、`du`、`df` 和 `sync`。确保 Milvus 的全部持久化状态确实位于该单一命名卷；分散在多个卷或宿主目录的部署不能使用此配置。
 
-匹配时比较 collection、用户列表、每用户行数、维度、seed 版本和索引参数；服务名称及 Milvus 镜像 ID 只记录在清单中，不阻止复用。换镜像后的 Runtime 卷仍须通过当前部署的健康检查和索引就绪检查。Golden 卷不完整或基线不匹配时，部署在写入前失败；需要重建基线时请使用新的 Golden 卷名。`state.json` 的 `preparation.<实例>.golden_volume` 记录本次是 `built` 还是 `reused`、Runtime 卷名及复制耗时。对于已部署的 Mem0，可从 `.memory-bench/deployments/<部署名>/state.json` 中读取 `ports.<实例>.memory["8000/tcp"]`，设为 `MEM0_API_URL=http://127.0.0.1:<端口>`，再运行 `production-mem0-sample` 的 trace replay。回放产生的写入只进入 Runtime 卷；若要再次从同一基线测试，先 `undeploy` 并重新 `deploy`，不要复用已写入的 Runtime 卷。
+匹配时比较 collection、用户列表、每用户行数、维度、seed 版本和索引参数；服务名称及 Milvus 镜像 ID 只记录在清单中，不阻止复用。封存时记录卷内全部目录、文件内容和符号链接的 SHA-256 摘要；复用前及复制后再次校验。旧版清单没有摘要，不能复用，需要使用新的 Golden 卷名重新构建。部署开始前也会拒绝已存在的同名 Runtime 卷，避免使用或清理遗留数据。换镜像后的 Runtime 卷仍须通过当前部署的健康检查和索引就绪检查。Golden 卷不完整或基线不匹配时，部署在写入前失败；需要重建基线时请使用新的 Golden 卷名。`state.json` 的 `preparation.<实例>.golden_volume` 记录本次是 `built` 还是 `reused`、Runtime 卷名及复制耗时。对于已部署的 Mem0，可从 `.memory-bench/deployments/<部署名>/state.json` 中读取 `ports.<实例>.memory["8000/tcp"]`，设为 `MEM0_API_URL=http://127.0.0.1:<端口>`，再运行 `production-mem0-sample` 的 trace replay。回放产生的写入只进入 Runtime 卷；若要再次从同一基线测试，先 `undeploy` 并重新 `deploy`，不要复用已写入的 Runtime 卷。
 
 Agent/Memory 的 `verify.command` 返回 JSON，至少包含 `version`、`endpoints`、`reachable` 和 `effective_parameters`。平台用它核对实际版本、依赖地址、连通性及允许覆盖的配置项生效值。敏感配置内容和 CLI 值不会写入状态或日志。`deploy status` 与 `run --deployment` 都复核容器、镜像、配置文件哈希和实际生效配置；发现漂移时拒绝运行。`undeploy` 仅清理部署状态记录归属的 Compose project、数据卷和生成文件。

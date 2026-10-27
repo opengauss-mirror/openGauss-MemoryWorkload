@@ -167,7 +167,8 @@ def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], doc
                     raise DeploymentFailed("seed_resource_boost requires a vector with original resource limits")
                 docker.update_resources(vector_id, cpus=boost.cpus, memory_mb=boost.memory_mb)
                 boosted = True
-            seed_summary = docker.exec_json(containers[_target_service(group, prep.seed.target)], prep.seed.command)
+            seed_summary = docker.exec_json(containers[_target_service(group, prep.seed.target)],
+                                            prep.seed.command, timeout_seconds=prep.seed.timeout_seconds)
             if golden_manifest is not None:
                 validate_seed_summary(seed_summary, golden_manifest)
             outcome["seed"] = True
@@ -215,22 +216,24 @@ def _golden_before_deploy(group: DeploymentGroup, rendered: dict,
                           docker: DockerClient) -> tuple[dict, str, float]:
     spec = group.preparation.golden_volume
     manifest = expected_manifest(spec, "vector", docker.inspect_image(group.vector_template.image.name)["Id"])
-    if not docker.volume_exists(spec.name):
-        return manifest, "build", 0.0
-    if classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest) != "ready":
-        raise DeploymentFailed("Golden volume is not ready")
-    if docker.attached_volume_containers(spec.name):
-        raise DeploymentFailed("Golden volume is attached to a container")
     key, runtime = _golden_volume_names(rendered)
     if docker.volume_exists(runtime):
         raise DeploymentFailed("Runtime volume already exists")
+    if not docker.volume_exists(spec.name):
+        return manifest, "build", 0.0
+    if classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest,
+                       docker.volume_digest(spec.name, spec.helper_image)) != "ready":
+        raise DeploymentFailed("Golden volume is not ready")
+    if docker.attached_volume_containers(spec.name):
+        raise DeploymentFailed("Golden volume is attached to a container")
     started = time.monotonic()
     docker.create_volume(runtime, project=rendered["name"], volume_key=key)
     try:
         if docker.volume_entries(runtime, spec.helper_image):
             raise DeploymentFailed("Runtime volume already contains data")
         docker.copy_volume(spec.name, runtime, spec.helper_image)
-        classify_volume(docker.volume_entries(runtime, spec.helper_image), manifest)
+        classify_volume(docker.volume_entries(runtime, spec.helper_image), manifest,
+                        docker.volume_digest(runtime, spec.helper_image))
     except BaseException:
         docker.remove_volume(runtime)
         raise
@@ -249,14 +252,17 @@ def _golden_after_seed(group: DeploymentGroup, rendered: dict, containers: dict[
     _, runtime = _golden_volume_names(rendered)
     if docker.running_volume_containers(runtime):
         raise DeploymentFailed("Runtime volume is still in use")
+    runtime_digest = docker.volume_digest(runtime, spec.helper_image)
     if docker.volume_exists(spec.name):
         raise DeploymentFailed("Golden volume appeared during baseline build")
     docker.create_volume(spec.name)
     if docker.volume_entries(spec.name, spec.helper_image):
         raise DeploymentFailed("Golden volume already contains data")
     docker.copy_volume(runtime, spec.name, spec.helper_image)
-    docker.write_volume_manifest(spec.name, manifest, spec.helper_image)
-    classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest)
+    if docker.volume_digest(spec.name, spec.helper_image) != runtime_digest:
+        raise DeploymentFailed("Golden volume data digest mismatch after copy")
+    docker.write_volume_manifest(spec.name, {**manifest, "data_sha256": runtime_digest}, spec.helper_image)
+    classify_volume(docker.volume_entries(spec.name, spec.helper_image), manifest, runtime_digest)
     docker.compose_up(rendered["name"], compose_file, env=os.environ.copy())
     for service_name in ("vector", "memory"):
         if docker.compose_ps(rendered["name"], compose_file, service_name) != containers[service_name]:

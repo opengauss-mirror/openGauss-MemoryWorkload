@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -76,6 +77,17 @@ class DockerClient:
         )
         return json.loads(self._run(["docker", "run", "--rm", "-v", f"{name}:/data:ro",
                                      "--entrypoint", "python3", helper_image, "-c", script]))
+
+    def volume_digest(self, name: str, helper_image: str) -> str:
+        from .deployment_golden import MARKER
+
+        script = Path(__file__).with_name("deployment_volume_digest.py").resolve()
+        digest = self._run(["docker", "run", "--rm", "-v", f"{name}:/data:ro",
+                            "-v", f"{script}:/opt/volume_digest.py:ro", "--entrypoint", "python3",
+                            helper_image, "/opt/volume_digest.py", "/data", MARKER], timeout=3600).strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("volume digest helper returned an invalid SHA-256")
+        return digest
 
     def create_volume(self, name: str, *, project: str | None = None,
                       volume_key: str | None = None) -> None:

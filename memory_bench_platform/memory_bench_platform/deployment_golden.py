@@ -1,6 +1,8 @@
 """Validate reusable Milvus baseline volumes before deployment writes."""
 from __future__ import annotations
 
+import re
+
 from .deployment_config import GoldenVolume
 
 
@@ -11,7 +13,7 @@ _BASELINE_FIELDS = ("schema_version", "collection", "users", "count_per_user",
 
 def expected_manifest(config: GoldenVolume, service: str, image_id: str) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "service": service,
         "image_id": image_id,
         "collection": config.collection,
@@ -27,7 +29,7 @@ def baseline_matches(saved: dict, expected: dict) -> bool:
     return all(saved.get(field) == expected.get(field) for field in _BASELINE_FIELDS)
 
 
-def classify_volume(entries: dict, expected: dict) -> str:
+def classify_volume(entries: dict, expected: dict, actual_digest: str | None = None) -> str:
     if not entries:
         return "build"
     marker = entries.get(MARKER)
@@ -35,6 +37,11 @@ def classify_volume(entries: dict, expected: dict) -> str:
         raise ValueError("Golden volume is incomplete; use a new volume name")
     if not baseline_matches(marker, expected):
         raise ValueError("Golden volume manifest does not match this baseline")
+    saved_digest = marker.get("data_sha256")
+    if not isinstance(saved_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", saved_digest):
+        raise ValueError("Golden volume is incomplete; use a new volume name")
+    if actual_digest != saved_digest:
+        raise ValueError("Golden volume data digest mismatch")
     return "ready"
 
 

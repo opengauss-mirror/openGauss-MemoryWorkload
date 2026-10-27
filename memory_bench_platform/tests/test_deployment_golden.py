@@ -19,16 +19,19 @@ def _golden():
 
 def test_golden_match_uses_baseline_contents_across_service_and_image_changes():
     expected = expected_manifest(_golden(), "vector-new", "sha256:new")
-    saved = {**expected, "service": "vector-old", "image_id": "sha256:old"}
-    assert classify_volume({MARKER: saved, "etcd": None}, expected) == "ready"
+    digest = "a" * 64
+    saved = {**expected, "service": "vector-old", "image_id": "sha256:old", "data_sha256": digest}
+    assert classify_volume({MARKER: saved, "etcd": None}, expected, digest) == "ready"
     with pytest.raises(ValueError, match="does not match"):
-        classify_volume({MARKER: {**saved, "users": ["other"]}, "etcd": None}, expected)
+        classify_volume({MARKER: {**saved, "users": ["other"]}, "etcd": None}, expected, digest)
+    with pytest.raises(ValueError, match="digest mismatch"):
+        classify_volume({MARKER: saved, "etcd": None}, expected, "b" * 64)
 
 
 def test_golden_rejects_partial_or_unsealed_volume():
     expected = expected_manifest(_golden(), "vector", "sha256:image")
     assert classify_volume({}, expected) == "build"
-    for entries in ({"etcd": None}, {MARKER: expected}):
+    for entries in ({"etcd": None}, {MARKER: expected}, {MARKER: expected, "etcd": None}):
         with pytest.raises(ValueError, match="incomplete"):
             classify_volume(entries, expected)
 
