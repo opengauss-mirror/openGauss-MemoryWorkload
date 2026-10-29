@@ -86,13 +86,15 @@ def test_file_receipt_fallback_without_duplicate_recall(monkeypatch):
     assert len(calls)==2
 
 
-def test_console_receipt_does_not_need_file_fallback(monkeypatch):
+def test_console_receipt_still_checks_file_logs(monkeypatch):
     from types import SimpleNamespace
+    calls = []
     def execute(args, **kwargs):
-        assert args[1]=='logs'
-        return SimpleNamespace(stdout=LINE+' memos.agent_end.skipped',stderr='',returncode=0)
+        calls.append(args[1])
+        return SimpleNamespace(stdout=LINE+' memos.agent_end.skipped' if args[1]=='logs' else '',stderr='',returncode=0)
     monkeypatch.setattr(a.subprocess,'run',execute)
     assert 'memos.agent_end.skipped' in a.container_logs('dedicated',123)
+    assert calls == ['logs', 'exec']
 
 FILES={a.QA_WORKSPACE+'/history/tr_1.txt':{'trace_id':'tr_1'}}
 def call(cid,name,path=None):

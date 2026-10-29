@@ -102,10 +102,10 @@ def recall_receipt(text):
 def container_logs(name, since):
     p = subprocess.run(['docker', 'logs', '--since', str(since), name], capture_output=True, text=True, check=True, timeout=15)
     text = p.stdout + '\n' + p.stderr
-    # OpenClaw can suppress repeated console lines while retaining file logs.
-    # Read only native MemOS messages from the same exclusive request window.
-    if 'memos.agent_end.skipped' not in text or recall_receipt(text) is None:
-        script = r"""
+    # Check each source independently: duplicate receipts or failures in either
+    # source must not be hidden by merging. Always inspect the file window.
+    console_recall = recall_receipt(text)
+    script = r"""
 const fs=require('node:fs');const since=Number(process.argv[1])*1000;
 const dir='/tmp/openclaw';
 if(fs.existsSync(dir))for(const file of fs.readdirSync(dir).filter(n=>/^openclaw-.*\.log$/.test(n))){
@@ -113,17 +113,29 @@ if(fs.existsSync(dir))for(const file of fs.readdirSync(dir).filter(n=>/^openclaw
   let row;try{row=JSON.parse(line);}catch{continue;}
   const stamp=Date.parse(row.time??row._meta?.date);
   const message=row.message??row['1'];
-  if(Number.isFinite(stamp)&&stamp>=since&&typeof message==='string'&&message.startsWith('memos.'))console.log(message);
+  if(Number.isFinite(stamp)&&stamp>=since&&typeof message==='string'&&
+     (message.startsWith('memos.')||message.includes('closeSession.flush_failed')))console.log(message);
  }
 }
 """
+    try:
         fallback = subprocess.run(['docker', 'exec', name, 'node', '-e', script, str(since)],
                                   capture_output=True, text=True, timeout=15)
-        if fallback.returncode == 0:
-            for line in fallback.stdout.splitlines():
-                if line and line not in text:
-                    text += '\n' + line
-    return text
+    except (OSError, subprocess.TimeoutExpired):
+        return text
+    if fallback.returncode != 0:
+        return text
+    file_text = fallback.stdout
+    file_recall = recall_receipt(file_text)
+    if console_recall and file_recall and console_recall != file_recall:
+        raise RuntimeError('Conflicting recall receipts across native log sources')
+    # Keep all file events, including identical messages. Select one source for
+    # recall counting; only supplement completion markers from the other source.
+    selected = file_text if file_recall is not None else text
+    for marker in ('memos.agent_end.skipped', 'memos.onTurnEnd'):
+        if marker not in selected and (marker in text or marker in file_text):
+            selected += '\n' + marker
+    return selected
 
 
 def load_runtime():

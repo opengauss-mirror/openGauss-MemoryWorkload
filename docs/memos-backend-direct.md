@@ -4,7 +4,7 @@
 
 ## 服务要求
 
-使用独立 MemOS 实例和独立存储，启用原生 scheduler。同步 `/product/add` 完成提取和落库后仍可能提交后台整理，适配器会查询 `/product/scheduler/allstatus`，等待 waiting/in_progress/pending 全部为零；失败、取消或状态不可观测均报运行失败。该状态接口是实例级，因此不能与其他负载共享实例。HTTP 写入没有自动重试；会话 ID 用于来源关联，不代表服务提供幂等保证。
+使用独立 MemOS 实例和独立存储，启用原生 scheduler。同步 `/product/add` 完成提取和落库后仍可能提交后台整理，适配器会查询 `/product/scheduler/allstatus`，等待 waiting/in_progress/pending 全部为零；失败、取消或状态不可观测均报运行失败。该状态接口是实例级，因此不能与其他负载共享实例。写入、检索和 scheduler 状态请求均禁止自动 HTTP 重定向；MEMOS_API_URL 必须直接指向实际服务地址，重定向按运行失败处理，避免凭据跨源转发或 HTTPS 降级。HTTP 写入没有自动重试；会话 ID 用于来源关联，不代表服务提供幂等保证。
 
 使用官方 Docker 部署所需的 Neo4j、Qdrant 和模型配置。固定源码 commit/镜像摘要，记录原生配置。不要复用别人的数据库。官方参考：https://github.com/MemTensor/MemOS/tree/main/docker
 

@@ -10,6 +10,13 @@ import urllib.error
 import urllib.request
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward credentials or replay operations to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class InvalidHistoricalTime(ValueError):
     """Invalid explicitly supplied historical time; never substitute wall time."""
 
@@ -74,7 +81,7 @@ def _memories(data):
 
 def run_operation(request, *, environ=None, urlopen=None):
     env = dict(os.environ if environ is None else environ)
-    opener = urlopen or urllib.request.urlopen
+    opener = urlopen or urllib.request.build_opener(NoRedirect()).open
     started = time.monotonic()
     operation = {}
     try:

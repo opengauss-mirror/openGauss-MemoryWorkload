@@ -174,3 +174,90 @@ def test_nullable_native_results_remain_supported(data):
     r, _ = invoke(inputs={"query": "Where?"}, data={
         "code": 200, "message": "Search completed successfully", "data": data})
     assert r["state"] == "completed" and r["output"]["memories"] == []
+
+
+@pytest.mark.parametrize("code", [200, 301, 302, 303, 307, 308])
+@pytest.mark.parametrize("redirect_path", [
+    "/product/add", "/product/search", "/product/scheduler/allstatus",
+])
+def test_http_redirect_never_reaches_target(code, redirect_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    source_calls, target_calls = [], []
+    def payload(path):
+        if path == "/product/add":
+            return {"code": 200, "message": "Memory added successfully", "data": []}
+        if path == "/product/search":
+            return {"code": 200, "message": "Search completed successfully",
+                    "data": {"text_mem": []}}
+        return {"code": 200, "data": {"scheduler_summary": dict(
+            waiting=0, in_progress=0, pending=0, failed=0, cancelled=0)}}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.do_GET()
+
+        def do_GET(self):
+            calls = source_calls if self.server is source else target_calls
+            calls.append((self.command,
+                          self.path, self.headers.get("Authorization")))
+            if self.server is source and self.path == redirect_path and code != 200:
+                self.send_response(code)
+                self.send_header("Location", target_url + self.path)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = json.dumps(payload(self.path)).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    target = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    target_url = f"http://127.0.0.1:{target.server_port}"
+    threads = [Thread(target=s.serve_forever, kwargs={"poll_interval": .01})
+               for s in (source, target)]
+    for thread in threads:
+        thread.start()
+    try:
+        action = "recall" if redirect_path == "/product/search" else "ingest"
+        result = runner.run_operation({"action": action, "task_id": "redirect-test",
+            "inputs": {"scope_id": "redirect-test", "query": "Where?", "content": "history"}},
+            environ={"MEMOS_API_URL": f"http://127.0.0.1:{source.server_port}",
+                     "MEMOS_API_KEY": "synthetic-redirect-secret", "MEMOS_EXCLUSIVE_INSTANCE": "1",
+                     "MEMOS_HTTP_TIMEOUT_SECONDS": "5"})
+        assert result["state"] == ("completed" if code == 200 else "failed")
+        assert target_calls == []
+        assert [c[1] for c in source_calls] == (
+            ["/product/add", "/product/scheduler/allstatus"]
+            if redirect_path.endswith("allstatus") or (code == 200 and action == "ingest")
+            else [redirect_path])
+        assert all(c[2] == "Token synthetic-redirect-secret" for c in source_calls)
+        assert "synthetic-redirect-secret" not in json.dumps(result)
+        assert target_url not in json.dumps(result)
+    finally:
+        for server in (source, target):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("target", ["http://example.test/target", "https://example.test/target"])
+def test_redirect_handler_rejects_downgrade_and_same_origin(code, target):
+    import urllib.error
+    import urllib.request
+    opener = urllib.request.build_opener(runner.NoRedirect())
+    request = urllib.request.Request("https://example.test/source",
+                                     headers={"Authorization": "Token synthetic-secret"})
+    # Exercise the standard handler dispatch with the custom redirect policy.
+    with pytest.raises(urllib.error.HTTPError) as error:
+        opener.error("http", request, io.BytesIO(), code, "Redirect", {"location": target})
+    assert error.value.code == code
