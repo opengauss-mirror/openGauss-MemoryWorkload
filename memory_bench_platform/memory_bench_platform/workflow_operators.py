@@ -118,20 +118,34 @@ def _execute_agent(
     failure = failed_check("before_agent")
     if failure is not None:
         return failure
-    result = token_usage.capture_agent(agent_runner, agent_id, rendered)
-    if not isinstance(result, dict):
-        raise ValueError("agent runner returned a non-object response")
-    if str(result.get("status") or "") not in {"ok", "failed"}:
-        raise ValueError("agent runner response requires status=ok|failed")
-    turns = result.get("turns", [])
-    answer = str(result.get("agent_answer") or result.get("text_output") or "").strip()
-    if not answer and isinstance(turns, list):
-        for turn in reversed(turns):
-            if isinstance(turn, dict) and turn.get("text"):
-                answer = str(turn["text"]).strip()
-                break
-    if result["status"] == "ok" and not answer:
-        raise ValueError("successful agent runner response requires a final answer text")
+    result = {}
+    try:
+        result = token_usage.capture_agent(agent_runner, agent_id, rendered)
+        if not isinstance(result, dict):
+            raise ValueError("agent runner returned a non-object response")
+        if str(result.get("status") or "") not in {"ok", "failed"}:
+            raise ValueError("agent runner response requires status=ok|failed")
+        turns = result.get("turns", [])
+        answer = str(result.get("agent_answer") or result.get("text_output") or "").strip()
+        if not answer and isinstance(turns, list):
+            for turn in reversed(turns):
+                if isinstance(turn, dict) and turn.get("text"):
+                    answer = str(turn["text"]).strip()
+                    break
+        if result["status"] == "ok" and not answer:
+            raise ValueError("successful agent runner response requires a final answer text")
+    except Exception as exc:
+        # The runner can raise (HTTP errors/timeouts, invalid JSON) after the
+        # plugin acquired a request lease. Let the declared hook settle it;
+        # preserve the original failure even when cleanup itself fails.
+        try:
+            check("after_agent", check_context=check_context, agent_result={
+                **(result if isinstance(result, dict) else {}),
+                "status": "failed", "error": {"type": type(exc).__name__},
+            })
+        except Exception as cleanup_error:
+            exc.add_note("after_agent cleanup raised " + type(cleanup_error).__name__)
+        raise
     normalized = dict(result)
     normalized["agent_answer"] = answer
     check("after_agent", check_context=check_context, agent_result=result)

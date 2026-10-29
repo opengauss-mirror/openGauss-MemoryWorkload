@@ -69,3 +69,48 @@ def test_noncompleted_before_check_does_not_start_agent():
     result = _execute_agent(step(), "openclaw", agent, context(actions=["before_agent"]),
                             lambda *a: MemoryPluginTaskOutput(status="ok", state="accepted"))
     assert result["status"] == "failed" and "accepted" in result["error_message"]
+
+
+@pytest.mark.parametrize('cleanup_raises', [False, True])
+def test_agent_exception_still_calls_after_and_preserves_original(cleanup_raises):
+    original = TimeoutError('upstream timed out')
+    seen = []
+    def agent(*args):
+        seen.append('agent')
+        raise original
+    def plugin(_id, request):
+        seen.append(request.action)
+        if request.action == 'after_agent':
+            assert request.inputs['check_context'] == {'nonce': 'owned'}
+            assert request.inputs['agent_result'] == {'status': 'failed', 'error': {'type': 'TimeoutError'}}
+            if cleanup_raises:
+                raise RuntimeError('cleanup failed')
+        return MemoryPluginTaskOutput(status='ok', state='completed', output={'nonce':'owned'})
+    with pytest.raises(TimeoutError) as caught:
+        _execute_agent(step(), 'openclaw', agent, context(actions=['before_agent','after_agent']), plugin)
+    assert caught.value is original
+    assert seen == ['before_agent', 'agent', 'after_agent']
+    if cleanup_raises:
+        assert 'RuntimeError' in original.__notes__[0]
+
+
+@pytest.mark.parametrize('result', [None, {}, {'status':'ok','turns':[]}])
+def test_invalid_agent_response_also_releases_via_failure_hook(result):
+    seen = []
+    def plugin(_id, request):
+        seen.append(request.action)
+        if request.action == 'after_agent':
+            assert request.inputs['agent_result']['status'] == 'failed'
+            assert request.inputs['agent_result']['error']['type'] == 'ValueError'
+        return MemoryPluginTaskOutput(status='ok',state='completed')
+    with pytest.raises(ValueError):
+        _execute_agent(step(),'openclaw',lambda *args:result,context(actions=['before_agent','after_agent']),plugin)
+    assert seen == ['before_agent','after_agent']
+
+
+@pytest.mark.parametrize('mode,actions', [('backend_direct',['before_agent','after_agent']),('agent_plugin',[])])
+def test_exception_does_not_invoke_unbound_hooks(mode, actions):
+    def agent(*args): raise TimeoutError('original')
+    def plugin(*args): pytest.fail('unbound hook invoked')
+    with pytest.raises(TimeoutError,match='original'):
+        _execute_agent(step(),'openclaw',agent,context(mode,actions),plugin)
