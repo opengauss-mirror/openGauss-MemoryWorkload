@@ -1,0 +1,28 @@
+kind: memory_plugin
+id: openclaw-memos-local
+version: 0.1.0
+agent: openclaw
+memory: memos
+entry:
+  runner: scripts/run_lifecycle.py
+runtime:
+  actions: [validate, prepare, set_phase, before_agent, after_agent, finalize]
+capabilities:
+  auto_capture: true
+  auto_recall: true
+  qa_read_only: true
+  namespace_isolation: true
+  extraction_trigger: agent_native_agent_end
+  commit:
+    supported: false
+    required_after_ingest: false
+  readiness:
+    supported: false
+phases:
+  ingest: {capture: true, recall: true}
+  qa: {capture: false, recall: true}
+integration:
+  protocol_version: memory-plugin/1
+lifecycle:
+  phases: [ingest, qa]
+  actions: [validate, prepare, set_phase, before_agent, after_agent, finalize]
