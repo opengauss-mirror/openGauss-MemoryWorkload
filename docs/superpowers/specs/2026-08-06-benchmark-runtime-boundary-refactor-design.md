@@ -330,16 +330,18 @@ flowchart LR
 
 Memory/Plugin Runtime 应尽量返回 `operation_id`、`checkpoint_token` 或等价的可追踪凭证。`wait_ready` 应针对本阶段凭证确认完成，不使用无法归属到具体写入批次的固定 sleep。
 
-一个 checkpoint 可以包含多个 ingest operation。统一执行粒度为：
+一个 checkpoint 可以包含多个 ingest operation。`backend_direct` 在同一样本的历史作用域内按事件顺序生成依赖链：
 
 ```text
-本阶段全部 ingest
-  → 对需要提交的 operation 全部 commit/flush
-  → 对需要等待的 operation 全部 wait_ready
-  → 所有 operation ready 后进入 Evaluation
+事件 1 ingest → 按能力执行 commit/flush → 按能力 wait_ready 成功
+  → 事件 2 ingest → 按能力执行 commit/flush → 按能力 wait_ready 成功
+  → 后续事件
+  → 本阶段全部 operation ready 后进入 Evaluation
 ```
 
-Adapter 可以提供真正的批量 commit，也可以保留每个 Session 一个 operation；后一种情况下 Composer 负责按上述三段式顺序编排，并把所有 operation 归属于同一个 `checkpoint_id`。禁止恢复为“ingest 一个、commit 并等待一个、再 ingest 下一个”的交错顺序，因为它会改变同一阶段内的抽取边界和性能口径。
+Composer 复用 Runtime 的 commit/readiness 能力声明；同步且无需 commit 的 Runtime 仍只有顺序 ingest，异步但无需 commit 的 Runtime 在每次 ingest 后等待。等待必须针对当前 operation 确认 `completed`，不能把 `accepted` 当作完成。失败或超时沿已有依赖链阻止后续历史和该 checkpoint 的 Evaluation，不自动重放可能已部分写入的 commit。不同隔离样本之间不新增全局串行约束。
+
+这一顺序避免同一历史作用域的多个后台提取任务重叠；它可能改变记忆更新时可见的状态及历史准备耗时，因此比较报告应注明编排版本，不能直接把与旧批量流程的耗时差异归因于后端性能。`agent_plugin` 的编排本次不变，仍按其已有阶段流程执行。所有 operation 继续归属于同一个 `checkpoint_id`。
 
 `memory/1` 和 `memory-plugin/1` 首版不要求 Runtime 伪造单一 checkpoint token。平台以共享的 `checkpoint_id` 聚合本阶段 `operations[]`，当所有 operation 均进入 `completed` 时，该 checkpoint 才视为 ready。若 Runtime 原生提供批次 token，可放在 `operation.checkpoint_token` 中，但其语义必须是“本批次全部写入可查询”，不能只是请求已接受。
 

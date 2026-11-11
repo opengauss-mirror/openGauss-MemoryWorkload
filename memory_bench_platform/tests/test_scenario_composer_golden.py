@@ -70,7 +70,18 @@ def test_multi_checkpoint_direct_plan_preserves_stage_boundaries():
     assert {step["inputs"]["scope_id"] for step in scoped_steps} == {"run-golden:sample-1"}
 
 
-def test_checkpoint_barrier_finishes_all_commits_before_any_wait():
+@pytest.mark.parametrize(
+    "commit_required, readiness_required, expected_order",
+    [
+        (True, True, ["ingest", "flush", "wait"] * 2),
+        (False, True, ["ingest", "wait"] * 2),
+        (True, False, ["ingest", "flush"] * 2),
+        (False, False, ["ingest"] * 2),
+    ],
+)
+def test_checkpoint_finishes_each_event_before_starting_the_next(
+    commit_required, readiness_required, expected_order,
+):
     payload = _scenario().model_dump(mode="json")
     payload["samples"][0]["timeline"].insert(
         1,
@@ -85,9 +96,9 @@ def test_checkpoint_barrier_finishes_all_commits_before_any_wait():
         _binding("backend_direct"),
         {
             "memory": {
-                "async_ingest": True,
-                "commit": {"required_after_ingest": True},
-                "readiness": {"supported": True},
+                "async_ingest": readiness_required,
+                "commit": {"required_after_ingest": commit_required},
+                "readiness": {"supported": readiness_required},
             }
         },
     )
@@ -99,7 +110,17 @@ def test_checkpoint_barrier_finishes_all_commits_before_any_wait():
         for step in first_stage
         if step["operator_kind"] in {"memory", "poll"}
     ]
-    assert action_order == ["ingest", "ingest", "flush", "flush", "wait", "wait"]
+    assert action_order == expected_order
+    for index, step in enumerate(first_stage):
+        assert step["depends_on"] == (
+            [first_stage[index - 1]["step_id"]] if index else []
+        )
+        if step["operator_kind"] == "poll":
+            assert step["inputs"]["probe"]["inputs"]["operation"] == {
+                "$ref": f"steps.{first_stage[index - 1]['step_id']}.output.operation"
+            }
+            assert step["inputs"]["success_when"] == {"path": "state", "equals": "completed"}
+            assert step["inputs"]["failure_when"] == {"path": "state", "equals": "failed"}
     assert all(
         step["inputs"].get("checkpoint_id") == "checkpoint-1"
         for step in first_stage
