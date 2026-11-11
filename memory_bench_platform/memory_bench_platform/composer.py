@@ -246,7 +246,8 @@ def _compose_backend_direct(
                 )
             )
             previous_step_id = ""
-            ingested_events: list[tuple[TimelineEvent, str]] = []
+            commit_required, readiness_required = _direct_barrier_policy(runtime_capabilities)
+            # Preserve historical order through backend completion, not just acceptance.
             for timeline_event in pending_events:
                 event_slug = _slug(timeline_event.event_id)
                 ingest_step_id = f"{setup_case_id}-{event_slug}-ingest"
@@ -269,15 +270,9 @@ def _compose_backend_direct(
                         },
                     )
                 )
-                ingested_events.append((timeline_event, ingest_step_id))
                 previous_step_id = ingest_step_id
 
-            commit_required, readiness_required = _direct_barrier_policy(runtime_capabilities)
-            readiness_operations: list[tuple[TimelineEvent, str]] = []
-            for timeline_event, ingest_step_id in ingested_events:
-                event_slug = _slug(timeline_event.event_id)
                 flush_step_id = f"{setup_case_id}-{event_slug}-flush"
-                wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                 readiness_operation_step_id = ingest_step_id
                 if commit_required:
                     steps.append(
@@ -303,10 +298,7 @@ def _compose_backend_direct(
                     )
                     previous_step_id = flush_step_id
                     readiness_operation_step_id = flush_step_id
-                readiness_operations.append((timeline_event, readiness_operation_step_id))
-            if readiness_required:
-                for timeline_event, readiness_operation_step_id in readiness_operations:
-                    event_slug = _slug(timeline_event.event_id)
+                if readiness_required:
                     wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                     steps.append(
                         _step(
