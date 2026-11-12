@@ -28,11 +28,22 @@ The flush `operation.task_id` identifies the synchronous adapter operation, not 
 | `OGMEM_ACCOUNT_ID` | `memory-bench`; prefix for per-episode accounts |
 | `OGMEM_API_KEY` | Optional authorized API key |
 | `OGMEM_RUNTIME_VERSION` | Actual source commit and image digest; set for measured runs |
-| `OGMEM_FLUSH_TIMEOUT_SECONDS` | `900`; extraction HTTP timeout |
+| `OGMEM_FLUSH_TIMEOUT_SECONDS` | `1800`; extraction HTTP timeout |
 | `OGMEM_COMPOSE_TOKEN_BUDGET` | `128000`; context budget passed to compose |
 | `OGMEM_COMPOSE_TIMEOUT_SECONDS` | `300`; keep below the platform recall timeout of 330 seconds |
 
-No write retries are performed: a transport timeout can leave the server working. Inspect the session before retrying; use a fresh run ID for a new experiment. This adapter does not claim durable exactly-once replay or provision users automatically.
+After a compact read timeout or HTTP 504, Workload checks the original scoped
+session for a durable compaction receipt. A successful extraction and archive
+receipt still goes through the usual index readiness check. When the server
+cannot prove completion, the setup stays failed and dependent QA can run with
+available memory. These scores appear as degraded QA in the analysis, without a
+comparable benchmark score. The affected history stage and subsequent writes in
+the same episode remain blocked by the readiness barrier. The backend may still
+be updating memory during diagnostic QA. Other setup failures still block QA.
+
+No compact write retries are performed. The 1800-second setting applies to the
+Workload HTTP client. The server and any intermediate proxy have their own
+deadlines.
 
 ## Run
 

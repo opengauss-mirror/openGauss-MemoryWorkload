@@ -102,6 +102,15 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "benchmark_diagnostics": _extract_benchmark_diagnostics(external_result),
         "analysis_notes": _build_notes(summary, external_result, buckets, _read_ingest_summary(run_dir)),
     }
+    degraded = (summary.get("resource_summary", {}).get("evaluation") or {}).get("degraded_qa")
+    if "memory_compact_timeout" in (summary.get("run_validity") or {}).get("reasons", []):
+        analysis["overall_accuracy"] = None
+    if degraded:
+        analysis["degraded_qa"] = degraded
+        analysis["analysis_notes"].append(
+            f"Degraded QA after a memory compact timeout: {degraded['correct']}/{degraded['graded']} "
+            "graded answers correct. History was incomplete and this run has no comparable benchmark score."
+        )
     if chain_diagnostics:
         analysis["chain_diagnostics"] = chain_diagnostics
     if timing_report:
@@ -690,6 +699,9 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
         except Exception:
             return "0.00%"
 
+    accuracy = analysis.get("overall_accuracy")
+    accuracy_display = "—" if accuracy is None else pct(accuracy)
+
     def render_mapping(mapping: dict[str, Any]) -> str:
         if not mapping:
             return "<tr><td colspan='2' class='muted'>无</td></tr>"
@@ -984,7 +996,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <div class="muted">benchmark={esc(analysis.get("benchmark_id"))} · agent={esc(analysis.get("agent_id"))} · status={esc(analysis.get("status"))}</div>
     </section>
     <section class="grid">
-      <div class="card"><div class="metric-label">Overall Accuracy</div><div class="metric-value">{pct(analysis.get("overall_accuracy"))}</div></div>
+      <div class="card"><div class="metric-label">Overall Accuracy</div><div class="metric-value">{accuracy_display}</div></div>
       <div class="card"><div class="metric-label">Cases</div><div class="metric-value">{esc(analysis.get("case_passed"))} / {esc(analysis.get("case_total"))}</div></div>
       <div class="card"><div class="metric-label">Failures</div><div class="metric-value">{esc(analysis.get("case_failed"))}</div></div>
       <div class="card"><div class="metric-label">EntryPoint</div><div class="metric-value">{esc(analysis.get("entrypoint_kind"))}</div></div>

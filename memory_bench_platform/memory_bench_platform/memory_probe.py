@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -43,6 +44,12 @@ def probe(backend, run_dir, *, ready_timeout=120, invoke=None):
         if timeout is not None:
             limit = min(limit, timeout)
         if invoke is None:
+            if backend == "ogmemory" and action == "flush":
+                http_timeout = float(os.environ.get("OGMEM_FLUSH_TIMEOUT_SECONDS", "1800"))
+                if not math.isfinite(http_timeout) or http_timeout <= 0:
+                    raise ValueError("OGMEM_FLUSH_TIMEOUT_SECONDS must be positive and finite")
+                # Allow up to 20 seconds for receipt checks plus process overhead.
+                limit = http_timeout + 30
             proc = subprocess.run([sys.executable, str(SKILLS_ROOT / "memories" / backend / manifest.entry.runner)],
                                   input=request.model_dump_json(), capture_output=True, text=True,
                                   timeout=limit, check=True)

@@ -29,7 +29,7 @@ capabilities:
   actions: [ingest, flush, status, recall]
   async_ingest: true
   action_timeouts_seconds:
-    flush: 900
+    flush: 1800
     recall: 330
   commit:
     supported: true

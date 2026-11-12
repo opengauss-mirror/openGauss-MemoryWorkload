@@ -422,6 +422,9 @@ def _compose_backend_direct(
                         )
                     )
             previous_checkpoint_cases = checkpoint_cases or [setup_case_id]
+            if binding.memory_id == "ogmemory" and checkpoint_cases:
+                # Diagnostic QA does not release the next stage's write barrier.
+                previous_checkpoint_cases = [setup_case_id, *previous_checkpoint_cases]
     return cases, steps
 
 

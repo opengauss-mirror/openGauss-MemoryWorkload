@@ -4,12 +4,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 import sys
 import time
 from typing import Any
 import urllib.error
+from urllib.parse import quote, urlencode
 import urllib.request
+
+
+class CompactTimeout(RuntimeError):
+    pass
 
 
 def _digest(value: str) -> str:
@@ -63,22 +69,61 @@ def run_operation(request: dict[str, Any], *, environ=None, urlopen=None) -> dic
                      "type": "memory_" + str(action),
                      "runtime_version": env.get("OGMEM_RUNTIME_VERSION", "unrecorded")}
 
-        def post(path: str, body: dict, timeout: float = 30) -> dict:
+        def request_json(path: str, body: dict | None, timeout: float = 30) -> dict:
             headers = {"Content-Type": "application/json", "X-Account-ID": identity["accountId"],
                        "X-User-ID": identity["userId"], "X-Agent-ID": identity["agentId"]}
             if env.get("OGMEM_API_KEY"):
                 headers["X-API-Key"] = env["OGMEM_API_KEY"]
-            req = urllib.request.Request(base + path, data=json.dumps({**identity, **body}).encode(), headers=headers, method="POST")
+            payload = None if body is None else json.dumps({**identity, **body}).encode()
+            req = urllib.request.Request(base + path, data=payload, headers=headers)
             try:
                 with opener(req, timeout=timeout) as response:
                     data = json.load(response)
             except urllib.error.HTTPError as exc:
-                raise RuntimeError(f"oGMemory HTTP {exc.code}: {exc.read().decode(errors='replace')[:2000]}") from exc
+                detail = exc.read(2000).decode(errors="replace")
+                if path == "/api/v1/compact" and exc.code == 504:
+                    raise CompactTimeout(f"oGMemory HTTP 504: {detail}") from exc
+                raise RuntimeError(f"oGMemory HTTP {exc.code}: {detail}") from exc
             if not isinstance(data, dict):
                 raise ValueError("oGMemory returned a non-object response")
+            return data
+
+        def post(path: str, body: dict, timeout: float = 30) -> dict:
+            data = request_json(path, body, timeout)
             if data.get("ok") is False or data.get("status") in ("failed", "error") or data.get("error"):
                 raise RuntimeError("oGMemory rejected operation: " + json.dumps(data, ensure_ascii=False)[:2000])
             return data
+
+        def confirm_compact_after_timeout() -> dict | None:
+            # Idle alone cannot establish that extraction succeeded.
+            idle = request_json("/api/v1/call/wait_until_idle", {
+                "sessionId": session_id, "timeoutSeconds": 5,
+                "drainOutbox": False, "waitOutbox": True,
+            }, 10)
+            operation["timeout_status"] = {"idle": idle.get("idle"), "reason": idle.get("reason")}
+            if source.get("type") != "memory_ingest":
+                return None
+
+            path = "/api/v1/sessions/" + quote(session_id, safe="")
+            context = request_json(path + "/context?" + urlencode({**identity, "token_budget": 1}), None, 5)
+            archives = context.get("archives")
+            # Workload assigns each ingested history segment its own session.
+            if (context.get("session_id") != session_id or not isinstance(archives, list)
+                    or len(archives) != 1 or not isinstance(archives[0], dict)):
+                return None
+            archive_id = archives[0].get("archive_id")
+            if not isinstance(archive_id, str) or not archive_id:
+                return None
+            request_id = f"compaction-{archive_id}"
+            receipt_path = path + "/write-requests/" + quote(request_id, safe="")
+            receipt = request_json(receipt_path + "?" + urlencode(identity), None, 5)
+            operation["timeout_status"]["request_status"] = receipt.get("request_status")
+            if (receipt.get("request_id") == request_id and receipt.get("archive_id") == archive_id
+                    and receipt.get("request_status") == "SUCCEEDED"
+                    and receipt.get("source_status") == "ARCHIVED"
+                    and receipt.get("semantic_status") == "COMPLETE"):
+                return {"compacted": True, "confirmed_after_timeout": True, "receipt": receipt}
+            return None
 
         if action == "ingest":
             content = inputs.get("content")
@@ -102,8 +147,23 @@ def run_operation(request: dict[str, Any], *, environ=None, urlopen=None) -> dic
         elif action == "flush":
             if not session_id:
                 raise ValueError("memory.flush requires the ingest session_id")
-            timeout = float(env.get("OGMEM_FLUSH_TIMEOUT_SECONDS", "900"))
-            data = post("/api/v1/compact", {"sessionId": session_id, "shortTermIndexMode": "async"}, timeout)
+            timeout = float(env.get("OGMEM_FLUSH_TIMEOUT_SECONDS", "1800"))
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("OGMEM_FLUSH_TIMEOUT_SECONDS must be positive and finite")
+            try:
+                data = post("/api/v1/compact", {"sessionId": session_id, "shortTermIndexMode": "async"}, timeout)
+            except (TimeoutError, urllib.error.URLError, CompactTimeout) as exc:
+                if isinstance(exc, urllib.error.URLError) and not isinstance(exc.reason, TimeoutError):
+                    raise
+                operation["compact_timeout"] = True
+                try:
+                    data = confirm_compact_after_timeout()
+                except (OSError, RuntimeError, ValueError):
+                    operation.setdefault("timeout_status", {"reason": "status_unavailable"})
+                    operation["timeout_status"]["lookup_failed"] = True
+                    data = None
+                if data is None:
+                    raise CompactTimeout(str(exc) or "compact timed out") from exc
             if data.get("compacted") is not True:
                 raise RuntimeError("compact did not confirm extraction and archival: " + json.dumps(data)[:2000])
             # Compact is synchronous; this identifies the adapter operation,
