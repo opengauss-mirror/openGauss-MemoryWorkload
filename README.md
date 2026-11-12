@@ -641,3 +641,9 @@ memory-bench analyze-run --run-dir runs/<run-id>
 `experiment` 顺序执行部署/既有部署校验、组合运行、离线分析，状态保存在 `runs/experiments/<id>/experiment.json`；每个组合仍写入自己的 `runs/<run-id>/`。其中 `phase_events.jsonl`、`target_registry.json`、`profiling/collector_status.json` 和 `reports/profiling_analysis.*` 可用于复核；原始 perf 数据仅在本地私有目录。`analyze-run` 不连接目标系统，可用原归档重新计算。缺少可验证阶段边界的 runner 会明确记为 `phase_boundary_unavailable`，不会把整轮耗时伪装成单个阶段。
 
 硬件采集需要 Linux、`perf`、相应 PMU/容器 cgroup 权限；`best_effort` 在 macOS 或权限不足时保留客户端阶段指标并标记硬件 `skipped`，`required` 会在正式请求前拒绝。工具不会执行 `sudo` 或修改内核权限。`--pressure-test` 仍需独立的多 Agent 压测实现，目前不能与 `experiment` 使用。
+
+## Hindsight 自部署接入
+
+支持 Hindsight `backend_direct`：原生异步 retain、后台任务就绪检查、recall，以及既有准确率和 Token 报告。配置与命令见 [Hindsight 接入说明](docs/hindsight-backend-direct.md)。
+
+Hindsight 官方 OpenClaw 插件的 `agent_plugin` 模式及独立运行要求见 [插件接入说明](docs/hindsight-agent-plugin.md)。

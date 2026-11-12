@@ -1,0 +1,55 @@
+kind: memory
+id: hindsight
+version: 0.1.0
+version_policy:
+  default_selection: latest_official_release_tag
+  targets:
+    - name: hindsight
+      scope: memory_backend
+      version_source: upstream_release_tag
+      upstream: https://github.com/vectorize-io/hindsight
+      record_runtime_version: true
+  record_runtime_version: true
+entry:
+  runner: scripts/run_operation.py
+runtime:
+  benchmark_unit: session
+  actions: [ingest, status, recall]
+ingest:
+  benchmark_unit: session
+recall:
+  mode: native_recall
+completion:
+  accept_signal: accepted
+  complete_signal: completed
+integration:
+  protocol_version: memory/1
+capabilities:
+  actions: [ingest, status, recall]
+  async_ingest: true
+  action_timeouts_seconds:
+    ingest: 60
+    recall: 180
+  commit:
+    supported: false
+    required_after_ingest: false
+  readiness:
+    supported: true
+    scoped_by_operation: true
+  scope:
+    supported: true
+    scoped_ingest: true
+    scoped_recall: true
+    isolation_level: episode
+  evidence_output: true
+  outputs:
+    ingest: [operation.session_id, operation.task_id, output.session_id]
+    status: [state, operation]
+    recall: [output.evidence_text]
+model_dependencies:
+  memory_extract:
+    protocol: openai-chat-completions
+    base_url_env: MEMORY_LLM_BASE_URL
+  embedding:
+    protocol: openai-embeddings
+    base_url_env: MEMORY_EMBEDDING_BASE_URL

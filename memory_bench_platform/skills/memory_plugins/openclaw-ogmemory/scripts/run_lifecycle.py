@@ -207,28 +207,47 @@ def wait_ready(base, state, inputs):
         remaining()
         return result
 
+    def archived_session(path):
+        context = request(path + "/context", {}, method="GET")
+        archives = context.get("archives")
+        archive_ids = []
+        if isinstance(archives, list):
+            archive_ids = [row["archive_id"] for row in archives
+                           if isinstance(row, dict) and isinstance(row.get("archive_id"), str)
+                           and row["archive_id"]]
+        if context.get("session_id") != sid or not archive_ids:
+            raise RuntimeError("Native compact session missing and no scoped archive was confirmed")
+        return {"session_id": sid, "archive_ids": archive_ids}
+
     while True:
         idle = request("/api/v1/call/wait_until_idle", body)
-        # Do not call GET session first: that endpoint can create an empty session.
-        if idle.get("reason") == "session_not_found":
-            raise RuntimeError("Native compact session missing; inspect OpenClaw/backend logs")
         if idle.get("idle") is True:
-            session = request("/api/v1/sessions/" + urllib.parse.quote(sid, safe=""),
-                              {}, method="GET")
-            if int(session.get("message_count", 0)) <= 0 and int(session.get("commit_count", 0)) <= 0:
-                raise RuntimeError("Native compact has no accepted history")
-            if int(session.get("commit_count", 0)) == 0:
-                raise RuntimeError("Native compact has no archived history")
+            session_path = "/api/v1/sessions/" + urllib.parse.quote(sid, safe="")
+            session = {}
+            if idle.get("reason") == "session_not_found":
+                # An empty live buffer can be released after durable compaction.
+                session = archived_session(session_path)
+            else:
+                session = request(session_path, {}, method="GET")
+                if int(session.get("commit_count", 0)) <= 0:
+                    raise RuntimeError("Native compact has no archived history")
             drained = request("/api/v1/call/wait_until_idle",
                               {**body, "drainOutbox": True})
-            if drained.get("reason") == "session_not_found" or int((drained.get("drain") or {}).get("failed", 0)):
-                raise RuntimeError("Compacted session missing or indexing failed")
+            drain = drained.get("drain") or {}
+            if int(drain.get("failed", 0)) or int(drain.get("moved_to_dlq", 0)):
+                raise RuntimeError("Compacted session indexing failed")
             settled = request("/api/v1/call/wait_until_idle",
                               {**body, "waitOutbox": True})
             outbox = settled.get("outbox") or {}
-            if settled.get("reason") == "session_not_found" or outbox.get("supported") is False or outbox.get("error"):
+            if outbox.get("supported") is False or outbox.get("error"):
                 raise RuntimeError("Backend cannot verify readiness")
             if settled.get("idle") is True and "total" in outbox and int(outbox["total"]) == 0:
+                missing = any(r.get("reason") == "session_not_found" for r in (idle, drained, settled))
+                if missing:
+                    if drain.get("failed") != 0:
+                        raise RuntimeError("Backend cannot confirm indexing for archived session")
+                    if not session.get("archive_ids"):
+                        session = archived_session(session_path)
                 remaining()
                 return {"session_id": sid, "history_archived": True, "session": session,
                         "backend_result": settled, "extraction_trigger": "agent_native_compact"}
@@ -245,6 +264,10 @@ def check_ogmemory_hook_errors(text, phase=None):
                            + "; inspect OpenClaw/backend logs")
 
 
+class RecallReceiptMissing(RuntimeError):
+    pass
+
+
 def check_qa_recall(text, session_id, expected_key):
     # The pinned native plugin emits these two lines consecutively, after the
     # null-result branch. Never combine unrelated markers from different calls.
@@ -259,7 +282,7 @@ def check_qa_recall(text, session_id, expected_key):
             return {"session_id": session_id, "session_key": identity[1],
                     "recall_receipt": "native_assemble_return"}
         previous = line
-    raise RuntimeError("No successful native assemble receipt for this QA session; inspect Gateway logs")
+    raise RecallReceiptMissing("No successful native assemble receipt for this QA session; recall unverified")
 
 
 def before_agent(path, config, state, request):
@@ -300,30 +323,78 @@ def before_agent(path, config, state, request):
 
 def after_agent(path, inputs):
     result = inputs["agent_result"]
+    phase = inputs["check_context"]["phase"]
+    try:
+        output = check_after_agent(path, inputs)
+    except RecallReceiptMissing:
+        if phase != "qa" or result.get("status") != "ok":
+            raise
+        answer = result.get("agent_answer") or result.get("text_output")
+        if not isinstance(answer, str) or not answer.strip():
+            turns = result.get("turns")
+            if isinstance(turns, list):
+                answer = next((turn["text"] for turn in reversed(turns)
+                               if isinstance(turn, dict) and isinstance(turn.get("text"), str)
+                               and turn["text"].strip()), "")
+        if not isinstance(answer, str) or not answer.strip():
+            raise
+        return {"checked": True, "phase": phase, "recall_verified": False,
+                "recall_verification_reason": "native_assemble_receipt_not_matched",
+                "session_id": result["output"]["session_id"]}
+    if phase == "qa" and result.get("status") == "ok":
+        output["recall_verified"] = True
+    return output
+
+
+def check_after_agent(path, inputs):
+    result = inputs["agent_result"]
     context = inputs["check_context"]
     if result.get("transport") != context["transport"]:
         raise ValueError("Agent transport changed after plugin validation")
+    phase = context["phase"]
+    sid = str(result.get("output", {}).get("session_id") or "")
     if context["transport"] == "http":
-        logs = subprocess.run(["docker", "logs", "--since", context["log_since"],
-                               gateway_container(path)], check=True, capture_output=True,
-                              text=True, timeout=20)
-        text = logs.stdout + "\n" + logs.stderr
-        check_ogmemory_hook_errors(text, context["phase"])
-        if not result.get("output", {}).get("session_id"):
+        if not sid:
             raise RuntimeError("Cannot resolve native Gateway session ID from OPENCLAW_STATE_DIR")
-    else:
-        stderr = result.get("stderr", "")
-        if "og-memory: mode=remote" not in stderr:
-            raise RuntimeError("Native oGMemory plugin was not confirmed loaded; inspect OpenClaw logs")
-        text = stderr
-        check_ogmemory_hook_errors(text, context["phase"])
+        command = ["docker", "logs", "--since", context["log_since"], gateway_container(path)]
+        log_timeout = 20
+        receipt_deadline = None
+        while True:
+            try:
+                logs = subprocess.run(command, check=True, capture_output=True, text=True, timeout=log_timeout)
+            except subprocess.TimeoutExpired as exc:
+                if receipt_deadline is None:
+                    raise
+                raise RecallReceiptMissing(
+                    "No successful native assemble receipt for this QA session; recall unverified"
+                ) from exc
+            text = logs.stdout + "\n" + logs.stderr
+            check_ogmemory_hook_errors(text, phase)
+            if phase != "qa":
+                return {"checked": True, "phase": phase}
+            try:
+                receipt = check_qa_recall(text, sid, context["expected_session_key"])
+            except RecallReceiptMissing:
+                if receipt_deadline is None:
+                    receipt_deadline = time.monotonic() + 5
+                time.sleep(min(0.25, max(0, receipt_deadline - time.monotonic())))
+                log_timeout = receipt_deadline - time.monotonic()
+                if log_timeout <= 0:
+                    raise
+            else:
+                return {"checked": True, "phase": phase,
+                        "receipt_observed_after_retry": receipt_deadline is not None, **receipt}
+
+    text = result.get("stderr", "")
+    if "og-memory: mode=remote" not in text:
+        raise RuntimeError("Native oGMemory plugin was not confirmed loaded; inspect OpenClaw logs")
+    check_ogmemory_hook_errors(text, phase)
     receipt = {}
-    if context["phase"] == "qa":
-        sid = str(result.get("output", {}).get("session_id") or "")
+    if phase == "qa":
         if not sid:
             raise RuntimeError("QA recall validation requires the actual Agent session ID")
         receipt = check_qa_recall(text, sid, context["expected_session_key"])
-    return {"checked": True, "phase": context["phase"], **receipt}
+    return {"checked": True, "phase": phase, **receipt}
 
 
 def run(request):
@@ -390,6 +461,18 @@ def run(request):
             archive.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(events, archive)
             archive.chmod(0o600)
+            recall_checks = {}
+            with archive.open() as log:
+                for line in log:
+                    event = json.loads(line)
+                    check = event.get("output", {})
+                    if event.get("action") == "after_agent" and isinstance(check.get("recall_verified"), bool):
+                        recall_checks[check["session_id"]] = check["recall_verified"]
+            if recall_checks:
+                verified = sum(recall_checks.values())
+                total = len(recall_checks)
+                output["recall_verification"] = {"verified": verified, "unverified": total - verified,
+                                                 "checked_qa": total, "coverage": verified / total}
             artifacts.append({"kind": "memory_plugin_events", "path": str(archive),
                               "content_type": "application/x-ndjson"})
     else:
