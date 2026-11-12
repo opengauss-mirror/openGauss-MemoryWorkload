@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from memory_bench_platform.cli import main
 from memory_bench_platform.result_analysis import analyze_run, classify_failure
 
@@ -705,3 +707,20 @@ def test_classify_failure_treats_auth_errors_as_operator_failure():
     )
     assert bucket == "operator_error"
     assert "auth" in reason.lower() or "401" in reason
+
+
+@pytest.mark.parametrize("degraded,expected", [(True, "—"), (False, "0.00%")])
+def test_html_distinguishes_unavailable_accuracy_from_zero(tmp_path, degraded, expected):
+    run_dir = tmp_path / "accuracy"
+    _build_minimal_run(run_dir)
+    summary_file = run_dir / "reports" / "summary.json"
+    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    summary["benchmark_score"] = None if degraded else 0.0
+    if degraded:
+        summary["run_validity"] = {"valid": False, "reasons": ["memory_compact_timeout"]}
+    summary_file.write_text(json.dumps(summary), encoding="utf-8")
+
+    analysis = analyze_run(run_dir)
+    assert analysis["overall_accuracy"] == (None if degraded else 0.0)
+    report = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
+    assert f'Overall Accuracy</div><div class="metric-value">{expected}</div>' in report

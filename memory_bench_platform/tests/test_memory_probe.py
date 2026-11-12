@@ -1,3 +1,9 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import subprocess
+from threading import Event, Thread
+from urllib.parse import urlsplit
+
 import pytest
 
 from memory_bench_platform.memory_probe import probe
@@ -95,3 +101,86 @@ def test_cli_rejects_invalid_timeout(monkeypatch, tmp_path, timeout):
         main()
     assert error.value.code == 2
     assert not (tmp_path / "probe").exists()
+
+
+@pytest.mark.parametrize("receipt_status", ["SUCCEEDED", "UNKNOWN"])
+def test_ogmemory_probe_saves_receipt_check_after_http_read_timeout(monkeypatch, tmp_path, receipt_status):
+    compact_started = Event()
+    release_compact = Event()
+    calls = []
+    ingest_account = None
+
+    class Backend(BaseHTTPRequestHandler):
+        def reply(self, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            nonlocal ingest_account
+            path = self.path
+            calls.append(path)
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if path.endswith("/messages"):
+                ingest_account = payload["accountId"]
+                self.reply({"ok": True, "message_id": "m1"})
+            elif path == "/api/v1/compact":
+                compact_started.set()
+                # No HTTP response until the probe has finished. Its client must time out.
+                release_compact.wait(5)
+            elif path.endswith("/wait_until_idle"):
+                self.reply({"idle": True, "outbox": {"total": 0, "supported": True}})
+            elif path == "/api/v1/compose":
+                messages = [{"_ogmem": True, "content": "Hangzhou"}] if payload["accountId"] == ingest_account else []
+                self.reply({"messages": messages})
+            else:
+                self.send_error(404)
+
+        def do_GET(self):
+            path = urlsplit(self.path).path
+            calls.append(path)
+            if path.endswith("/context"):
+                self.reply({"session_id": path.split("/")[4], "archives": [{"archive_id": "a"}]})
+            elif path.endswith("/write-requests/compaction-a"):
+                self.reply({"request_id": "compaction-a", "archive_id": "a", "request_status": receipt_status,
+                            "source_status": "ARCHIVED", "semantic_status": "COMPLETE"})
+            else:
+                self.send_error(404)
+
+    run_subprocess = subprocess.run
+    budgets = {}
+
+    def record_budget(*args, **kwargs):
+        action = json.loads(kwargs["input"])["action"]
+        budgets.setdefault(action, []).append(kwargs["timeout"])
+        return run_subprocess(*args, **kwargs)
+
+    monkeypatch.setattr("memory_bench_platform.memory_probe.subprocess.run", record_budget)
+    monkeypatch.setenv("OGMEM_FLUSH_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    with ThreadingHTTPServer(("127.0.0.1", 0), Backend) as backend:
+        Thread(target=backend.serve_forever, daemon=True).start()
+        monkeypatch.setenv("OGMEM_API_URL", f"http://127.0.0.1:{backend.server_port}")
+        try:
+            report = probe("ogmemory", tmp_path / "probe")
+        finally:
+            release_compact.set()
+            backend.shutdown()
+
+    assert compact_started.is_set()
+    assert budgets["ingest"] == [90]
+    assert budgets["flush"] == [30.2]
+    assert calls.count("/api/v1/compact") == 1
+    assert any(path.endswith("/write-requests/compaction-a") for path in calls)
+    assert json.loads((tmp_path / "probe" / "probe.json").read_text(encoding="utf-8")) == report
+    flush = report["steps"][1]["result"]
+    assert flush["operation"]["compact_timeout"] is True
+    assert flush["operation"]["timeout_status"]["request_status"] == receipt_status
+    if receipt_status == "SUCCEEDED":
+        assert report["status"] == "passed"
+        assert flush["output"]["backend_result"]["confirmed_after_timeout"] is True
+    else:
+        assert report["status"] == "failed"
+        assert flush["error"]["code"] == "CompactTimeout"

@@ -365,6 +365,7 @@ def _summarize_native_evaluation(
         if "phase:setup" in case.labels
     ]
     ready_checkpoints = 0
+    timed_out_setups: set[str] = set()
     checkpoint_rows: list[dict] = []
     ready_latencies: list[int] = []
     for case_id in setup_case_ids:
@@ -386,11 +387,20 @@ def _summarize_native_evaluation(
             if step.step_id in result_by_id
         )
         case = next(item for item in cases if item.case_id == case_id)
+        upstream_timed_out = any(dependency in timed_out_setups for dependency in case.depends_on_cases)
+        if upstream_timed_out or (not ready and any(
+            step.step_id in result_by_id and
+            result_by_id[step.step_id].structured_output.get("raw", {}).get("error", {}).get("code") == "CompactTimeout"
+            for step in expected
+        )):
+            ready = False
+            timed_out_setups.add(case_id)
         checkpoint_rows.append(
             {
                 "setup_case_id": case_id,
                 "checkpoint_id": case.source_metadata.get("checkpoint_id"),
                 "ready": ready,
+                **({"degraded_reason": "memory_compact_timeout"} if case_id in timed_out_setups else {}),
                 "readiness_latency_ms": latency_ms,
                 "failed_steps": [
                     step.step_id
@@ -429,6 +439,9 @@ def _summarize_native_evaluation(
     evaluation_coverage = (
         round(len(valid_results) / len(judge_results), 4) if judge_results else 0.0
     )
+    degraded_cases = {case.case_id for case in cases
+                      if any(dependency in timed_out_setups for dependency in case.depends_on_cases)}
+    degraded_scores = [item.passed for item in valid_results if item.case_id in degraded_cases]
     return {
         "case_total": len(judge_results),
         "case_passed": passed_cases,
@@ -443,6 +456,9 @@ def _summarize_native_evaluation(
         "runtime_failure_rate": runtime_failure_rate,
         "readiness_latency_ms": readiness_latency_ms,
         "checkpoints": checkpoint_rows,
+        **({"degraded_qa": {"graded": len(degraded_scores), "correct": sum(degraded_scores),
+                            "accuracy": round(sum(degraded_scores) / len(degraded_scores), 4)}}
+           if degraded_scores else {}),
     }
 
 
@@ -467,6 +483,8 @@ def _apply_native_run_validity(
         reasons.append("checkpoint_ready_rate_below_minimum")
     if float(summary.get("runtime_failure_rate", 0.0)) > maximum_runtime_failure_rate:
         reasons.append("runtime_failure_rate_above_maximum")
+    if any(row.get("degraded_reason") == "memory_compact_timeout" for row in summary.get("checkpoints", [])):
+        reasons.append("memory_compact_timeout")
     for reason in additional_reasons or []:
         if reason not in reasons:
             reasons.append(reason)

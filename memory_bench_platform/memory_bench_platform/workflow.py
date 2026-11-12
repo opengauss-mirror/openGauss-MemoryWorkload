@@ -117,6 +117,16 @@ def _execute_case(
             for dependency in case.depends_on_cases
             if case_execution_status.get(dependency) != "passed"
         ]
+        compact_timeout_dependencies = bool(unsatisfied_case_dependencies) and all(
+            case_failure_kind.get(dependency) == "memory-compact-timeout"
+            for dependency in unsatisfied_case_dependencies
+        )
+        if (compact_timeout_dependencies
+                and runtime_context.memory_integration == "backend_direct"
+                and memory_id == "ogmemory"
+                and case.reference.get("evaluation_target") == "qa_answer"
+                and case.capability == "memory/question-answering"):
+            unsatisfied_case_dependencies = []
         case_failed = bool(unsatisfied_case_dependencies)
         if unsatisfied_case_dependencies:
             dependency_detail = (
@@ -191,9 +201,15 @@ def _execute_case(
                 resolved_step.operator_kind == "memory"
                 and str(resolved_step.inputs.get("action", "") or "") == "ingest"
             )
+            is_ogmemory_flush = (
+                runtime_context.memory_integration == "backend_direct"
+                and memory_id == "ogmemory"
+                and resolved_step.operator_kind == "memory"
+                and resolved_step.inputs.get("action") == "flush"
+            )
             max_attempts = (
                 1
-                if resolution_error is not None or is_memory_ingest
+                if resolution_error is not None or is_memory_ingest or is_ogmemory_flush
                 else max(
                     1,
                     step.retry_limit + 1
@@ -477,8 +493,19 @@ def _execute_case(
                 "wait-ready" in step_id or "wait_ready" in step_id
                 for step_id in failed_step_ids
             )
+            failed = [item for item in case_step_results if item.status == "failed"]
+            compact_timed_out = (
+                runtime_context.memory_integration == "backend_direct"
+                and memory_id == "ogmemory"
+                and "phase:setup" in case.labels
+                and (compact_timeout_dependencies or (
+                    len(failed) == 1
+                    and failed[0].structured_output.get("raw", {}).get("error", {}).get("code") == "CompactTimeout"
+                ))
+            )
             case_failure_kind[case.case_id] = (
-                "runtime-not-ready" if readiness_failed else "runtime-error"
+                "memory-compact-timeout" if compact_timed_out
+                else "runtime-not-ready" if readiness_failed else "runtime-error"
             )
         if case.judge_mode == "none":
             continue
