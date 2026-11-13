@@ -238,6 +238,19 @@ def run(request):
             if action=='finalize':
                 state['active']=False
             output={'phase':phase}
+            if action == 'finalize':
+                checks = []
+                receipt_dir = Path(owner) / 'artifacts/memory_plugin/openclaw-hindsight'
+                for receipt_file in receipt_dir.glob('*.json'):
+                    verified = json.loads(receipt_file.read_text()).get('recall_verified')
+                    if isinstance(verified, bool):
+                        checks.append(verified)
+                if checks:
+                    verified = sum(checks)
+                    output['recall_verification'] = {
+                        'verified': verified, 'unverified': len(checks) - verified,
+                        'checked_qa': len(checks), 'coverage': verified / len(checks),
+                    }
         else:
             if not state.get('active'):
                 raise ValueError('Prepare first')
@@ -269,16 +282,37 @@ def run(request):
                 if result.get('status')!='ok' or handle.get('gateway_session_key')!=pending['session_key'] or not handle.get('session_id'):
                     raise ValueError('Agent call/session failed')
                 name, _, _, _ = gateway(path, config);deadline=time.monotonic()+(600 if pending['phase']=='ingest' else 5)
+                is_qa = pending['phase'] == 'qa'
+                settled = False
                 while time.monotonic()<deadline:
                     log=subprocess.run(['docker','logs','--since',pending['since'],name],capture_output=True,text=True,check=True,timeout=15)
                     text=log.stdout+'\n'+log.stderr
                     proof=native_receipt(text,pending['phase'],pending['bank_id'])
-                    rows=operations(config,state['bank_id'],missing=True)
-                    new=[x for x in rows if x['operation_id'] not in pending['operation_ids']]
-                    if pending['phase']=='qa' and new:raise RuntimeError('QA created memory operations')
-                    if proof and completed(rows) and (pending['phase']=='qa' or new):break
+                    rows=operations(config,state['bank_id'],missing=not is_qa)
+                    operation_ids = {row['operation_id'] for row in rows}
+                    previous_ids = set(pending['operation_ids'])
+                    new = operation_ids - previous_ids
+                    if is_qa and new:
+                        raise RuntimeError('QA created memory operations')
+                    if is_qa and not previous_ids <= operation_ids:
+                        raise RuntimeError('QA bank operation history could not be verified')
+                    settled = completed(rows) if is_qa or proof else False
+                    if proof and settled and (is_qa or new):
+                        break
                     time.sleep(1)
-                else:raise RuntimeError('Native hook or background completion not verified')
+                else:
+                    answer = result.get('agent_answer') or result.get('text_output')
+                    if not isinstance(answer, str) or not answer.strip():
+                        turns = result.get('turns')
+                        if isinstance(turns, list):
+                            answer = next((turn['text'] for turn in reversed(turns)
+                                           if isinstance(turn, dict) and isinstance(turn.get('text'), str)
+                                           and turn['text'].strip()), '')
+                    if not is_qa or not settled or proof is not None or not isinstance(answer, str) or not answer.strip():
+                        raise RuntimeError('Native hook or background completion not verified')
+                    proof = {'recall_verified': False, 'recall_verification_reason': 'native_recall_receipt_missing'}
+                if is_qa:
+                    proof.setdefault('recall_verified', True)
                 receipt=Path(owner)/'artifacts/memory_plugin/openclaw-hindsight'
                 receipt.mkdir(parents=True,exist_ok=True)
                 target=receipt/(pending['nonce']+'.json')

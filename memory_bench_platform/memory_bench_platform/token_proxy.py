@@ -1,7 +1,7 @@
 """Reusable, opt-in OpenAI-compatible usage relay for memory-system clients.
 
-Only endpoint configuration changes. No SDK patches, retries, model parameter
-overrides, prompt logging, or local token estimates. Agent/Judge must bypass it.
+Requests pass through by default. An opt-in JiuwenMemory mode clarifies source IDs
+in the native extraction prompt. Agent/Judge must bypass this relay.
 """
 from datetime import datetime, timezone
 from http.client import HTTPConnection, HTTPSConnection, IncompleteRead
@@ -28,6 +28,40 @@ USAGE_DETAILS = {"prompt_tokens_details": {"cached_tokens"},
                  "input_tokens_details": {"cached_tokens"},
                  "completion_tokens_details": {"reasoning_tokens"},
                  "output_tokens_details": {"reasoning_tokens"}}
+
+
+JIUWEN_SOURCE_ID_GUIDANCE = (
+    'For source_id, copy the UUID exactly from the outer [ID: <UUID>] marker of '
+    'the source block. Never use dialogue line labels inside the block, such as '
+    '[D1:3] or [D2:7], as source_id.'
+)
+JIUWEN_SOURCE_MARKER = re.compile(
+    r"^---\n\[ID: [0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\]$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def clarify_jiuwen_source_id(request):
+    messages = request.get("messages")
+    if request.get("stream") or not isinstance(messages, list) or len(messages) != 2:
+        return False
+    system, user = messages
+    if not isinstance(system, dict) or not isinstance(user, dict):
+        return False
+    prompt, content = system.get("content"), user.get("content")
+    if (
+        system.get("role") != "system"
+        or user.get("role") != "user"
+        or not isinstance(prompt, str)
+        or 'the bare UUID from the "[ID: ...]" marker' not in prompt
+        or not isinstance(content, str)
+        or not content.startswith("observation_date: ")
+        or not JIUWEN_SOURCE_MARKER.search(content)
+    ):
+        return False
+    if JIUWEN_SOURCE_ID_GUIDANCE not in prompt:
+        system["content"] = prompt + "\n\n" + JIUWEN_SOURCE_ID_GUIDANCE
+    return True
 
 
 def safe_usage(value):
@@ -164,6 +198,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self.reply(400, b'{"error":{"type":"invalid_model_request"}}')
             return
+        if (self.server.jiuwen_source_id_guidance and self.path == "/v1/chat/completions"
+                and clarify_jiuwen_source_id(parsed)):
+            body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
         kind, suffix = route
         model = parsed.get("model")
         model = model[:256] if isinstance(model, str) else None
@@ -266,6 +303,9 @@ def make_server(config, audit_dir, port=0):
     backend = config.get("memory_backend")
     if not isinstance(backend, str) or not backend.strip() or len(backend) > 128:
         raise ValueError("memory_backend must name the dedicated memory system")
+    guidance = config.get("jiuwen_source_id_guidance", False)
+    if not isinstance(guidance, bool) or (guidance and backend != "jiuwenmemory"):
+        raise ValueError("jiuwen_source_id_guidance is a boolean option for JiuwenMemory only")
     upstreams = {}
     for kind in ("llm", "embedding"):
         url = urlsplit(config[kind + "_base_url"])
@@ -278,6 +318,7 @@ def make_server(config, audit_dir, port=0):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     try:
         server.audit = Audit(audit_dir, backend)
+        server.jiuwen_source_id_guidance = guidance
         server.upstreams, server.timeout, server.max_bytes = upstreams, timeout, 64 * 1024 * 1024
         return server
     except Exception:

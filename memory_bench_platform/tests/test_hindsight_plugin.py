@@ -215,3 +215,70 @@ def test_before_agent_validates_selected_agent(dedicated_gateway, monkeypatch, m
             m.run(request)
         assert 'pending' not in json.loads(phase.read_text())
         assert not calls
+
+
+@pytest.mark.parametrize('fault', [None, 'hook', 'write', 'unavailable', 'empty_answer', 'wrong_session'])
+def test_qa_missing_receipt_releases_only_verified_read_only_request(dedicated_gateway, monkeypatch, tmp_path, fault):
+    import json
+    from types import SimpleNamespace
+
+    runtime, _, _, _, _ = dedicated_gateway
+    owner = str(tmp_path / 'run')
+    phase = runtime / 'phase.json'
+    m.save(phase, {'active': True, 'owner': owner, 'scope_id': 'scope', 'phase': 'qa',
+                   'gateway_ready': True, 'config_sha256': m.digest(runtime / 'openclaw.json'),
+                   'bank_id': 'bank1'})
+    clock = [0]
+    monkeypatch.setattr(m.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(m.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    inspect = m.subprocess.run
+    log_text = 'Auto-recall timed out' if fault == 'hook' else ''
+
+    def docker(command, **kwargs):
+        if command[1] == 'logs':
+            return SimpleNamespace(stdout=log_text, stderr='')
+        return inspect(command, **kwargs)
+
+    monkeypatch.setattr(m.subprocess, 'run', docker)
+
+    def operations(config, bank, missing):
+        if not missing and fault == 'unavailable':
+            raise RuntimeError('Operation list unavailable')
+        ids = ['existing', 'new'] if not missing and fault == 'write' else ['existing']
+        return [{'operation_id': key, 'status': 'completed'} for key in ids]
+
+    monkeypatch.setattr(m, 'operations', operations)
+
+    def call(action, **inputs):
+        return m.run({'action': action, 'runtime_context': {'run_dir': owner}, 'inputs': inputs})
+
+    def before(key):
+        return call('before_agent', agent_request={'metadata': {
+            'scope_id': 'scope', 'session_key': key,
+        }})['output']
+
+    def after(pending):
+        return call('after_agent', check_context=pending, agent_result={
+            'status': 'ok', 'turns': [{'text': '' if fault == 'empty_answer' else 'Paris'}],
+            'output': {'session_handle': {'session_id': pending['session_key'],
+                'gateway_session_key': 'wrong' if fault == 'wrong_session' else pending['session_key']}},
+        })
+
+    pending = before('q16')
+    if fault:
+        with pytest.raises((RuntimeError, ValueError)):
+            after(pending)
+        assert json.loads(phase.read_text())['pending'] == pending
+        return
+
+    first = after(pending)['output']
+    assert first['recall_verified'] is False
+    assert json.loads(Path(first['receipt']).read_text())['recall_verification_reason'] == 'native_recall_receipt_missing'
+    assert json.loads(phase.read_text())['pending'] is None
+    log_text = 'perf: before_prompt_build results=0'
+    assert after(before('q17'))['output']['recall_verified'] is True
+    monkeypatch.setattr(m, 'configure', lambda path, config, state, phase: state.update(phase=phase))
+    assert call('finalize')['output']['recall_verification'] == {
+        'verified': 1, 'unverified': 1, 'checked_qa': 2, 'coverage': 0.5,
+    }
+    assert json.loads(phase.read_text())['active'] is False

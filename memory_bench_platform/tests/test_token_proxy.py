@@ -27,6 +27,9 @@ def running(server):
 @pytest.fixture
 def relay(tmp_path, monkeypatch, request):
     backend = getattr(request, 'param', 'mem0')
+    guidance = backend == 'jiuwenmemory-guidance'
+    if guidance:
+        backend = 'jiuwenmemory'
     received = []
 
     class Upstream(BaseHTTPRequestHandler):
@@ -61,6 +64,8 @@ def relay(tmp_path, monkeypatch, request):
     with running(ThreadingHTTPServer(('127.0.0.1', 0), Upstream)) as upstream:
         base = f'http://127.0.0.1:{upstream.server_port}/provider/v1'
         config = {'memory_backend': backend, 'llm_base_url': base, 'embedding_base_url': base, 'request_timeout_seconds': 2}
+        if guidance:
+            config['jiuwen_source_id_guidance'] = True
         with running(make_server(config, tmp_path/'audit')) as server:
             monkeypatch.setenv('MEMORY_BENCH_TOKEN_PROXY_EXCLUSIVE', '1')
             monkeypatch.setenv('MEMORY_BENCH_TOKEN_PROXY_AUDIT_DIR', str(tmp_path/'audit'))
@@ -334,3 +339,27 @@ def test_crlf_frame_boundary_stays_atomic_across_chunk_splits():
     assert match is not None
     assert match.group() == b"\r\n\r\n"
     assert match.end() == len(frame)
+
+
+@pytest.mark.parametrize('relay', ['jiuwenmemory', 'jiuwenmemory-guidance'], indirect=True)
+def test_jiuwen_source_id_guidance_is_opt_in_and_single_request(relay):
+    server, ctx, received = relay
+    base = f'http://127.0.0.1:{server.server_port}/v1/chat/completions'
+    system = 'Copy the bare UUID from the "[ID: ...]" marker'
+    history = 'observation_date: 2023-05-08\n---\n[ID: d4b466ba-46f8-47b5-ada3-d6bd797805cf]\n[D1:3] 历史'
+    body = {'model': 'ok', 'temperature': 0, 'messages': [
+        {'role': 'system', 'content': system},
+        {'role': 'user', 'content': history},
+    ]}
+    request = urllib.request.Request(base, data=json.dumps(body).encode())
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 200
+    assert len(received) == 1
+    forwarded = json.loads(received[0][2])
+    if server.jiuwen_source_id_guidance:
+        assert 'Never use dialogue line labels' in forwarded['messages'][0]['content']
+        forwarded['messages'][0]['content'] = system
+    assert forwarded == body
+    events = [json.loads(line) for line in (server.audit.root/'requests.jsonl').read_text().splitlines()]
+    assert [event['event'] for event in events] == ['started', 'finished']
+    assert events[1]['usage']['total_tokens'] == 120

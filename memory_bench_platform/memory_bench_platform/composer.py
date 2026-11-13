@@ -533,6 +533,7 @@ def _compose_agent_plugin(
                                 "local": binding.agent_local,
                                 "timeout_seconds": 900,
                                 "purpose": "memory_ingest",
+                                "occurred_at": timeline_event.timestamp,
                             },
                         },
                     )

@@ -207,9 +207,15 @@ def _execute_case(
                 and resolved_step.operator_kind == "memory"
                 and resolved_step.inputs.get("action") == "flush"
             )
+            is_tool_ingest = (
+                resolved_step.operator_kind == "agent"
+                and resolved_step.inputs.get("metadata", {}).get("purpose") == "memory_ingest"
+                and (runtime_context.run_contract.get("memory_plugin_runtime") or {})
+                    .get("capabilities", {}).get("agent_tool_ingest")
+            )
             max_attempts = (
                 1
-                if resolution_error is not None or is_memory_ingest or is_ogmemory_flush
+                if resolution_error is not None or is_memory_ingest or is_ogmemory_flush or is_tool_ingest
                 else max(
                     1,
                     step.retry_limit + 1

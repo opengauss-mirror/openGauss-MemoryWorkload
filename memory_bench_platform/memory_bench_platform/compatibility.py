@@ -174,9 +174,15 @@ def resolve_compatibility(
                 missing.append("memory_plugin.namespace_isolation")
             if "qa_answer" in targets and not plugin_capabilities.get("qa_read_only"):
                 missing.append("memory_plugin.qa_read_only")
-            if "ingest" in required_memory_actions and not plugin_capabilities.get("auto_capture"):
+            agent_tool_ingest = plugin_capabilities.get("agent_tool_ingest")
+            agent_tool_recall = plugin_capabilities.get("agent_tool_recall")
+            if agent_tool_ingest or agent_tool_recall:
+                for action in ("before_agent", "after_agent"):
+                    if action not in plugin_actions:
+                        missing.append(f"memory_plugin.lifecycle.actions.{action}")
+            if "ingest" in required_memory_actions and not (plugin_capabilities.get("auto_capture") or agent_tool_ingest):
                 missing.append("memory_plugin.auto_capture")
-            if "recall" in required_memory_actions and not plugin_capabilities.get("auto_recall"):
+            if "recall" in required_memory_actions and not (plugin_capabilities.get("auto_recall") or agent_tool_recall):
                 missing.append("memory_plugin.auto_recall")
             if str(memory_plugin.integration.get("protocol_version") or "") != "memory-plugin/1":
                 missing.append("memory_plugin.integration.protocol_version.memory-plugin/1")

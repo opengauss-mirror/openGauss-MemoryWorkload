@@ -647,3 +647,7 @@ memory-bench analyze-run --run-dir runs/<run-id>
 支持 Hindsight `backend_direct`：原生异步 retain、后台任务就绪检查、recall，以及既有准确率和 Token 报告。配置与命令见 [Hindsight 接入说明](docs/hindsight-backend-direct.md)。
 
 Hindsight 官方 OpenClaw 插件的 `agent_plugin` 模式及独立运行要求见 [插件接入说明](docs/hindsight-agent-plugin.md)。
+
+JiuwenMemory `backend_direct` 使用原生同步抽取和召回，配置与命令见 [JiuwenMemory 接入说明](docs/jiuwenmemory-backend-direct.md)。
+
+OpenClaw + JiuwenMemory 通过统一 `cli run --memory-integration agent_plugin` 使用 v0.2.1 官方 MCP 和 Agent 主动检索，见 [MCP 接入说明](docs/jiuwenmemory-mcp.md)。
