@@ -272,7 +272,7 @@ def test_real_plugin_protocol_brackets_generic_agent(runtime):
 
 
 @pytest.mark.parametrize("kind", ["success", "empty", "missing", "null", "preliminary", "wrong_id", "wrong_key", "unpaired", "success_then_null"])
-def test_qa_requires_current_session_success_receipt(runtime, monkeypatch, kind):
+def test_qa_reports_current_session_recall_verification(runtime, monkeypatch, kind):
     from types import SimpleNamespace
     state, module, run = runtime
     run("prepare", scope_id="run:a")
@@ -295,13 +295,27 @@ def test_qa_requires_current_session_success_receipt(runtime, monkeypatch, kind)
         assert cmd == ["docker", "logs", "--since", context["log_since"], "dedicated"]
         return SimpleNamespace(stdout=text, stderr="")
     monkeypatch.setattr(module.subprocess, "run", logs)
-    inputs = {"check_context": context, "agent_result": {"transport": "http", "output": {"session_id": "current"}}}
-    if kind in ("success", "empty"):
-        result = module.after_agent(state, inputs)
-        assert result["checked"] and result["recall_receipt"] == "native_assemble_return"
-        assert result["session_id"] == "current"
+    now = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    inputs = {"check_context": context, "agent_result": {"status": "ok", "transport": "http",
+              "output": {"session_id": "current"}, "turns": [{"text": "An answer"}]}}
+    if kind in ("null", "success_then_null"):
+        with pytest.raises(RuntimeError, match="Native oGMemory hook failed"):
+            module.after_agent(state, inputs)
     else:
-        with pytest.raises(RuntimeError): module.after_agent(state, inputs)
+        result = module.after_agent(state, inputs)
+        assert result["checked"] and result["session_id"] == "current"
+        assert result["recall_verified"] is (kind in ("success", "empty"))
+        if not result["recall_verified"]:
+            assert result["recall_verification_reason"] == "native_assemble_receipt_not_matched"
+            inputs["agent_result"]["turns"] = [{"text": "  "}]
+            with pytest.raises(module.RecallReceiptMissing):
+                module.after_agent(state, inputs)
+            inputs["agent_result"]["status"] = "failed"
+            inputs["agent_result"]["turns"] = [{"text": "Partial answer"}]
+            with pytest.raises(module.RecallReceiptMissing):
+                module.after_agent(state, inputs)
 
 
 @pytest.mark.parametrize("phase", ["ingest", "qa"])
@@ -490,3 +504,63 @@ else:
     assert result.operation["checkpoint_id"] == "checkpoint"
     assert result.operation["scope_id"] == "run:a"
     assert result.operation["compact_completed"] is True
+
+
+def test_qa_with_unverified_recall_reaches_judge_and_is_reported(runtime, monkeypatch, tmp_path):
+    from memory_bench_platform import workflow
+    from memory_bench_platform.integration import build_run_contract
+    from memory_bench_platform.protocol import CaseRecord, ExecutionSpec, StepRecord, WorkflowRuntimeContext
+
+    _, _, run = runtime
+    run("prepare", scope_id="run:a")
+    run("set_phase", phase="qa")
+    ctx = WorkflowRuntimeContext(run_id="run", run_dir=str(tmp_path / "run"),
+        benchmark_id="locomo", agent_id="openclaw", memory_integration="agent_plugin",
+        memory_plugin_id="openclaw-ogmemory",
+        run_contract=build_run_contract("locomo", "openclaw", "ogmemory", "agent_plugin"))
+    case = CaseRecord(case_id="qa", run_id="run", title="qa", goal="answer",
+                      capability="memory/question-answering", reference={"expected_answer": "Paris"})
+    step = StepRecord(step_id="answer", case_id="qa", name="answer", operator_kind="agent",
+        inputs={"metadata": {"purpose": "memory_qa", "scope_id": "run:a", "local": True}})
+    monkeypatch.setattr(workflow, "run_agent_task", lambda *args: {
+        "status": "ok", "transport": "cli", "stderr": "og-memory: mode=remote",
+        "output": {"session_id": "qa-session"}, "turns": [{"text": "Paris"}]})
+
+    result = workflow.execute_cases(run_id="run", agent_id="openclaw", runtime_context=ctx,
+        cases=[case], steps=[step], execution_spec=ExecutionSpec(), run_dir=tmp_path / "run")
+    assert result["step_results"][0].status == "passed"
+    assert result["judge_results"][0].passed is True
+    assert run("finalize")["output"]["recall_verification"] == {
+        "verified": 0, "unverified": 1, "checked_qa": 1, "coverage": 0.0}
+
+
+@pytest.mark.parametrize("timeout_on_retry", [False, True])
+def test_qa_log_timeout_only_degrades_during_receipt_retry(runtime, monkeypatch, timeout_on_retry):
+    from types import SimpleNamespace
+
+    state, module, _ = runtime
+    monkeypatch.setattr(module, "gateway_container", lambda path: "dedicated")
+    budgets = []
+
+    def logs(command, **kwargs):
+        budgets.append(kwargs["timeout"])
+        if timeout_on_retry and len(budgets) == 1:
+            return SimpleNamespace(stdout="", stderr="")
+        raise module.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(module.subprocess, "run", logs)
+    inputs = {
+        "check_context": {"transport": "http", "phase": "qa", "log_since": "1",
+                          "expected_session_key": "agent:main:qa"},
+        "agent_result": {"status": "ok", "transport": "http",
+                         "output": {"session_id": "qa-session"}, "turns": [{"text": "Paris"}]},
+    }
+    if timeout_on_retry:
+        output = module.after_agent(state, inputs)
+        assert output["recall_verified"] is False
+        assert output["recall_verification_reason"] == "native_assemble_receipt_not_matched"
+        assert len(budgets) == 2 and 0 < budgets[1] <= 5
+    else:
+        with pytest.raises(module.subprocess.TimeoutExpired):
+            module.after_agent(state, inputs)
+        assert budgets == [20]
