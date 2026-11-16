@@ -1,0 +1,28 @@
+kind: memory_plugin
+id: openclaw-jiuwenmemory
+version: 0.2.1
+agent: openclaw
+memory: jiuwenmemory
+entry:
+  runner: scripts/run_lifecycle.py
+runtime:
+  actions: [validate, prepare, set_phase, before_agent, after_agent, finalize]
+capabilities:
+  agent_tool_ingest: true
+  agent_tool_recall: true
+  qa_read_only: true
+  namespace_isolation: true
+  extraction_trigger: agent_tool_ingest
+  commit:
+    supported: false
+    required_after_ingest: false
+  readiness:
+    supported: false
+phases:
+  ingest: {capture: true, recall: false}
+  qa: {capture: false, recall: true}
+integration:
+  protocol_version: memory-plugin/1
+lifecycle:
+  phases: [ingest, qa]
+  actions: [validate, prepare, set_phase, before_agent, after_agent, finalize]

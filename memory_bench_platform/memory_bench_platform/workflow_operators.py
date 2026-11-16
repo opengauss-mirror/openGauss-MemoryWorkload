@@ -118,6 +118,21 @@ def _execute_agent(
     failure = failed_check("before_agent")
     if failure is not None:
         return failure
+    capabilities = (runtime_context.run_contract.get("memory_plugin_runtime") or {}).get("capabilities", {})
+    is_ingest = rendered.metadata.get("purpose") == "memory_ingest"
+    if capabilities.get("agent_tool_ingest" if is_ingest else "agent_tool_recall"):
+        suffix = check_context.get("system_prompt_suffix")
+        if not isinstance(suffix, str) or not suffix.strip():
+            raise ValueError("Agent tool use requires instructions from before_agent")
+        rendered.system_prompt = "\n\n".join(filter(None, (rendered.system_prompt, suffix)))
+        if route := check_context.get("agent_id"):
+            if not isinstance(route, str) or not route.strip():
+                raise ValueError("Agent tool use requires a valid Agent ID")
+            rendered.metadata["agent_id"] = route
+        if session_key := check_context.get("session_key"):
+            if not isinstance(session_key, str) or not session_key.strip():
+                raise ValueError("Agent tool use requires a valid session key")
+            rendered.metadata["session_key"] = session_key
     result = {}
     try:
         result = token_usage.capture_agent(agent_runner, agent_id, rendered)
