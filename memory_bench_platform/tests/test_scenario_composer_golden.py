@@ -62,7 +62,7 @@ def test_multi_checkpoint_direct_plan_preserves_stage_boundaries():
     assert actions.count("flush") == 2
     assert len([step for step in plan["steps"] if "wait-ready" in step["step_id"]]) == 2
     second_setup = setup_cases[1]
-    assert second_setup["depends_on_cases"] == ["sample-1-q1"]
+    assert second_setup["depends_on_cases"] == ["sample-1-stage-1-setup", "sample-1-q1"]
     scoped_steps = [
         step for step in plan["steps"]
         if step["operator_kind"] == "memory" and step["inputs"].get("action") in {"ingest", "recall"}

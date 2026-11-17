@@ -705,3 +705,37 @@ def test_plugin_check_failures_are_archived_and_obey_fail_fast(monkeypatch, tmp_
                 assert "s1" not in calls
             assert output["judge_results"][0].passed is True
             assert output["judge_results"][1].label == "runtime-error"
+
+
+@pytest.mark.parametrize("input_error", [True, False])
+@pytest.mark.parametrize("explicit_dependency", [True, False])
+def test_preparation_only_bypasses_runtime_failure(tmp_path, monkeypatch, input_error, explicit_dependency):
+    calls = []
+
+    def operator(step, **kwargs):
+        calls.append(step.step_id)
+        if step.step_id == "first":
+            raise RuntimeError("backend unavailable")
+        return {"status": "ok", "output": {}}
+
+    monkeypatch.setattr("memory_bench_platform.workflow._execute_step_operator", operator)
+    case = CaseRecord(case_id="setup", run_id="r", title="setup", goal="write history",
+                      capability="memory/setup", judge_mode="none", labels=["phase:setup"])
+    def step(step_id, action, depends_on=(), content="history"):
+        return StepRecord(step_id=step_id, case_id="setup", name=step_id, operator_kind="memory",
+                          gate_policy="hard", depends_on=list(depends_on),
+                          inputs={"action": action, "content": content})
+
+    steps = [
+        step("first", "ingest", content={"$ref": "run.missing"} if input_error else "history"),
+        (step("flush", "flush", ("first",)) if explicit_dependency
+         else step("flush", "ingest", content={"$ref": "steps.first.output.content"})),
+        step("next", "ingest", ("flush",)),
+        step("unrelated", "ingest"),
+    ]
+    result = execute_cases(run_id="r", agent_id="openclaw", memory_id="mem0", cases=[case],
+                           steps=steps, execution_spec=ExecutionSpec(fail_fast=False), run_dir=tmp_path)
+    assert [x.status for x in result["step_results"]] == [
+        "failed", "skipped", "skipped" if input_error else "passed", "passed",
+    ]
+    assert calls == (["unrelated"] if input_error else ["first", "next", "unrelated"])

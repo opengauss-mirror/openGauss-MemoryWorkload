@@ -102,14 +102,25 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "benchmark_diagnostics": _extract_benchmark_diagnostics(external_result),
         "analysis_notes": _build_notes(summary, external_result, buckets, _read_ingest_summary(run_dir)),
     }
-    degraded = (summary.get("resource_summary", {}).get("evaluation") or {}).get("degraded_qa")
-    if "memory_compact_timeout" in (summary.get("run_validity") or {}).get("reasons", []):
+    evaluation = summary.get("resource_summary", {}).get("evaluation") or {}
+    degraded = evaluation.get("degraded_qa")
+    validity = summary.get("run_validity") or {}
+    compact_timed_out = "memory_compact_timeout" in validity.get("reasons", [])
+    if validity.get("valid") is False or compact_timed_out:
         analysis["overall_accuracy"] = None
     if degraded:
         analysis["degraded_qa"] = degraded
+        paths = evaluation.get("qa_paths") or {}
+        reasons = []
+        if compact_timed_out:
+            reasons.append("memory compact timeout")
+        if (paths.get("setup_failed") or {}).get("cases"):
+            reasons.append("history preparation failure")
+        if (paths.get("recall_failed") or {}).get("cases"):
+            reasons.append("memory recall failure")
+        reason_text = f" after {', '.join(reasons)}" if reasons else ""
         analysis["analysis_notes"].append(
-            f"Degraded QA after a memory compact timeout: {degraded['correct']}/{degraded['graded']} "
-            "graded answers correct. History was incomplete and this run has no comparable benchmark score."
+            f"Degraded QA{reason_text}: {degraded['correct']}/{degraded['graded']} graded answers correct."
         )
     if chain_diagnostics:
         analysis["chain_diagnostics"] = chain_diagnostics

@@ -127,7 +127,11 @@ def test_parallel_failures_preserve_other_results(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow, "_execute_step_operator", operator)
     monkeypatch.setattr(workflow, "run_llm_judge", judge)
     result = execute(tmp_path, cases, steps, qa=2, judge=2)
-    assert [r.label for r in result["judge_results"]] == ["runtime-error", "judge-error", "correct"]
+    assert [r.label for r in result["judge_results"]] == ["correct", "judge-error", "correct"]
+    failed = next(r for r in result["step_results"] if r.step_id == "c0-q0-recall")
+    assert failed.status == "failed" and "recall failed" in failed.gate_detail
+    answer = next(r for r in result["step_results"] if r.step_id == "c0-q0-answer")
+    assert answer.structured_output["qa_degradation"]["recall_failed"] == failed.step_id
     assert len(list((tmp_path / "records/case-progress").glob("*.json"))) == 4
     assert sum(t.event_type == "case_judge_started" for t in result["traces"]) == 3
     assert sum(t.event_type == "case_judge_finished" for t in result["traces"]) == 3

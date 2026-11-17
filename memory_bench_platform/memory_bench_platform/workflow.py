@@ -27,12 +27,31 @@ from .protocol import (
     TraceEventRecord,
     WorkflowRuntimeContext,
 )
-from .workflow_inputs import InputResolutionError, build_input_scope, resolve_inputs, validate_workflow
+from .workflow_inputs import InputResolutionError, build_input_scope, iter_input_references, resolve_inputs, validate_workflow
 from .workflow_operators import dispatch_step_operator
 
 
 _sleep = time.sleep
 _monotonic = time.monotonic
+
+_MEMORY_FAILURES = {"memory-preparation-failed", "memory-compact-timeout"}
+
+
+def _memory_preparation(case: CaseRecord, steps: list[StepRecord]) -> bool:
+    """Only data preparation, never plugin validation or arbitrary commands."""
+    return "phase:setup" in case.labels and all(
+        (step.operator_kind == "memory" and step.inputs.get("action") in {"ingest", "flush", "commit"})
+        or (step.operator_kind == "poll" and step.inputs.get("probe", {}).get("operator_kind") == "memory")
+        for step in steps
+    )
+
+
+def _memory_qa(case: CaseRecord, steps: list[StepRecord]) -> bool:
+    if case.reference.get("evaluation_target") != "qa_answer" or case.capability != "memory/question-answering":
+        return False
+    return (len(steps) == 2 and steps[0].operator_kind == "memory"
+            and steps[0].inputs.get("action") == "recall"
+            and steps[1].operator_kind == "agent" and steps[1].depends_on == [steps[0].step_id])
 
 
 def _timestamp() -> datetime:
@@ -112,6 +131,12 @@ def _execute_case(
     for case in [case]:
         case_step_results: list[StepResultRecord] = []
         results_by_step: dict[str, StepResultRecord] = {}
+        preparation = _memory_preparation(case, steps_by_case.get(case.case_id, []))
+        resilient_qa = _memory_qa(case, steps_by_case.get(case.case_id, []))
+        qa_degradation = {}
+        recall_fallbacks = set()
+        configuration_failed = False
+        configuration_blocked_steps: set[str] = set()
         unsatisfied_case_dependencies = [
             dependency
             for dependency in case.depends_on_cases
@@ -121,13 +146,15 @@ def _execute_case(
             case_failure_kind.get(dependency) == "memory-compact-timeout"
             for dependency in unsatisfied_case_dependencies
         )
-        if (compact_timeout_dependencies
-                and runtime_context.memory_integration == "backend_direct"
-                and memory_id == "ogmemory"
-                and case.reference.get("evaluation_target") == "qa_answer"
-                and case.capability == "memory/question-answering"):
+        failed_memory_dependencies = bool(unsatisfied_case_dependencies) and all(
+            case_failure_kind.get(dependency) in _MEMORY_FAILURES
+            for dependency in unsatisfied_case_dependencies
+        )
+        if failed_memory_dependencies and (resilient_qa or preparation):
+            if resilient_qa:
+                qa_degradation["setup_failed"] = list(unsatisfied_case_dependencies)
             unsatisfied_case_dependencies = []
-        case_failed = bool(unsatisfied_case_dependencies)
+        case_failed = bool(unsatisfied_case_dependencies) or (preparation and failed_memory_dependencies)
         if unsatisfied_case_dependencies:
             dependency_detail = (
                 "case dependency not satisfied: "
@@ -148,9 +175,30 @@ def _execute_case(
 
         executable_steps = [] if unsatisfied_case_dependencies else steps_by_case.get(case.case_id, [])
         for step in executable_steps:
-            if step.depends_on and any(
-                dep not in results_by_step or results_by_step[dep].status != "passed" for dep in step.depends_on
-            ):
+            failed_dependencies = [dep for dep in step.depends_on
+                                   if dep not in results_by_step or results_by_step[dep].status != "passed"]
+            preparation_ingest = (
+                preparation and step.operator_kind == "memory" and step.inputs.get("action") == "ingest"
+            )
+            failed_input_dependencies: set[str] = set()
+            if preparation:
+                for reference in iter_input_references(step.inputs):
+                    root, _, path = reference.partition(".")
+                    if root == "steps":
+                        dependency = path.partition(".")[0]
+                        result = results_by_step.get(dependency)
+                        if result is None or result.status != "passed":
+                            failed_input_dependencies.add(dependency)
+            configuration_blocked = not configuration_blocked_steps.isdisjoint(
+                set(failed_dependencies) | failed_input_dependencies
+            )
+            independent_ingest = preparation_ingest and not configuration_blocked
+            fallback_answer = resilient_qa and step.operator_kind == "agent" and all(
+                dep in recall_fallbacks for dep in failed_dependencies)
+            if (configuration_blocked or failed_input_dependencies
+                    or (failed_dependencies and not independent_ingest and not fallback_answer)):
+                if configuration_blocked:
+                    configuration_blocked_steps.add(step.step_id)
                 skipped = StepResultRecord(
                     step_result_id=f"{step.step_id}-skipped",
                     step_id=step.step_id,
@@ -177,11 +225,19 @@ def _execute_case(
             final_operator_output: dict = {}
             resolution_error: InputResolutionError | None = None
             try:
+                input_scope = build_input_scope(runtime_context, case, case_step_results)
+                # Substitute only the answer input. Keep the failed recall record
+                # and raw response intact, and never feed error text as evidence.
+                if step.operator_kind == "agent":
+                    for dep in recall_fallbacks:
+                        input_scope["steps"][dep] = {"output": {"evidence_text": ""}}
                 resolved_inputs = resolve_inputs(
                     step.inputs,
-                    build_input_scope(runtime_context, case, case_step_results),
+                    input_scope,
                 )
             except InputResolutionError as exc:
+                configuration_failed = True
+                configuration_blocked_steps.add(step.step_id)
                 resolution_error = exc
                 resolved_step = step
             else:
@@ -354,6 +410,14 @@ def _execute_case(
                     )
 
             result = final_result
+            recall_failed = (resilient_qa and step.operator_kind == "memory"
+                             and step.inputs.get("action") == "recall"
+                             and result.status == "failed" and resolution_error is None)
+            if recall_failed:
+                recall_fallbacks.add(step.step_id)
+                qa_degradation["recall_failed"] = step.step_id
+            if resilient_qa and step.operator_kind == "agent" and qa_degradation:
+                result.structured_output["qa_degradation"] = dict(qa_degradation)
             case_step_results.append(result)
             step_results.append(result)
             results_by_step[step.step_id] = result
@@ -484,8 +548,10 @@ def _execute_case(
             )
 
             if not result.gate_passed and step.gate_policy == "hard":
+                if recall_failed:
+                    continue
                 case_failed = True
-                if execution_spec.fail_fast:
+                if execution_spec.fail_fast and (not preparation or resolution_error is not None):
                     break
 
         case_execution_status[case.case_id] = "failed" if case_failed else "passed"
@@ -510,8 +576,11 @@ def _execute_case(
                 ))
             )
             case_failure_kind[case.case_id] = (
+                "runtime-error" if configuration_failed else
                 "memory-compact-timeout" if compact_timed_out
-                else "runtime-not-ready" if readiness_failed else "runtime-error"
+                else "memory-preparation-failed" if preparation and not unsatisfied_case_dependencies
+                else "runtime-not-ready" if readiness_failed
+                else "runtime-error"
             )
         if case.judge_mode == "none":
             continue
@@ -759,6 +828,15 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                         if client_event_path is not None and phase in {"ingest", "drain", "recall"}:
                             timed = [item for item in output["step_results"]
                                      if item.started_at is not None and item.ended_at is not None]
+                            operation_status = output["_execution_status"]
+                            if integration == "backend_direct" and phase == "recall":
+                                recall_ids = {
+                                    step.step_id for step in by_case[case.case_id]
+                                    if step.operator_kind == "memory" and step.inputs.get("action") == "recall"
+                                }
+                                timed = [item for item in timed
+                                         if item.step_id in recall_ids and item.status != "skipped"]
+                                operation_status = "passed" if all(item.status == "passed" for item in timed) else "failed"
                             if timed:
                                 started = min(item.started_at for item in timed).astimezone(timezone.utc)
                                 ended = max(item.ended_at for item in timed).astimezone(timezone.utc)
@@ -766,7 +844,7 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                                     stream.write(json.dumps({"run_id": run_id, "request_id": case.case_id,
                                         "operation": {"ingest": "add", "drain": "drain", "recall": "search"}[phase],
                                         "started_utc": started.isoformat(), "ended_utc": ended.isoformat(),
-                                        "status": "ok" if output["_execution_status"] == "passed" else "failed"}) + "\n")
+                                        "status": "ok" if operation_status == "passed" else "failed"}) + "\n")
                         if output["_judge_job"] is not None:
                             judge = judge_pool.submit(copy_context().run, _judge_case, run_id, case, output["_judge_job"], runtime_context)
                             pending[judge] = ("judge", case)
