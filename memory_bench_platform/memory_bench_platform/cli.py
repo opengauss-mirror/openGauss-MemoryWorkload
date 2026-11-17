@@ -366,6 +366,7 @@ def _summarize_native_evaluation(
     ]
     ready_checkpoints = 0
     timed_out_setups: set[str] = set()
+    failed_setups: set[str] = set()
     checkpoint_rows: list[dict] = []
     ready_latencies: list[int] = []
     for case_id in setup_case_ids:
@@ -387,6 +388,8 @@ def _summarize_native_evaluation(
             if step.step_id in result_by_id
         )
         case = next(item for item in cases if item.case_id == case_id)
+        if any(dependency in failed_setups for dependency in case.depends_on_cases):
+            ready = False
         upstream_timed_out = any(dependency in timed_out_setups for dependency in case.depends_on_cases)
         if upstream_timed_out or (not ready and any(
             step.step_id in result_by_id and
@@ -395,6 +398,8 @@ def _summarize_native_evaluation(
         )):
             ready = False
             timed_out_setups.add(case_id)
+        if not ready:
+            failed_setups.add(case_id)
         checkpoint_rows.append(
             {
                 "setup_case_id": case_id,
@@ -439,9 +444,23 @@ def _summarize_native_evaluation(
     evaluation_coverage = (
         round(len(valid_results) / len(judge_results), 4) if judge_results else 0.0
     )
-    degraded_cases = {case.case_id for case in cases
-                      if any(dependency in timed_out_setups for dependency in case.depends_on_cases)}
+    qa_cases = {case.case_id for case in cases
+                if case.reference.get("evaluation_target") == "qa_answer"}
+    setup_affected = {case.case_id for case in cases if case.case_id in qa_cases
+                      and any(dependency in failed_setups for dependency in case.depends_on_cases)}
+    recall_failed = {item.case_id for item in steps if item.operator_kind == "memory"
+                     and item.inputs.get("action") == "recall" and item.case_id in qa_cases
+                     and item.step_id in result_by_id and result_by_id[item.step_id].status == "failed"}
+    recall_empty = {item.case_id for item in steps if item.operator_kind == "memory"
+                    and item.inputs.get("action") == "recall" and item.case_id in qa_cases
+                    and item.step_id in result_by_id and result_by_id[item.step_id].status == "passed"
+                    and not result_by_id[item.step_id].structured_output.get("output", {}).get("evidence_text")}
+    degraded_cases = setup_affected | recall_failed
     degraded_scores = [item.passed for item in valid_results if item.case_id in degraded_cases]
+    def qa_group(ids):
+        scores = [item.passed for item in valid_results if item.case_id in ids]
+        return {"cases": len(ids), "graded": len(scores), "correct": sum(scores),
+                "accuracy": round(sum(scores) / len(scores), 4) if scores else None}
     return {
         "case_total": len(judge_results),
         "case_passed": passed_cases,
@@ -456,6 +475,11 @@ def _summarize_native_evaluation(
         "runtime_failure_rate": runtime_failure_rate,
         "readiness_latency_ms": readiness_latency_ms,
         "checkpoints": checkpoint_rows,
+        "qa_paths": {"normal": qa_group(qa_cases - degraded_cases),
+                     "degraded": qa_group(degraded_cases),
+                     "setup_failed": qa_group(setup_affected),
+                     "recall_failed": qa_group(recall_failed),
+                     "recall_empty": qa_group(recall_empty)},
         **({"degraded_qa": {"graded": len(degraded_scores), "correct": sum(degraded_scores),
                             "accuracy": round(sum(degraded_scores) / len(degraded_scores), 4)}}
            if degraded_scores else {}),

@@ -642,6 +642,19 @@ memory-bench analyze-run --run-dir runs/<run-id>
 
 硬件采集需要 Linux、`perf`、相应 PMU/容器 cgroup 权限；`best_effort` 在 macOS 或权限不足时保留客户端阶段指标并标记硬件 `skipped`，`required` 会在正式请求前拒绝。工具不会执行 `sudo` 或修改内核权限。`--pressure-test` 仍需独立的多 Agent 压测实现，目前不能与 `experiment` 使用。
 
+## 记忆准备与召回失败后的 QA
+
+原生 `backend_direct` 的标准“记忆准备 → recall → answer”流程默认继续评测，不依赖某个记忆系统的错误码判断是否允许回答：
+
+- `ingest`、`flush` 或就绪检查失败后保留错误，继续尝试后续独立历史写入和 QA。依赖失败写入返回值的 flush 不会执行，历史准备仍标为不完整。
+- QA 仍尝试召回；召回在既有重试结束后失败时，仅向回答步骤提供空 `evidence_text`，继续生成答案和评分。成功但没有记忆的召回也正常回答。
+- 原始失败状态、后端返回内容、异常文件和耗时照常保存；回答步骤的 `structured_output.qa_degradation` 记录准备或召回失败原因，不将失败响应当作记忆传给模型。
+- `reports/summary.json` 的 `qa_paths` 分别统计正常、降级、准备失败、召回失败、空召回的题数及评分。原因分类可能重叠；空召回不自动算失败。`degraded_qa` 保留降级题评分汇总。
+
+继续 QA 不等于确认记忆已抽取完成。`raw_benchmark_score` 保留实际答题评分；既有完整性校验仍会根据准备完成率、运行失败率等判定 run validity，未通过时正式 `benchmark_score` 仍为空。比较结果时应同时查看降级比例，避免将无记忆回答视为记忆系统正常表现。
+
+该行为适用于各记忆后端共用的标准直接召回流程，不修改后端适配器。配置/输入引用错误、任意工作流依赖、Agent 插件校验与隔离前置条件仍按原规则处理；回答或 Judge 自身失败仍如实记录。
+
 ## Hindsight 自部署接入
 
 支持 Hindsight `backend_direct`：原生异步 retain、后台任务就绪检查、recall，以及既有准确率和 Token 报告。配置与命令见 [Hindsight 接入说明](docs/hindsight-backend-direct.md)。

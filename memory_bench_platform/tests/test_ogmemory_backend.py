@@ -166,10 +166,10 @@ def test_timed_out_compact_checks_scoped_receipt_without_resubmitting(receipt_st
         assert result["error"]["code"] == "CompactTimeout"
 
 
-@pytest.mark.parametrize("failure_code,expected_answer", [("CompactTimeout", True), ("RuntimeError", False)])
+@pytest.mark.parametrize("failure_code", ["CompactTimeout", "RuntimeError"])
 @pytest.mark.parametrize("empty_checkpoints", [False, True])
 def test_workflow_ogmemory_timeout_keeps_diagnostic_qa(
-    monkeypatch, tmp_path, failure_code, expected_answer, empty_checkpoints,
+    monkeypatch, tmp_path, failure_code, empty_checkpoints,
 ):
     from memory_bench_platform import workflow
     from memory_bench_platform.cli import _apply_native_run_validity, _summarize_native_evaluation
@@ -225,14 +225,14 @@ def test_workflow_ogmemory_timeout_keeps_diagnostic_qa(
     result = workflow.execute_cases(run_id="r", agent_id="generic-cli", memory_id="ogmemory",
                                     runtime_context=context, cases=cases, steps=steps,
                                     execution_spec=ExecutionSpec(default_retry_limit=1), run_dir=tmp_path)
-    assert actions == ["flush"] + (["recall"] * last_checkpoint if expected_answer else [])
-    assert [row.passed for row in result["judge_results"]] == [True if expected_answer else None] * last_checkpoint
+    assert actions == ["flush"] + ["recall"] * (last_checkpoint - 1) + ["ingest", "recall"]
+    assert [row.passed for row in result["judge_results"]] == [True] * last_checkpoint
     summary = _apply_native_run_validity(_summarize_native_evaluation(
         cases, steps, result["judge_results"], result["step_results"],
-    ), {"minimum_checkpoint_ready_rate": 0, "maximum_runtime_failure_rate": 1})
+    ))
     assert summary["benchmark_score"] is None
-    if expected_answer:
-        assert summary["degraded_qa"] == {"graded": last_checkpoint, "correct": last_checkpoint, "accuracy": 1.0}
-        assert summary["checkpoint_ready_rate"] == 0.0
+    assert summary["degraded_qa"] == {"graded": last_checkpoint, "correct": last_checkpoint, "accuracy": 1.0}
+    assert summary["checkpoint_ready_rate"] == 0.0
+    if failure_code == "CompactTimeout":
         assert all(row["degraded_reason"] == "memory_compact_timeout" for row in summary["checkpoints"])
         assert "memory_compact_timeout" in summary["run_validity"]["reasons"]

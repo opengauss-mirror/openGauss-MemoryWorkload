@@ -724,3 +724,28 @@ def test_html_distinguishes_unavailable_accuracy_from_zero(tmp_path, degraded, e
     assert analysis["overall_accuracy"] == (None if degraded else 0.0)
     report = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
     assert f'Overall Accuracy</div><div class="metric-value">{expected}</div>' in report
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_recall_degradation_reports_recall_failure_with_formal_validity(tmp_path, valid):
+    run_dir = tmp_path / "recall-degradation"
+    _build_minimal_run(run_dir)
+    path = run_dir / "reports" / "summary.json"
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    summary["benchmark_score"] = 0.5 if valid else None
+    summary["run_validity"] = {"valid": valid, "reasons": [] if valid else ["runtime_failure_rate_above_maximum"]}
+    summary["resource_summary"] = {"evaluation": {
+        "degraded_qa": {"graded": 1, "correct": 1, "accuracy": 1.0},
+        "qa_paths": {"setup_failed": {"cases": 0}, "recall_failed": {"cases": 1}},
+    }}
+    path.write_text(json.dumps(summary), encoding="utf-8")
+
+    analysis = analyze_run(run_dir)
+    assert analysis["overall_accuracy"] == (0.5 if valid else None)
+    assert analysis["degraded_qa"]["accuracy"] == 1.0
+    html = (run_dir / "reports" / "run_report.html").read_text(encoding="utf-8")
+    expected = "50.00%" if valid else "—"
+    assert f'Overall Accuracy</div><div class="metric-value">{expected}</div>' in html
+    note, = [note for note in analysis["analysis_notes"] if note.startswith("Degraded QA")]
+    assert "memory recall failure" in note
+    assert "compact timeout" not in note and "history preparation" not in note
