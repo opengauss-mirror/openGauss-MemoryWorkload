@@ -195,7 +195,9 @@ class TraceEventRecord(BaseModel):
 class ExecutionSpec(BaseModel):
     case_mode: Literal["single_path", "dag"] = "single_path"
     max_parallel_steps: int = 1
+    sample_concurrency: int = Field(default=1, gt=0)
     qa_concurrency: int = Field(default=1, gt=0)
+    qa_per_sample: int = Field(default=1, gt=0)
     judge_concurrency: int = Field(default=1, gt=0)
     fail_fast: bool = True
     default_retry_limit: int = 0
@@ -218,6 +220,8 @@ class WorkflowRuntimeContext(BaseModel):
     memory_id: str | None = None
     memory_integration: Literal["backend_direct", "agent_plugin"] = "backend_direct"
     memory_plugin_id: str | None = None
+    concurrent_plugin_qa: bool = False
+    sample_environments: dict[str, dict[str, str]] = Field(default_factory=dict)
     run_contract: dict[str, Any] = Field(default_factory=dict)
     version_selection: dict[str, Any] = Field(default_factory=dict)
 

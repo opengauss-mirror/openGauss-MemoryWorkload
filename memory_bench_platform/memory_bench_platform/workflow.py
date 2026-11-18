@@ -5,7 +5,7 @@ from . import token_usage
 import json
 import hashlib
 from contextvars import copy_context
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import subprocess
 import time
 import urllib.request
@@ -13,7 +13,7 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .integration import run_agent_task, run_memory_plugin_task, run_memory_task
+from .integration import sample_runtime_environment, validate_sample_identities, run_agent_task, run_memory_plugin_task, run_memory_task
 from .judges import run_builtin_judge, run_llm_judge
 from .protocol import (
     ArtifactRecord,
@@ -133,6 +133,14 @@ def _execute_case(
         results_by_step: dict[str, StepResultRecord] = {}
         preparation = _memory_preparation(case, steps_by_case.get(case.case_id, []))
         resilient_qa = _memory_qa(case, steps_by_case.get(case.case_id, []))
+        plugin = runtime_context.memory_integration == "agent_plugin"
+        plugin_setup = plugin and "phase:setup" in case.labels and case.capability == "agent-memory/plugin-ingest"
+        plugin_qa = (plugin and case.reference.get("evaluation_target") == "qa_answer"
+                     and case.capability == "memory/question-answering" and len(steps_by_case.get(case.case_id, [])) == 1
+                     and steps_by_case[case.case_id][0].operator_kind == "agent"
+                     and steps_by_case[case.case_id][0].inputs.get("metadata", {}).get("purpose") == "memory_qa")
+        stopped_history = False
+        qa_phase_restored = False
         qa_degradation = {}
         recall_fallbacks = set()
         configuration_failed = False
@@ -150,8 +158,12 @@ def _execute_case(
             case_failure_kind.get(dependency) in _MEMORY_FAILURES
             for dependency in unsatisfied_case_dependencies
         )
-        if failed_memory_dependencies and (resilient_qa or preparation):
-            if resilient_qa:
+        inherited_plugin_failure = bool(unsatisfied_case_dependencies) and all(
+            case_failure_kind.get(dep) == "plugin-history-incomplete-qa-ready" for dep in unsatisfied_case_dependencies
+        )
+        if ((failed_memory_dependencies and (resilient_qa or preparation))
+                or (inherited_plugin_failure and (plugin_qa or plugin_setup))):
+            if resilient_qa or plugin_qa:
                 qa_degradation["setup_failed"] = list(unsatisfied_case_dependencies)
             unsatisfied_case_dependencies = []
         case_failed = bool(unsatisfied_case_dependencies) or (preparation and failed_memory_dependencies)
@@ -177,6 +189,9 @@ def _execute_case(
         for step in executable_steps:
             failed_dependencies = [dep for dep in step.depends_on
                                    if dep not in results_by_step or results_by_step[dep].status != "passed"]
+            restore_qa = (plugin_setup and (stopped_history or inherited_plugin_failure)
+                          and step is executable_steps[-1] and step.operator_kind == "memory_plugin"
+                          and step.inputs.get("action") == "set_phase" and step.inputs.get("phase") == "qa")
             preparation_ingest = (
                 preparation and step.operator_kind == "memory" and step.inputs.get("action") == "ingest"
             )
@@ -195,8 +210,8 @@ def _execute_case(
             independent_ingest = preparation_ingest and not configuration_blocked
             fallback_answer = resilient_qa and step.operator_kind == "agent" and all(
                 dep in recall_fallbacks for dep in failed_dependencies)
-            if (configuration_blocked or failed_input_dependencies
-                    or (failed_dependencies and not independent_ingest and not fallback_answer)):
+            if (configuration_blocked or failed_input_dependencies or (stopped_history and not restore_qa)
+                    or (failed_dependencies and not independent_ingest and not fallback_answer and not (restore_qa and stopped_history))):
                 if configuration_blocked:
                     configuration_blocked_steps.add(step.step_id)
                 skipped = StepResultRecord(
@@ -231,10 +246,9 @@ def _execute_case(
                 if step.operator_kind == "agent":
                     for dep in recall_fallbacks:
                         input_scope["steps"][dep] = {"output": {"evidence_text": ""}}
-                resolved_inputs = resolve_inputs(
-                    step.inputs,
-                    input_scope,
-                )
+                resolved_inputs = resolve_inputs(step.inputs, input_scope)
+                if restore_qa:
+                    resolved_inputs["recover_read_only"] = True
             except InputResolutionError as exc:
                 configuration_failed = True
                 configuration_blocked_steps.add(step.step_id)
@@ -394,6 +408,12 @@ def _execute_case(
                 if final_result is None:
                     raise RuntimeError(f"step result missing for {step.step_id}")
 
+                if (plugin_setup and step.operator_kind == "memory_plugin"
+                        and step.inputs.get("action") in {"commit", "wait_ready"}
+                        and final_result.structured_output.get("raw", {}).get("error", {}).get("code")
+                        == "SettledHistoryFailure" and not case_failed and step.gate_policy == "hard"):
+                    stopped_history = True
+                    break
                 if final_result.status == "passed":
                     break
 
@@ -416,7 +436,10 @@ def _execute_case(
             if recall_failed:
                 recall_fallbacks.add(step.step_id)
                 qa_degradation["recall_failed"] = step.step_id
-            if resilient_qa and step.operator_kind == "agent" and qa_degradation:
+            if restore_qa:
+                qa_phase_restored = (result.status == "passed"
+                                     and result.structured_output["output"].get("read_only_verified") is True)
+            if (resilient_qa or plugin_qa) and step.operator_kind == "agent" and qa_degradation:
                 result.structured_output["qa_degradation"] = dict(qa_degradation)
             case_step_results.append(result)
             step_results.append(result)
@@ -551,9 +574,11 @@ def _execute_case(
                 if recall_failed:
                     continue
                 case_failed = True
-                if execution_spec.fail_fast and (not preparation or resolution_error is not None):
+                if execution_spec.fail_fast and not stopped_history and (not preparation or resolution_error is not None):
                     break
 
+        if plugin_setup and inherited_plugin_failure:
+            case_failed = True
         case_execution_status[case.case_id] = "failed" if case_failed else "passed"
         if case_failed:
             failed_step_ids = {
@@ -577,6 +602,8 @@ def _execute_case(
             )
             case_failure_kind[case.case_id] = (
                 "runtime-error" if configuration_failed else
+                "plugin-history-incomplete-qa-ready" if qa_phase_restored and (
+                    stopped_history or (inherited_plugin_failure and not failed)) else
                 "memory-compact-timeout" if compact_timed_out
                 else "memory-preparation-failed" if preparation and not unsatisfied_case_dependencies
                 else "runtime-not-ready" if readiness_failed
@@ -692,6 +719,39 @@ def _qa_group_key(case, steps, integration):
     return (sample, checkpoint, tuple(case.depends_on_cases))
 
 
+def _sample_partitions(cases, by_case, *, plugin=False):
+    """Reject ambiguous isolation before starting any sample writes."""
+    owners, partitions, scopes, sessions = {}, {}, {}, set()
+    for case in cases:
+        sample = case.source_metadata.get("sample_id") or case.reference.get("sample_id")
+        if not isinstance(sample, str) or not sample:
+            raise ValueError("Sample concurrency requires a sample_id on every case")
+        if any(value and value != sample for value in
+               (case.source_metadata.get("sample_id"), case.reference.get("sample_id"))):
+            raise ValueError("Conflicting sample_id in case metadata and reference")
+        owners[case.case_id] = sample
+        partitions.setdefault(sample, []).append(case)
+        for step in by_case[case.case_id]:
+            inputs = step.inputs
+            if step.operator_kind == "poll":
+                inputs = inputs.get("probe", {}).get("inputs", {})
+            if step.operator_kind in {"memory", "memory_plugin", "poll"} and (not plugin or "scope_id" in inputs):
+                scope = inputs.get("scope_id")
+                if not isinstance(scope, str) or not scope:
+                    raise ValueError("Sample concurrency requires explicit memory scope_id")
+                if scopes.setdefault(scope, sample) != sample:
+                    raise ValueError("Concurrent samples must not share memory scope_id")
+            if step.operator_kind == "agent":
+                session = inputs.get("metadata", {}).get("session_key")
+                if not isinstance(session, str) or not session or session.lower() in sessions:
+                    raise ValueError("Concurrent samples require unique Agent session_key")
+                sessions.add(session.lower())
+    for case in cases:
+        if any(owners.get(dep) != owners[case.case_id] for dep in case.depends_on_cases):
+            raise ValueError("Sample concurrency does not support cross-sample dependencies")
+    return partitions, scopes
+
+
 def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                   runtime_context: WorkflowRuntimeContext | None = None,
                   cases: list[CaseRecord], steps: list[StepRecord],
@@ -700,13 +760,45 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
     runtime_context = runtime_context or WorkflowRuntimeContext(
         run_id=run_id, run_dir=str(run_dir), benchmark_id="", agent_id=agent_id, memory_id=memory_id)
     integration = runtime_context.memory_integration
-    if integration == "agent_plugin" and execution_spec.qa_concurrency != 1:
-        raise ValueError("agent_plugin requires qa_concurrency=1; Judge concurrency is supported")
+    concurrent_plugin_qa = execution_spec.qa_per_sample > 1
+    if concurrent_plugin_qa:
+        if (integration, runtime_context.memory_plugin_id) != ("agent_plugin", "openclaw-ogmemory"):
+            raise ValueError("qa_per_sample > 1 requires the oGMemory agent_plugin")
+        if execution_spec.qa_per_sample > execution_spec.qa_concurrency:
+            raise ValueError("qa_per_sample cannot exceed qa_concurrency")
+    if integration == "agent_plugin" and execution_spec.qa_concurrency > 1 and execution_spec.sample_concurrency == 1 and not concurrent_plugin_qa:
+        raise ValueError("agent_plugin requires qa_concurrency=1 unless parallel samples have dedicated runtime bindings")
     validate_workflow(cases=cases, steps=steps, execution_spec=execution_spec,
         memory_id=memory_id, memory_plugin_id=runtime_context.memory_plugin_id)
     by_case = {case.case_id: [] for case in cases}
     for step in steps:
         by_case[step.case_id].append(step)
+    parallel_samples = execution_spec.sample_concurrency > 1
+    if parallel_samples and phase_sink is not None:
+        raise ValueError("Phase profiling requires sample_concurrency=1")
+    bound_samples = bool(runtime_context.sample_environments)
+    if bound_samples and phase_sink is not None:
+        raise ValueError("Phase profiling does not support sample runtime bindings")
+    partitions, scope_owners = _sample_partitions(cases, by_case, plugin=integration == "agent_plugin") if parallel_samples or bound_samples else ({}, {})
+    if integration == "agent_plugin" and (parallel_samples or bound_samples):
+        environments = runtime_context.sample_environments
+        if set(environments) != set(partitions):
+            raise ValueError("Every plugin sample requires a dedicated runtime environment")
+        for key in ("OPENCLAW_GATEWAY_URL", "OPENCLAW_STATE_DIR", "OPENCLAW_BIN"):
+            values = [env.get(key, "").rstrip("/") for env in environments.values()]
+            if any(not value for value in values) or len(set(values)) != len(values):
+                raise ValueError(f"Plugin samples require distinct {key}")
+        for name in ("OGMEM_PLUGIN_STATE_FILE", "MEM0_PLUGIN_STATE_FILE", "MEMOS_LOCAL_RUNTIME_DIR"):
+            paths = [Path(env[name]).resolve() for env in environments.values() if env.get(name)]
+            if paths and (len(paths) != len(environments) or len(set(paths)) != len(paths)):
+                raise ValueError(f"Plugin samples require distinct {name}")
+
+    if len(partitions) > 1:
+        sample_scopes = {sample: set() for sample in partitions}
+        for scope, sample in scope_owners.items():
+            sample_scopes[sample].add(scope)
+        skill = runtime_context.memory_plugin_id if integration == "agent_plugin" else memory_id
+        validate_sample_identities(runtime_context, skill, sample_scopes)
     groups = []
     keys = []
     sessions = set()
@@ -792,22 +884,42 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
 
     with ThreadPoolExecutor(max_workers=execution_spec.qa_concurrency) as qa_pool, \
          ThreadPoolExecutor(max_workers=execution_spec.judge_concurrency) as judge_pool:
-      def run_group(group, phase):
-            # Drain both pools at checkpoint/sample boundaries, before any writes.
+      def run_group(group, phase, statuses=statuses, failures=failures):
+            # Drain this group before the next checkpoint of the same sample.
             remaining = iter(group)
             pending = {}
             qa_active = 0
+            # Only read-only QA groups can contain multiple cases. All groups share the global pool.
+            qa_limit = execution_spec.qa_per_sample if integration == "agent_plugin" else execution_spec.qa_concurrency
             capacity = (1 if execution_spec.qa_concurrency == execution_spec.judge_concurrency == 1
                         else execution_spec.qa_concurrency + execution_spec.judge_concurrency * 2)
             exhausted = False
             while pending or not exhausted:
-                while not exhausted and qa_active < execution_spec.qa_concurrency and len(pending) < capacity:
+                while not exhausted and qa_active < qa_limit and len(pending) < capacity:
                     case = next(remaining, None)
                     if case is None:
                         exhausted = True
                         break
-                    future = qa_pool.submit(copy_context().run, _execute_case, run_id=run_id, agent_id=agent_id, memory_id=memory_id,
-                        runtime_context=runtime_context, case=case, steps=by_case[case.case_id],
+                    # Preparation runs in the sample worker, outside the global QA pool.
+                    inline_setup = parallel_samples and all(
+                        item.judge_mode == "none" and (
+                            "phase:setup" in item.labels or not any(
+                                step.operator_kind == "agent" for step in by_case[item.case_id]
+                            )
+                        ) for item in group
+                    )
+                    def submit(fn, *args, **kwargs):
+                        if not inline_setup:
+                            return qa_pool.submit(fn, *args, **kwargs)
+                        future = Future()
+                        try:
+                            future.set_result(fn(*args, **kwargs))
+                        except Exception as exc:
+                            future.set_exception(exc)
+                        return future
+                    future = submit(copy_context().run, _execute_case, run_id=run_id, agent_id=agent_id, memory_id=memory_id,
+                        runtime_context=runtime_context.model_copy(update={"sample_environments": {},
+                            "concurrent_plugin_qa": concurrent_plugin_qa and phase == "recall"}), case=case, steps=by_case[case.case_id],
                         case_execution_status=dict(statuses), case_failure_kind=dict(failures),
                         execution_spec=execution_spec, run_dir=run_dir)
                     pending[future] = ("qa", case)
@@ -855,23 +967,39 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                         output["traces"].extend(traces)
                         output["_judge_job"] = None
                         archive(case, output)
-      drain_recorded = False
-      for phase, batch in batches:
-        if (phase_sink is not None and phase == "recall" and not drain_recorded and
-                "drain" in phase_sink.session.config.phases and "drain" not in selected_phases and
-                integration == "backend_direct"):
-            phase_sink.run_phase("drain", target_ids or [], lambda: None, applicable=False)
-            drain_recorded = True
-        def run_batch():
-            for group in batch:
-                run_group(group, phase)
-        if phase_sink is not None and phase in phase_sink.session.config.phases:
-            phase_sink.run_phase(phase, target_ids or [], run_batch,
-                                 request_count=lambda: sum(len(group) for group in batch))
-            if phase_sink.session.config.mode == "required" and phase_sink.invalid_profile:
-                raise RuntimeError("invalid_profile")
-        else:
-            run_batch()
+      if parallel_samples or bound_samples:
+        sample_groups = {sample: [] for sample in partitions}
+        owners = {case.case_id: sample for sample, rows in partitions.items() for case in rows}
+        for group in groups:
+            sample_groups[owners[group[0].case_id]].append(group)
+        def run_sample(sample):
+            sample_statuses, sample_failures = {}, {}
+            with sample_runtime_environment(runtime_context, sample):
+                for group in sample_groups[sample]:
+                    run_group(group, group_phase(group), sample_statuses, sample_failures)
+        with ThreadPoolExecutor(max_workers=execution_spec.sample_concurrency) as sample_pool:
+            pending_samples = [sample_pool.submit(copy_context().run, run_sample, sample)
+                               for sample in sample_groups]
+            for future in pending_samples:
+                future.result()
+      else:
+        drain_recorded = False
+        for phase, batch in batches:
+          if (phase_sink is not None and phase == "recall" and not drain_recorded and
+                  "drain" in phase_sink.session.config.phases and "drain" not in selected_phases and
+                  integration == "backend_direct"):
+              phase_sink.run_phase("drain", target_ids or [], lambda: None, applicable=False)
+              drain_recorded = True
+          def run_batch():
+              for group in batch:
+                  run_group(group, phase)
+          if phase_sink is not None and phase in phase_sink.session.config.phases:
+              phase_sink.run_phase(phase, target_ids or [], run_batch,
+                                   request_count=lambda: sum(len(group) for group in batch))
+              if phase_sink.session.config.mode == "required" and phase_sink.invalid_profile:
+                  raise RuntimeError("invalid_profile")
+          else:
+              run_batch()
     if phase_sink is not None and missing_phases:
         from .profiling_run import mark_phase_unavailable
         mark_phase_unavailable(phase_sink)

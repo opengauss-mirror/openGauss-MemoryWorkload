@@ -418,6 +418,8 @@ def test_commit_uses_native_gateway_transcript(runtime, monkeypatch, kind):
     monkeypatch.setattr(module, "gateway_container", lambda path: "dedicated")
     calls = []
     def compact(cmd, **kw):
+        if cmd[:2] == ["docker", "logs"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         calls.append(cmd)
         assert cmd[:7] == ["docker", "exec", "dedicated", "openclaw", "gateway", "call", "sessions.compact"]
         assert json.loads(cmd[cmd.index("--params") + 1]) == {"key": "agent:main:ingest"}
@@ -564,3 +566,117 @@ def test_qa_log_timeout_only_degrades_during_receipt_retry(runtime, monkeypatch,
         with pytest.raises(module.subprocess.TimeoutExpired):
             module.after_agent(state, inputs)
         assert budgets == [20]
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_readiness_retries_read_timeout_within_total_budget(runtime, monkeypatch, wrapped):
+    _, module, run = runtime
+    run("prepare", scope_id="run:a")
+    clock, calls = [0.0], []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    def backend(base, path, body, identity, **kw):
+        calls.append(path)
+        assert "compact" not in path
+        if len(calls) == 1:
+            clock[0] += 60
+            error = TimeoutError("busy serving another sample")
+            raise module.urllib.error.URLError(error) if wrapped else error
+        if kw.get("method") == "GET":
+            return {"message_count": 2, "commit_count": 1, "pending_tokens": 0}
+        return {"idle": True, "reason": "idle", "drain": {"failed": 0}, "outbox": {"total": 0}}
+    monkeypatch.setattr(module, "backend", backend)
+    result = run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "s"}, timeout_seconds=65, interval_seconds=1)
+    assert result["output"]["history_archived"]
+    assert len(calls) == 5 and clock[0] == 61
+
+
+def test_readiness_timeouts_exhaust_total_budget(runtime, monkeypatch):
+    _, module, run = runtime
+    run("prepare", scope_id="run:a")
+    clock, calls = [0.0], []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    def backend(*args, **kw):
+        calls.append(kw["timeout"])
+        clock[0] += kw["timeout"]
+        raise TimeoutError("busy")
+    monkeypatch.setattr(module, "backend", backend)
+    with pytest.raises(TimeoutError, match="deadline"):
+        run("wait_ready", scope_id="run:a", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "s"}, timeout_seconds=65, interval_seconds=1)
+    assert calls == [60, 4] and clock[0] == 65
+
+def test_concurrent_qa_attributes_gateway_errors_per_session(runtime, monkeypatch):
+    from types import SimpleNamespace
+    state, module, _ = runtime
+    monkeypatch.setattr(module, "gateway_container", lambda path: "dedicated")
+    lines = ["[og-memory] compose returned null",
+             "[og-memory] compose failed sessionId=q4"]
+    for sid in ("q1", "q2", "q3"):
+        lines.extend(["[og-memory] assemble return: 2 msgs, ws_injected=true,",
+                      f"[og-memory] assemble params keys: sessionKey, sessionKey=agent:main:{sid}, sessionId={sid}"])
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        stdout="\n".join(lines), stderr=""))
+    for sid in ("q1", "q2", "q3", "q4"):
+        inputs = {"check_context": {"transport": "http", "phase": "qa", "log_since": "1",
+                  "concurrent_qa": True, "expected_session_key": f"agent:main:{sid}"},
+                  "agent_result": {"status": "ok", "transport": "http", "output": {"session_id": sid},
+                                   "turns": [{"text": "Paris"}]}}
+        if sid == "q4":
+            with pytest.raises(RuntimeError, match="Native oGMemory hook failed"):
+                module.after_agent(state, inputs)
+        else:
+            assert module.after_agent(state, inputs)["recall_verified"]
+
+
+@pytest.mark.parametrize("terminal,idle,recoverable", [(True, True, True), (False, True, False), (True, False, False)])
+def test_failed_native_prepare_requires_terminal_receipt_and_idle(runtime, monkeypatch, terminal, idle, recoverable):
+    import hashlib
+    from types import SimpleNamespace
+    path, module, run = runtime
+    run("prepare", scope_id="r:a")
+    state = json.loads(path.read_text())
+    state.update(gateway_ready=True, config_sha256=hashlib.sha256(path.with_name("openclaw.json").read_bytes()).hexdigest())
+    monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
+    monkeypatch.setattr(module, "gateway_container", lambda path: "dedicated")
+    def docker(cmd, **kwargs):
+        if cmd[1] == "exec":
+            return SimpleNamespace(stdout=json.dumps({"ok": False, "compacted": False, "key": "key"}))
+        assert cmd[:3] == ["docker", "logs", "--since"]
+        message = ('[og-memory] HTTP 500 from prepare_compaction, body: '
+                   '{"request_id":"","request_status":"FAILED","retry_action":"manual_review"}'
+                   if terminal else "[og-memory] prepare_compaction timed out")
+        return SimpleNamespace(returncode=0, stderr=message, stdout="")
+    def backend(base, endpoint, payload, identity, **kwargs):
+        assert endpoint.endswith("wait_until_idle") and payload["sessionId"] == "sid"
+        assert not payload["drainOutbox"] and identity == state["identity"]
+        return {"idle": idle, "outbox": {"total": 0}}
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    monkeypatch.setattr(module, "backend", backend)
+    with pytest.raises(RuntimeError) as exc:
+        module.commit(path, state, {"scope_id": "r:a", "session_handle": {"session_id": "sid", "gateway_session_key": "key"}})
+    assert isinstance(exc.value, module.SettledHistoryFailure) == recoverable
+
+
+@pytest.mark.parametrize("plugin_loaded", [True, False])
+def test_degraded_phase_requires_native_engine_after_restart(runtime, monkeypatch, plugin_loaded):
+    from types import SimpleNamespace
+    path, module, run = runtime
+    run("prepare", scope_id="r:a")
+    monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(path.parent / "state"))
+    monkeypatch.setattr(module, "gateway_container", lambda path: "dedicated")
+    monkeypatch.setattr(module, "wait_gateway", lambda config: None)
+    calls = []
+    def docker(cmd, **kwargs):
+        calls.append(cmd[1])
+        engine = module.PLUGIN if plugin_loaded else "other"
+        return SimpleNamespace(stdout=f"[gateway] http server listening (1 plugin: {engine}; 1s)", stderr="")
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    if plugin_loaded:
+        output = run("set_phase", phase="qa", recover_read_only=True, scope_id="r:a")["output"]
+        assert output["read_only_verified"] and output["autoRecall"] and not output["autoCapture"]
+    else:
+        with pytest.raises(RuntimeError, match="did not confirm"):
+            run("set_phase", phase="qa", recover_read_only=True, scope_id="r:a")
+    assert calls == ["restart", "logs"]

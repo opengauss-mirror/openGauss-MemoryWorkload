@@ -498,7 +498,7 @@ def _compose_agent_plugin(
                 )
             )
             previous_step_id = ingest_phase_id
-            ingested_events: list[tuple[TimelineEvent, str, str]] = []
+            commit_required, readiness_required = _plugin_barrier_policy(runtime_capabilities)
             for timeline_event in pending_events:
                 event_slug = _slug(timeline_event.event_id)
                 agent_step_id = f"{setup_case_id}-{event_slug}-agent-ingest"
@@ -536,13 +536,7 @@ def _compose_agent_plugin(
                         },
                     )
                 )
-                ingested_events.append((timeline_event, agent_step_id, session_key))
                 previous_step_id = agent_step_id
-
-            commit_required, readiness_required = _plugin_barrier_policy(runtime_capabilities)
-            readiness_operations: list[tuple[TimelineEvent, str, str | None, str]] = []
-            for timeline_event, agent_step_id, session_key in ingested_events:
-                event_slug = _slug(timeline_event.event_id)
                 commit_step_id = f"{setup_case_id}-{event_slug}-commit"
                 wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                 readiness_operation_step_id: str | None = None
@@ -568,11 +562,7 @@ def _compose_agent_plugin(
                     )
                     previous_step_id = commit_step_id
                     readiness_operation_step_id = commit_step_id
-                readiness_operations.append(
-                    (timeline_event, session_key, readiness_operation_step_id, agent_step_id)
-                )
-            if readiness_required:
-                for timeline_event, session_key, readiness_operation_step_id, agent_step_id in readiness_operations:
+                if readiness_required:
                     event_slug = _slug(timeline_event.event_id)
                     wait_step_id = f"{setup_case_id}-{event_slug}-wait-ready"
                     wait_inputs: dict[str, Any] = {
@@ -613,7 +603,7 @@ def _compose_agent_plugin(
                     "set_plugin_qa_phase",
                     "memory_plugin",
                     depends_on=[previous_step_id],
-                    inputs={"action": "set_phase", "phase": "qa"},
+                    inputs={"action": "set_phase", "phase": "qa", "scope_id": scope_id},
                 )
             )
 
@@ -681,7 +671,7 @@ def _compose_agent_plugin(
                         },
                     )
                 )
-            previous_checkpoint_cases = checkpoint_cases or [setup_case_id]
+            previous_checkpoint_cases = [setup_case_id, *checkpoint_cases]
     return cases, steps
 
 

@@ -443,3 +443,29 @@ def test_runner_redacts_content_and_api_key_from_errors():
     assert content not in serialized
     assert environment["OPENVIKING_API_KEY"] not in serialized
     assert "[REDACTED]" in serialized
+
+
+def test_scope_users_supply_distinct_http_and_cli_identity(tmp_path):
+    runner = _load_runner()
+    users = tmp_path / "users.json"
+    users.write_text(json.dumps({
+        "run:a": {"user_id": "alice", "api_key": "key-a"},
+        "run:b": {"user_id": "bob", "api_key": "key-b"},
+    }))
+    env = dict(_environment(), OPENVIKING_SCOPE_USERS_FILE=str(users),
+               OPENVIKING_ROOT_API_KEY="root")
+    for scope, user, key in (("run:a", "alice", "key-a"), ("run:b", "bob", "key-b")):
+        scoped = runner._scoped_environment(env, {"operation": {"scope_id": scope}})
+        headers = runner._request_headers(scoped)
+        assert headers["X-OpenViking-User"] == user
+        assert headers["X-API-Key"] == key
+        _, path, temp = runner._prepare_cli_environment(scoped)
+        try:
+            cfg = json.loads(path.read_text())
+            assert (cfg["user"], cfg["api_key"]) == (user, key)
+            assert "root_api_key" not in cfg
+        finally:
+            runner.shutil.rmtree(temp)
+    result = runner.run_operation(_request("ingest", {"scope_id": "missing"}), environ=env)
+    assert result["status"] == "failed"
+    assert "missing scope binding" in result["error"]["message"]

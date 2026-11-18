@@ -47,6 +47,18 @@ def adapter_environment(environment: dict[str, str] | None):
         _adapter_environment.reset(token)
 
 
+@contextmanager
+def sample_runtime_environment(runtime_context, sample):
+    import hashlib
+    environment = {**_adapter_environment.get(), **runtime_context.sample_environments.get(sample, {})}
+    if runtime_context.memory_integration == "agent_plugin":
+        plugin_dir = Path(runtime_context.run_dir) / "artifacts" / "sample-runtimes" / hashlib.sha256(sample.encode()).hexdigest()
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        environment["MEMORY_BENCH_PLUGIN_RUN_DIR"] = str(plugin_dir)
+    with adapter_environment(environment):
+        yield
+
+
 @dataclass(frozen=True)
 class RunSkillBundle:
     skills_root: Path
@@ -401,6 +413,31 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput, *,
     )
 
 
+def validate_sample_identities(context, skill_id, sample_scopes):
+    """Run an optional skill-local preflight before scheduling any sample writes."""
+    if not skill_id or Path(skill_id).name != skill_id or skill_id in {".", ".."}:
+        raise ValueError("Invalid skill ID for sample isolation")
+    kind = "memory_plugins" if context.memory_integration == "agent_plugin" else "memories"
+    script = _manifest_path(kind, skill_id).parent / "scripts" / "sample_identity.py"
+    if not script.is_file():
+        return
+    owners = {}
+    for sample, scopes in sample_scopes.items():
+        try:
+            payload = run_json_script(script, stdin_payload={"scopes": sorted(scopes)},
+                                      environment=context.sample_environments.get(sample, {}), timeout_seconds=60)
+        except (subprocess.SubprocessError, ValueError) as exc:
+            raise ValueError(f"{skill_id} memory identity preflight failed for sample {sample}") from exc
+        identities = payload.get("identities")
+        if not isinstance(identities, list) or not identities or not all(
+                isinstance(item, str) and item for item in identities):
+            raise ValueError(f"{skill_id} returned invalid sample identities for {sample}")
+        for identity in identities:
+            other = owners.setdefault(identity, sample)
+            if other != sample:
+                raise ValueError(f"{skill_id} samples {other} and {sample} share a memory identity")
+
+
 def run_memory_task(
     skill_id: str,
     request: MemoryTaskInput,
@@ -438,6 +475,10 @@ def run_memory_plugin_task(
     environment: dict[str, str] | None = None,
     timeout_seconds: float | None = None,
 ) -> MemoryPluginTaskOutput:
+    plugin_dir = _adapter_environment.get().get("MEMORY_BENCH_PLUGIN_RUN_DIR")
+    if plugin_dir:
+        request = request.model_copy(update={"runtime_context":
+            request.runtime_context.model_copy(update={"run_dir": plugin_dir})})
     manifest = get_memory_plugin_manifest(skill_id)
     manifest_path = _manifest_path("memory_plugins", skill_id)
     if not manifest.entry.runner:

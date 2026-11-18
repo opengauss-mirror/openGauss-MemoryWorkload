@@ -215,19 +215,21 @@ def _response_usage(result):
 
 
 def _session_candidates(request, result):
+    from .integration import _adapter_environment
+    environment = {**os.environ, **_adapter_environment.get()}
     meta = request.metadata
-    aid = str(meta.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID") or "main")
-    folder = (Path(os.environ.get("OPENCLAW_STATE_DIR") or Path.home() / ".openclaw") / "agents" / aid / "sessions").resolve()
+    aid = str(meta.get("agent_id") or environment.get("OPENCLAW_AGENT_ID") or "main")
+    folder = (Path(environment.get("OPENCLAW_STATE_DIR") or Path.home() / ".openclaw") / "agents" / aid / "sessions").resolve()
     paths = [Path(a["path"]) for a in result.get("artifacts", [])
              if a.get("kind") == "openclaw_session_jsonl" and a.get("path")]
-    explicit = meta.get("session_jsonl") or os.environ.get("OPENCLAW_SESSION_JSONL")
+    explicit = meta.get("session_jsonl") or environment.get("OPENCLAW_SESSION_JSONL")
     if explicit:
         paths.append(Path(explicit))
     sid = _object(result.get("output")).get("session_id")
-    transport = result.get("transport") or os.environ.get("OPENCLAW_TRANSPORT", "").strip().lower()
+    transport = result.get("transport") or environment.get("OPENCLAW_TRANSPORT", "").strip().lower()
     if not transport:
-        transport = "http" if (os.environ.get("OPENCLAW_GATEWAY_URL")
-                               or os.environ.get("OPENCLAW_GATEWAY_BASE_URL")) else "cli"
+        transport = "http" if (environment.get("OPENCLAW_GATEWAY_URL")
+                               or environment.get("OPENCLAW_GATEWAY_BASE_URL")) else "cli"
     key = str(meta.get("session_key") or "")
     if transport == "http":
         # The HTTP runner sends an explicit session key, not the requested ID as
