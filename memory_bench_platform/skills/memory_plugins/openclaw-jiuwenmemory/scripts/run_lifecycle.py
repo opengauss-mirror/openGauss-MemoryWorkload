@@ -238,12 +238,15 @@ def run(request):
                     "error": {"message": "Expected one verified MCP write with the original history"}}
     elif action == "finalize":
         rows = [json.loads(p.read_text()) for p in receipts.glob("*.json")]
-        plan = json.loads((root / "records/composed_run_plan.json").read_text())
-        total = sum(case.get("reference", {}).get("evaluation_target") == "qa_answer" for case in plan["cases"])
+        if "planned_writes" in inputs or "planned_qa" in inputs:
+            planned_writes, total = inputs["planned_writes"], inputs["planned_qa"]
+        else:
+            plan = json.loads((root / "records/composed_run_plan.json").read_text())
+            total = sum(case.get("reference", {}).get("evaluation_target") == "qa_answer" for case in plan["cases"])
+            planned_writes = sum(step.get("inputs", {}).get("metadata", {}).get("purpose") == "memory_ingest"
+                                 for step in plan["steps"])
         writes = [row for row in rows if "ingest_verified" in row]
         rows = [row for row in rows if "verified_search" in row]
-        planned_writes = sum(step.get("inputs", {}).get("metadata", {}).get("purpose") == "memory_ingest"
-                             for step in plan["steps"])
         verified_writes = sum(row["ingest_verified"] for row in writes)
         called = sum((row["calls"] or 0) > 0 for row in rows)
         verified = sum(row["verified_search"] for row in rows)

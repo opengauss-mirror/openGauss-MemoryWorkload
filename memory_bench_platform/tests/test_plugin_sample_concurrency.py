@@ -307,3 +307,39 @@ def test_plugin_history_failure_and_read_only_gate(tmp_path, monkeypatch, failur
                    for s in result["step_results"] if s.step_id in qa)
     else:
         assert bool(switches) == (failure == "SettledHistoryFailure")
+
+
+def test_jiuwen_finalize_uses_sample_plans_and_weights_missing_answers(tmp_path):
+    from memory_bench_platform import cli
+    import hashlib
+
+    cases, steps, environments = plugin_plan()
+    # Use different denominators so averaging two percentages cannot pass.
+    qa_cases = [c for c in cases if c.reference.get("evaluation_target") == "qa_answer"]
+    first, second = environments
+    keep = [next(c for c in qa_cases if c.source_metadata["sample_id"] == first),
+            *[c for c in qa_cases if c.source_metadata["sample_id"] == second][:2]]
+    ingest = [s for s in steps if s.inputs.get("metadata", {}).get("purpose") == "memory_ingest"]
+    writes = [next(s for s in ingest if s.case_id.startswith(sample)) for sample in environments]
+    keep.extend(c for c in cases if c.case_id in {s.case_id for s in writes})
+    plans = cli._sample_finalize_plans(keep, writes)
+    assert plans == {first: {"planned_writes": 1, "planned_qa": 1},
+                     second: {"planned_writes": 1, "planned_qa": 2}}
+    for sample in environments:
+        root = tmp_path / "artifacts/sample-runtimes" / hashlib.sha256(sample.encode()).hexdigest()
+        receipts = root / "artifacts/memory_plugin/openclaw-jiuwenmemory"
+        receipts.mkdir(parents=True)
+        (receipts / "write.json").write_text(json.dumps({"ingest_verified": sample == first}))
+        if sample == first:
+            (receipts / "qa.json").write_text(json.dumps({"verified_search": True, "calls": 1, "evidence": True}))
+
+    ctx = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
+        agent_id="openclaw", memory_id="jiuwenmemory", memory_plugin_id="openclaw-jiuwenmemory",
+        memory_integration="agent_plugin", sample_environments=environments)
+    payload, _, _, result, _, _ = cli._run_plugin_finalize(ctx, sample_plans=plans)
+    assert result.status == "passed"
+    out = payload["output"]
+    assert out["samples"][second]["output"]["recall_verification"]["coverage"] == 0
+    assert out["ingest_verification"] == {"planned": 2, "verified": 1, "coverage": 0.5}
+    assert out["recall_verification"] == {"planned_qa": 3, "checked_qa": 1, "verified": 1,
+        "unverified": 2, "coverage": 1/3, "tool_called": 1, "tool_call_coverage": 1/3, "with_evidence": 1}
