@@ -139,7 +139,7 @@ def _execute_case(
                      and case.capability == "memory/question-answering" and len(steps_by_case.get(case.case_id, [])) == 1
                      and steps_by_case[case.case_id][0].operator_kind == "agent"
                      and steps_by_case[case.case_id][0].inputs.get("metadata", {}).get("purpose") == "memory_qa")
-        stopped_history = False
+        failed_session_steps: dict[str, str] = {}
         qa_phase_restored = False
         qa_degradation = {}
         recall_fallbacks = set()
@@ -159,8 +159,10 @@ def _execute_case(
             for dependency in unsatisfied_case_dependencies
         )
         inherited_plugin_failure = bool(unsatisfied_case_dependencies) and all(
-            case_failure_kind.get(dep) == "plugin-history-incomplete-qa-ready" for dep in unsatisfied_case_dependencies
+            case_failure_kind.get(dep) in {"plugin-history-incomplete-qa-ready", "plugin-qa-unavailable"} for dep in unsatisfied_case_dependencies
         )
+        isolated_answer = plugin_qa and any(case_failure_kind.get(dep) == "plugin-qa-unavailable"
+                                               for dep in unsatisfied_case_dependencies)
         if ((failed_memory_dependencies and (resilient_qa or preparation))
                 or (inherited_plugin_failure and (plugin_qa or plugin_setup))):
             if resilient_qa or plugin_qa:
@@ -189,14 +191,20 @@ def _execute_case(
         for step in executable_steps:
             failed_dependencies = [dep for dep in step.depends_on
                                    if dep not in results_by_step or results_by_step[dep].status != "passed"]
-            restore_qa = (plugin_setup and (stopped_history or inherited_plugin_failure)
+            plugin_ingest = (plugin_setup and step.operator_kind == "agent"
+                             and step.inputs.get("metadata", {}).get("purpose") == "memory_ingest")
+            session_key = (step.inputs.get("metadata", {}).get("session_key") if plugin_ingest
+                           else step.inputs.get("session_key"))
+            session_step = (plugin_ingest or (plugin_setup and step.operator_kind == "memory_plugin"
+                            and step.inputs.get("action") in {"commit", "wait_ready"}))
+            restore_qa = (plugin_setup and (failed_session_steps or inherited_plugin_failure)
                           and step is executable_steps[-1] and step.operator_kind == "memory_plugin"
                           and step.inputs.get("action") == "set_phase" and step.inputs.get("phase") == "qa")
             preparation_ingest = (
                 preparation and step.operator_kind == "memory" and step.inputs.get("action") == "ingest"
             )
             failed_input_dependencies: set[str] = set()
-            if preparation:
+            if preparation or plugin_setup:
                 for reference in iter_input_references(step.inputs):
                     root, _, path = reference.partition(".")
                     if root == "steps":
@@ -207,11 +215,19 @@ def _execute_case(
             configuration_blocked = not configuration_blocked_steps.isdisjoint(
                 set(failed_dependencies) | failed_input_dependencies
             )
-            independent_ingest = preparation_ingest and not configuration_blocked
+            # A later session waits for the previous attempt in plan order, but
+            # consumes its own transcript. Never bypass a failed data reference.
+            next_session = (plugin_ingest and isinstance(session_key, str) and session_key
+                            and all(dep in failed_session_steps and failed_session_steps[dep] != session_key
+                                    for dep in failed_dependencies))
+            independent_ingest = (preparation_ingest or next_session) and not configuration_blocked
             fallback_answer = resilient_qa and step.operator_kind == "agent" and all(
                 dep in recall_fallbacks for dep in failed_dependencies)
-            if (configuration_blocked or failed_input_dependencies or (stopped_history and not restore_qa)
-                    or (failed_dependencies and not independent_ingest and not fallback_answer and not (restore_qa and stopped_history))):
+            if (configuration_blocked or failed_input_dependencies
+                    or (failed_dependencies and not independent_ingest and not fallback_answer and not (restore_qa and all(dep in failed_session_steps for dep in failed_dependencies)))):
+                blocked_by = set(failed_dependencies) | failed_input_dependencies
+                if session_step and session_key and blocked_by and blocked_by <= failed_session_steps.keys():
+                    failed_session_steps[step.step_id] = session_key
                 if configuration_blocked:
                     configuration_blocked_steps.add(step.step_id)
                 skipped = StepResultRecord(
@@ -247,6 +263,8 @@ def _execute_case(
                     for dep in recall_fallbacks:
                         input_scope["steps"][dep] = {"output": {"evidence_text": ""}}
                 resolved_inputs = resolve_inputs(step.inputs, input_scope)
+                if isolated_answer:
+                    resolved_inputs["qa_without_plugin"] = True
                 if restore_qa:
                     resolved_inputs["recover_read_only"] = True
             except InputResolutionError as exc:
@@ -408,11 +426,9 @@ def _execute_case(
                 if final_result is None:
                     raise RuntimeError(f"step result missing for {step.step_id}")
 
-                if (plugin_setup and step.operator_kind == "memory_plugin"
-                        and step.inputs.get("action") in {"commit", "wait_ready"}
-                        and final_result.structured_output.get("raw", {}).get("error", {}).get("code")
-                        == "SettledHistoryFailure" and not case_failed and step.gate_policy == "hard"):
-                    stopped_history = True
+                if (session_step and isinstance(session_key, str) and session_key and
+                        final_result.status == "failed" and resolution_error is None and step.gate_policy == "hard"):
+                    failed_session_steps[step.step_id] = session_key
                     break
                 if final_result.status == "passed":
                     break
@@ -439,6 +455,8 @@ def _execute_case(
             if restore_qa:
                 qa_phase_restored = (result.status == "passed"
                                      and result.structured_output["output"].get("read_only_verified") is True)
+            if plugin_qa and result.structured_output.get("raw", {}).get("qa_without_plugin"):
+                qa_degradation["without_memory"] = True
             if (resilient_qa or plugin_qa) and step.operator_kind == "agent" and qa_degradation:
                 result.structured_output["qa_degradation"] = dict(qa_degradation)
             case_step_results.append(result)
@@ -574,7 +592,7 @@ def _execute_case(
                 if recall_failed:
                     continue
                 case_failed = True
-                if execution_spec.fail_fast and not stopped_history and (not preparation or resolution_error is not None):
+                if execution_spec.fail_fast and step.step_id not in failed_session_steps and (not preparation or resolution_error is not None):
                     break
 
         if plugin_setup and inherited_plugin_failure:
@@ -603,7 +621,8 @@ def _execute_case(
             case_failure_kind[case.case_id] = (
                 "runtime-error" if configuration_failed else
                 "plugin-history-incomplete-qa-ready" if qa_phase_restored and (
-                    stopped_history or (inherited_plugin_failure and not failed)) else
+                    failed_session_steps or (inherited_plugin_failure and not failed)) else
+                "plugin-qa-unavailable" if plugin_setup and not unsatisfied_case_dependencies else
                 "memory-compact-timeout" if compact_timed_out
                 else "memory-preparation-failed" if preparation and not unsatisfied_case_dependencies
                 else "runtime-not-ready" if readiness_failed
@@ -760,12 +779,10 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
     runtime_context = runtime_context or WorkflowRuntimeContext(
         run_id=run_id, run_dir=str(run_dir), benchmark_id="", agent_id=agent_id, memory_id=memory_id)
     integration = runtime_context.memory_integration
-    concurrent_plugin_qa = execution_spec.qa_per_sample > 1
-    if concurrent_plugin_qa:
-        if (integration, runtime_context.memory_plugin_id) != ("agent_plugin", "openclaw-ogmemory"):
-            raise ValueError("qa_per_sample > 1 requires the oGMemory agent_plugin")
-        if execution_spec.qa_per_sample > execution_spec.qa_concurrency:
-            raise ValueError("qa_per_sample cannot exceed qa_concurrency")
+    qa_limit = execution_spec.qa_per_sample or (1 if integration == "agent_plugin" else execution_spec.qa_concurrency)
+    concurrent_plugin_qa = integration == "agent_plugin" and qa_limit > 1
+    if qa_limit > execution_spec.qa_concurrency:
+        raise ValueError("qa_per_sample cannot exceed qa_concurrency")
     if integration == "agent_plugin" and execution_spec.qa_concurrency > 1 and execution_spec.sample_concurrency == 1 and not concurrent_plugin_qa:
         raise ValueError("agent_plugin requires qa_concurrency=1 unless parallel samples have dedicated runtime bindings")
     validate_workflow(cases=cases, steps=steps, execution_spec=execution_spec,
@@ -890,7 +907,6 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
             pending = {}
             qa_active = 0
             # Only read-only QA groups can contain multiple cases. All groups share the global pool.
-            qa_limit = execution_spec.qa_per_sample if integration == "agent_plugin" else execution_spec.qa_concurrency
             capacity = (1 if execution_spec.qa_concurrency == execution_spec.judge_concurrency == 1
                         else execution_spec.qa_concurrency + execution_spec.judge_concurrency * 2)
             exhausted = False

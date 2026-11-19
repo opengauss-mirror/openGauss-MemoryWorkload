@@ -259,6 +259,10 @@ def run(request):
                                           "tool_called": called,
                                           "tool_call_coverage": called / total if total else None,
                                           "with_evidence": sum(row["evidence"] for row in rows)}}
+    elif action == "set_phase" and inputs.get("recover_read_only") and inputs.get("phase") == "qa":
+        # validate checks the dedicated QA Agent's native tool allowlist.
+        validate()
+        output = {"phase": "qa", "read_only_verified": True}
     elif action not in ("prepare", "set_phase"):
         raise ValueError("Unsupported JiuwenMemory MCP action")
     return {"status": "ok", "state": "completed", "output": output}

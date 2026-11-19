@@ -3,6 +3,9 @@ from __future__ import annotations
 from . import token_usage, token_collectors
 
 import json
+import os
+import re
+from pathlib import Path
 from typing import Any, Callable
 import urllib.request
 
@@ -62,6 +65,57 @@ def dispatch_step_operator(
     raise ValueError(f"unsupported operator_kind: {step.operator_kind}")
 
 
+def _answer_without_plugin(agent_id, request):
+    """Ask the configured OpenClaw answer model without loading a memory plugin."""
+    from .integration import _adapter_environment
+    env = {**os.environ, **_adapter_environment.get()}
+    config = json.loads(Path(env["OPENCLAW_CONFIG_PATH"]).read_text())
+    agents = config["agents"]
+    selected = request.metadata.get("agent_id") or env.get("OPENCLAW_AGENT_ID") or "main"
+    agent = next((a for a in agents.get("list", []) if a.get("id") == selected), {})
+    model = request.metadata.get("model") or agent.get("model") or agents["defaults"]["model"]
+    if isinstance(model, dict):
+        model = model["primary"]
+    provider_id, model_id = model.split("/", 1)
+    provider = config["models"]["providers"][provider_id]
+    spec = next((m for m in provider.get("models", []) if m.get("id") == model_id), {})
+    api = spec.get("api", provider.get("api", "openai-completions"))
+    if api not in {"openai-completions", "openai-responses"}:
+        raise ValueError("Unsupported answer provider API for memory-free QA: " + str(api))
+    def resolve(value):
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z_0-9]*)\}", lambda m: env[m[1]], value)
+    messages = list(request.messages)
+    if request.system_prompt:
+        messages.insert(0, {"role": "system", "content": request.system_prompt})
+    headers = {"Content-Type": "application/json"}
+    if provider.get("apiKey"):
+        headers["Authorization"] = "Bearer " + resolve(provider["apiKey"])
+    payload = {"model": model_id, "messages": messages}
+    path = "/chat/completions"
+    if api == "openai-responses":
+        path = "/responses"
+        payload = {"model": model_id, "input": request.messages}
+        if request.system_prompt:
+            payload["instructions"] = request.system_prompt
+    req = urllib.request.Request(resolve(provider["baseUrl"]).rstrip("/") + path,
+                                 data=json.dumps(payload).encode(), headers=headers)
+    # Provider credentials are scoped to this endpoint.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            return None
+    timeout = float(request.metadata.get("timeout_seconds") or agents["defaults"].get("timeoutSeconds") or 120)
+    with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as response:
+        raw = json.load(response)
+    if api == "openai-responses":
+        answer = "\n".join(part["text"] for item in raw.get("output", []) if item.get("type") == "message"
+                           for part in item.get("content", []) if part.get("type") == "output_text")
+    else:
+        answer = raw["choices"][0]["message"]["content"]
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("Answer model returned no text for memory-free QA")
+    return {"status": "ok", "agent_answer": answer, "turns": [{"text": answer}], "raw": raw}
+
+
 def _execute_agent(
     step: StepRecord,
     agent_id: str,
@@ -114,10 +168,27 @@ def _execute_agent(
                     str(response.get("error", {}).get("message") or response["state"]),
                 "plugin_checks": checks}
 
-    check_context = check("before_agent")
+    qa = metadata.get("purpose") == "memory_qa" and runtime_context.memory_integration == "agent_plugin"
+    original = rendered.model_copy(deep=True)
+    def without_memory(reason, previous=None):
+        try:
+            result = token_usage.capture_agent(_answer_without_plugin, "model_without_plugin", original)
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            result = {"status": "failed", "exit_code": 1,
+                      "error_message": "Memory-free QA failed: " + type(exc).__name__}
+        return {**result, "qa_without_plugin": True, "memory_failure": reason, "plugin_checks": checks,
+                **({"plugin_attempt": previous} if previous is not None else {})}
+    if qa and step.inputs.get("qa_without_plugin"):
+        return without_memory("read-only QA phase unavailable")
+    try:
+        check_context = check("before_agent")
+    except Exception as exc:
+        if qa:
+            return without_memory("before_agent: " + type(exc).__name__)
+        raise
     failure = failed_check("before_agent")
     if failure is not None:
-        return failure
+        return without_memory(failure["error_message"]) if qa else failure
     capabilities = (runtime_context.run_contract.get("memory_plugin_runtime") or {}).get("capabilities", {})
     is_ingest = rendered.metadata.get("purpose") == "memory_ingest"
     if capabilities.get("agent_tool_ingest" if is_ingest else "agent_tool_recall"):
@@ -163,10 +234,15 @@ def _execute_agent(
         raise
     normalized = dict(result)
     normalized["agent_answer"] = answer
-    check("after_agent", check_context=check_context, agent_result=result)
+    try:
+        check("after_agent", check_context=check_context, agent_result=result)
+    except Exception as exc:
+        if qa:
+            return without_memory("after_agent: " + type(exc).__name__, normalized)
+        raise
     failure = failed_check("after_agent", normalized)
     if failure is not None:
-        return failure
+        return without_memory(failure["error_message"], normalized) if qa else failure
     if checks:
         normalized["plugin_checks"] = checks
     return normalized

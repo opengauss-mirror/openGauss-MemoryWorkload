@@ -38,9 +38,9 @@ def plan(integration="backend_direct", checkpoints=1, questions=4):
     return cases, steps
 
 
-def execute(tmp_path, cases, steps, integration="backend_direct", qa=1, judge=1):
+def execute(tmp_path, cases, steps, integration="backend_direct", qa=1, judge=1, limit=None):
     return workflow.execute_cases(run_id="run", agent_id="openclaw", memory_id="mem",
-        cases=cases, steps=steps, execution_spec=ExecutionSpec(qa_concurrency=qa, judge_concurrency=judge),
+        cases=cases, steps=steps, execution_spec=ExecutionSpec(qa_concurrency=qa, judge_concurrency=judge, qa_per_sample=limit),
         run_dir=tmp_path, runtime_context=WorkflowRuntimeContext(run_id="run", run_dir=str(tmp_path),
             benchmark_id="locomo", agent_id="openclaw", memory_id="mem", memory_integration=integration,
             memory_plugin_id="plugin" if integration == "agent_plugin" else None))
@@ -51,8 +51,8 @@ def grade(run_id, judge_input, **kwargs):
         passed=True, score=1.0, label="correct", rationale="test")
 
 
-@pytest.mark.parametrize("integration,qa", [("backend_direct", 2), ("agent_plugin", 1)])
-def test_checkpoint_parallelism_limits_context_and_archival(tmp_path, monkeypatch, integration, qa):
+@pytest.mark.parametrize("integration,qa,limit", [("backend_direct", 2, None), ("backend_direct", 1, 1), ("agent_plugin", 1, None)])
+def test_checkpoint_parallelism_limits_context_and_archival(tmp_path, monkeypatch, integration, qa, limit):
     cases, steps = plan(integration, checkpoints=2)
     lock, qa_barrier, judge_barrier = Lock(), Barrier(qa), Barrier(2)
     active = {"qa": 0, "judge": 0}
@@ -92,7 +92,7 @@ def test_checkpoint_parallelism_limits_context_and_archival(tmp_path, monkeypatc
     monkeypatch.setattr(workflow, "_execute_step_operator", operator)
     monkeypatch.setattr(workflow, "run_llm_judge", judge)
     with adapter_environment({"BENCH_TEST_CONTEXT": "scoped"}):
-        result = execute(tmp_path, cases, steps, integration, qa=qa, judge=2)
+        result = execute(tmp_path, cases, steps, integration, qa=30 if limit else qa, judge=2, limit=limit)
     assert peak == {"qa": qa, "judge": 2}
     assert all(r.passed for r in result["judge_results"])
     assert [r.case_id for r in result["judge_results"]] == [c.case_id for c in cases if c.judge_mode != "none"]
@@ -178,6 +178,8 @@ def test_cli_overrides_scenario_and_preserves_defaults():
     args = parser.parse_args(["run", "--benchmark", "locomo", "--agent", "openclaw", "--judge-concurrency", "4"])
     assert _execution_options(args, {"qa_concurrency": 2}).qa_concurrency == 2
     assert _execution_options(args).judge_concurrency == 4
+    assert _execution_options(args).qa_per_sample is None
+    assert _execution_options(args, {"qa_per_sample": 1}).qa_per_sample == 1
     assert _execution_options(args).qa_concurrency == 1
     args.memory_integration = "agent_plugin"
     assert _execution_options(args).judge_concurrency == 4

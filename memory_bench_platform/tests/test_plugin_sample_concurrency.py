@@ -13,7 +13,7 @@ from memory_bench_platform.protocol import CaseRecord, StepRecord, ExecutionSpec
 from test_workflow_concurrency import grade
 
 
-def plugin_plan(*, extra_question=False, questions_per_checkpoint=1):
+def plugin_plan(*, extra_question=False, questions_per_checkpoint=1, backend="ogmemory", extra_history=False):
     payload = json.loads(Path("tests/golden/multi_checkpoint_scenario.json").read_text())
     original = payload["samples"][0]
     if extra_question:
@@ -22,11 +22,14 @@ def plugin_plan(*, extra_question=False, questions_per_checkpoint=1):
     for index in range(1, questions_per_checkpoint):
         questions = original["timeline"][1]["evaluation"]["questions"]
         questions.append(dict(questions[0], question_id=f"q1-{index}"))
+    if extra_history:
+        event = original["timeline"][0]
+        original["timeline"][1:1] = [dict(copy.deepcopy(event), event_id=f"history-{i}") for i in (2, 3)]
     payload["samples"] = [copy.deepcopy(original), copy.deepcopy(original)]
     for index, sample in enumerate(payload["samples"]):
         sample["sample_id"] = f"sample-{index}"
     binding = RunBinding(benchmark_id=payload["benchmark_id"], run_id="r", agent_id="openclaw",
-                         memory_id="ogmemory", memory_plugin_id="openclaw-ogmemory",
+                         memory_id=backend, memory_plugin_id=f"openclaw-{backend}",
                          memory_integration="agent_plugin")
     plan = compose_run_plan(BenchmarkScenario.model_validate(payload), binding,
                             {"memory_plugin": {"commit": {"required_after_ingest": True},
@@ -196,12 +199,14 @@ def test_finalize_uses_every_sample_runtime(tmp_path, monkeypatch, failed):
     assert result.status == ('failed' if failed else 'passed')
     assert len(payload['output']['samples']) == 2
 
-def test_four_questions_share_one_plugin_gateway(tmp_path, monkeypatch):
-    cases, steps, _ = plugin_plan(questions_per_checkpoint=4)
+@pytest.mark.parametrize("backend", ["ogmemory", "openviking", "mem0", "memos", "hindsight", "jiuwenmemory"])
+@pytest.mark.parametrize("limit", [3, 4])
+def test_concurrent_questions_share_one_plugin_gateway(tmp_path, monkeypatch, backend, limit):
+    cases, steps, _ = plugin_plan(questions_per_checkpoint=limit, backend=backend)
     cases = [c for c in cases if c.case_id.startswith("sample-0")]
     steps = [s for s in steps if s.case_id in {c.case_id for c in cases}]
-    assert len(cases) == 7
-    barrier = Barrier(4)
+    assert len(cases) == limit + 3
+    barrier = Barrier(limit)
     sessions = set()
     lock = Lock()
 
@@ -212,7 +217,7 @@ def test_four_questions_share_one_plugin_gateway(tmp_path, monkeypatch):
             assert runtime_context.concurrent_plugin_qa
             with lock:
                 sessions.add(step.inputs["metadata"]["session_key"])
-                first_checkpoint = len(sessions) <= 4
+                first_checkpoint = len(sessions) <= limit
             if first_checkpoint:
                 barrier.wait(timeout=5)
         return {"status": "ok", "output": {"session_handle": "session"}, "turns": [{"text": "coffee" if step.case_id.endswith("-q2") else "tea"}]}
@@ -220,12 +225,12 @@ def test_four_questions_share_one_plugin_gateway(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow, "_execute_step_operator", operator)
     monkeypatch.setattr(workflow, "run_llm_judge", grade)
     ctx = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
-        agent_id="openclaw", memory_id="ogmemory", memory_plugin_id="openclaw-ogmemory",
+        agent_id="openclaw", memory_id=backend, memory_plugin_id=f"openclaw-{backend}",
         memory_integration="agent_plugin")
-    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="ogmemory",
+    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id=backend,
         runtime_context=ctx, cases=cases, steps=steps, run_dir=tmp_path,
-        execution_spec=ExecutionSpec(qa_concurrency=4, qa_per_sample=4))
-    assert len(sessions) == len(result["judge_results"]) == 5
+        execution_spec=ExecutionSpec(qa_concurrency=30, qa_per_sample=limit))
+    assert len(sessions) == len(result["judge_results"]) == limit + 1
     assert all(r.passed for r in result["judge_results"])
 
 def test_parallel_qa_shared_state_counts_each_transcript_once(tmp_path):
@@ -261,9 +266,9 @@ def test_parallel_qa_shared_state_counts_each_transcript_once(tmp_path):
 
 @pytest.mark.parametrize("failure,restore,graded", [
     ("SettledHistoryFailure", True, True),
-    ("SettledHistoryFailure", False, False),
-    ("TimeoutError", True, False),
-    ("RuntimeError", True, False),
+    ("SettledHistoryFailure", False, True),
+    ("TimeoutError", True, True),
+    ("RuntimeError", True, True),
 ])
 def test_plugin_history_failure_and_read_only_gate(tmp_path, monkeypatch, failure, restore, graded):
     from memory_bench_platform.cli import _summarize_native_evaluation
@@ -285,7 +290,7 @@ def test_plugin_history_failure_and_read_only_gate(tmp_path, monkeypatch, failur
                     "output": {"read_only_verified": restore}}
         if step.operator_kind == "agent":
             if step.inputs["metadata"]["purpose"] == "memory_qa":
-                assert switches and restore
+                assert switches and (restore or step.inputs.get("qa_without_plugin"))
                 qa.append(step.step_id)
             return {"status": "ok", "output": {"session_handle": "session"}, "turns": [{"text": "tea"}]}
         return {"status": "ok", "output": {"operation": {"id": step.step_id}, "ready": True}}
@@ -343,3 +348,78 @@ def test_jiuwen_finalize_uses_sample_plans_and_weights_missing_answers(tmp_path)
     assert out["ingest_verification"] == {"planned": 2, "verified": 1, "coverage": 0.5}
     assert out["recall_verification"] == {"planned_qa": 3, "checked_qa": 1, "verified": 1,
         "unverified": 2, "coverage": 1/3, "tool_called": 1, "tool_call_coverage": 1/3, "with_evidence": 1}
+
+
+@pytest.mark.parametrize("backend", ["ogmemory", "openviking"])
+@pytest.mark.parametrize("fault", ["memory_ingest", "commit", "wait_ready"])
+@pytest.mark.parametrize("uses_failed_output", [False, True])
+def test_session_failure_continues_sibling_sessions_and_qa(tmp_path, monkeypatch, backend, fault, uses_failed_output):
+    cases, steps, _ = plugin_plan(backend=backend, extra_history=True)
+    cases = [case for case in cases if case.case_id.startswith("sample-0")]
+    steps = [step for step in steps if step.case_id in {case.case_id for case in cases}]
+    if uses_failed_output:
+        failed_source = next(step for step in steps if "history-2" in step.step_id and
+                             (step.inputs.get("action") or step.inputs.get("metadata", {}).get("purpose")) == fault)
+        third_ingest = next(step for step in steps if "history-3" in step.step_id and step.operator_kind == "agent")
+        third_ingest.inputs["messages"] = {"$ref": f"steps.{failed_source.step_id}.output.messages"}
+    calls = []
+    def operator(step, **kwargs):
+        action = step.inputs.get("action") or step.inputs.get("metadata", {}).get("purpose")
+        calls.append((step.step_id, action))
+        if action == fault and "history-2" in step.step_id:
+            return {"status": "failed", "error": {"code": "TimeoutError"}}
+        if step.inputs.get("recover_read_only"):
+            return {"status": "ok", "output": {"read_only_verified": True}}
+        if step.operator_kind == "agent":
+            return {"status": "ok", "output": {"session_handle": "session"}, "turns": [{"text":"tea"}]}
+        return {"status":"ok","output":{"operation":{"id":step.step_id},"ready":True}}
+    monkeypatch.setattr(workflow, "_execute_step_operator", operator)
+    monkeypatch.setattr(workflow, "run_llm_judge", grade)
+    ctx = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
+        agent_id="openclaw", memory_id=backend, memory_plugin_id=f"openclaw-{backend}", memory_integration="agent_plugin")
+    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id=backend, runtime_context=ctx,
+        cases=cases, steps=steps, run_dir=tmp_path, execution_spec=ExecutionSpec(fail_fast=True))
+    order = ["memory_ingest", "commit", "wait_ready"]
+    assert [a for k,a in calls if "history-2" in k] == order[:order.index(fault)+1]
+    assert [a for k,a in calls if "history-3" in k] == ([] if uses_failed_output else order)
+    assert len([j for j in result["judge_results"] if j.passed is not None]) == 2
+    assert all(row.structured_output.get("qa_degradation", {}).get("setup_failed")
+               for row in result["step_results"] if row.step_id.endswith("agent-answer"))
+
+
+@pytest.mark.parametrize("api", ["openai-completions", "openai-responses"])
+def test_isolated_answer_uses_original_question_and_sample_model(tmp_path, api):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    from memory_bench_platform.workflow_operators import _answer_without_plugin
+
+    requests = []
+    class Model(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+            raw = {"usage": {"input_tokens": 4, "output_tokens": 1},
+                   "choices": [{"message": {"content": "tea"}}],
+                   "output": [{"type": "message", "content": [{"type": "output_text", "text": "tea"}]}]}
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(raw).encode())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Model)
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"agents": {"defaults": {"model": {"primary": "bench/original"}}},
+            "models": {"providers": {"bench": {"api": api, "baseUrl": f"http://127.0.0.1:{server.server_port}/v1"}}}}))
+        q = RenderedTaskInput(task_id="q", system_prompt="Original rules",
+                              messages=[{"role": "user", "content": "Original question"}])
+        with adapter_environment({"OPENCLAW_CONFIG_PATH": str(path)}):
+            answer = _answer_without_plugin("model_without_plugin", q)
+        assert answer["agent_answer"] == "tea" and answer["raw"]["usage"]["input_tokens"] == 4
+        [(route, body)] = requests
+        assert route == ("/v1/responses" if api == "openai-responses" else "/v1/chat/completions")
+        assert body["model"] == "original" and "tools" not in body
+        assert (body.get("input") or body["messages"])[-1] == q.messages[-1]
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()

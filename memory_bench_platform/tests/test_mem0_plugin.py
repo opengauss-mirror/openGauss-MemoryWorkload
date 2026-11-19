@@ -102,7 +102,10 @@ def test_missing_hook_and_stale_receipt(runtime, monkeypatch):
     monkeypatch.setattr(plugin, "logs", lambda *args, **kwargs: "")
     with pytest.raises(RuntimeError, match="No positive native"): finish(life, check)
     with pytest.raises(ValueError, match="context mismatch"): finish(life, {**check, "nonce": "old"})
-    with pytest.raises(ValueError, match="Parallel"): life("before_agent", agent_request=request("qa"))
+    next_check = life("before_agent", agent_request=request("qa", "next-question"))["output"]
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kwargs: "openclaw-mem0: injecting 2 memories into context")
+    assert finish(life, next_check)["output"]["memory_count"] == 2
+    assert life("set_phase", phase="ingest")["output"]["capture"]
 
 def test_existing_session_and_package_change(runtime):
     root, upstream, life, _ = runtime
@@ -154,7 +157,7 @@ def test_restart_applies_native_switches_and_failure_stays_unready(runtime, monk
 @pytest.mark.parametrize("second_log,error", [
     ("openclaw-mem0: injecting 2 memories into context", None),
     ("openclaw-mem0: recall timed out\nopenclaw-mem0: injecting 2 memories into context", "exceeded its deadline"),
-    ("openclaw-mem0: recall failed: unavailable", "hook failed"),
+    ("openclaw-mem0: recall failed: unavailable", "recall failed"),
 ])
 def test_qa_waits_for_delayed_logs_without_accepting_failed_recall(runtime, monkeypatch, second_log, error):
     _, _, life, _ = runtime
@@ -194,7 +197,7 @@ def test_qa_log_wait_is_bounded_and_rejects_success_after_deadline(runtime, monk
     assert plugin.time.monotonic() - start == pytest.approx(3)
     assert calls[0] == 3 and all(0 < timeout <= 3 for timeout in calls)
     assert len(calls) == 1 if late_success else len(calls) > 1
-    assert json.loads((root / "phase.json").read_text())["pending"] == check
+    assert json.loads((root / "phase.json").read_text())["pending"] is None
 
 
 def test_log_read_uses_remaining_subprocess_budget(monkeypatch):
@@ -205,3 +208,72 @@ def test_log_read_uses_remaining_subprocess_budget(monkeypatch):
     monkeypatch.setattr(plugin.subprocess, "run", read_logs)
     plugin.logs("dedicated", "0", timeout=0.25)
     assert seen["timeout"] == 0.25
+
+
+def test_concurrent_qa_verifies_session_without_claiming_shared_log(runtime, tmp_path, monkeypatch):
+    _, _, life, _ = runtime
+    life("set_phase", phase="qa")
+    ctx = {"run_dir": str(tmp_path / "run"), "concurrent_plugin_qa": True}
+    def hook(action, inputs):
+        return plugin.run({"action": action, "inputs": inputs, "runtime_context": ctx})["output"]
+    questions = [dict(request("qa", f"qa-{i}"), task_id=f"q{i}") for i in range(3)]
+    checks = [hook("before_agent", {"agent_request": q}) for q in questions]
+    monkeypatch.setattr(plugin, "logs", lambda *a, **kw: pytest.fail("unscoped log attribution"))
+    for q, check in reversed(list(zip(questions, checks))):
+        handle = {"session_id": q["task_id"], "gateway_session_key": check["session_key"]}
+        result = hook("after_agent", {"agent_request": q, "check_context": check,
+                      "agent_result": {"status": "ok", "transport": "http", "output": {"session_handle": handle}}})
+        assert result["recall_verified"] is False
+
+
+@pytest.mark.parametrize("old_settled", [True, False])
+def test_ingest_lease_recovery(runtime, monkeypatch, old_settled):
+    root, _, life, _ = runtime
+    old = life("before_agent", agent_request=request())["output"]
+    marker = "openclaw-mem0: auto-captured 2 memories"
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kw: "")
+    with pytest.raises(RuntimeError, match="completion marker"):
+        finish(life, old)
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kw: marker if old_settled else "")
+    new = life("before_agent", agent_request=request(session="history-2"))["output"]
+    with pytest.raises(ValueError, match="context mismatch"):
+        finish(life, old)
+    monkeypatch.setattr(plugin, "logs", lambda *args, **kw: "openclaw-mem0: auto-captured 3 memories")
+    if old_settled:
+        assert finish(life, new)["output"]["memory_count"] == 3
+    else:
+        with pytest.raises(RuntimeError, match="overlapping"):
+            finish(life, new)
+    life("set_phase", phase="qa")
+
+def test_explicit_qa_recall_error_recovers_only_its_own_session(runtime, monkeypatch):
+    root, _, life, restarts = runtime
+    life("set_phase", phase="qa")
+    old = life("before_agent", agent_request=request("qa", "q1"))["output"]
+    monkeypatch.setattr(plugin, "logs", lambda *a, **kw: "openclaw-mem0: recall failed: unavailable")
+    with pytest.raises(ValueError, match="context mismatch"):
+        finish(life, {**old, "nonce": "foreign"})
+    assert json.loads((root / "phase.json").read_text())["pending"] == old
+    with pytest.raises(plugin.RecoverableRecallError, match="recall failed"):
+        finish(life, old)
+    assert restarts == ["ingest", "qa", "qa"]
+    new = life("before_agent", agent_request=request("qa", "q2"))["output"]
+    with pytest.raises(ValueError, match="context mismatch"):
+        finish(life, old)
+    monkeypatch.setattr(plugin, "logs", lambda *a, **kw: "openclaw-mem0: injecting 3 memories into context")
+    assert finish(life, new)["output"]["memory_count"] == 3
+    assert life("set_phase", phase="ingest")["output"]["capture"]
+
+
+@pytest.mark.parametrize("write_marker", ["auto-captured 1 memories", "capture failed: unavailable"])
+def test_qa_write_violation_precedes_recoverable_recall_error(runtime, monkeypatch, write_marker):
+    root, _, life, restarts = runtime
+    life("set_phase", phase="qa")
+    check = life("before_agent", agent_request=request("qa", "q1"))["output"]
+    log = "openclaw-mem0: recall failed: unavailable\nopenclaw-mem0: " + write_marker
+    monkeypatch.setattr(plugin, "logs", lambda *a, **kw: log)
+    with pytest.raises(RuntimeError) as error:
+        finish(life, check)
+    assert not isinstance(error.value, plugin.RecoverableRecallError)
+    assert json.loads((root / "phase.json").read_text())["pending"] == check
+    assert restarts == ["ingest", "qa"]

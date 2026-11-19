@@ -197,7 +197,7 @@ class ExecutionSpec(BaseModel):
     max_parallel_steps: int = 1
     sample_concurrency: int = Field(default=1, gt=0)
     qa_concurrency: int = Field(default=1, gt=0)
-    qa_per_sample: int = Field(default=1, gt=0)
+    qa_per_sample: int | None = Field(default=None, gt=0)
     judge_concurrency: int = Field(default=1, gt=0)
     fail_fast: bool = True
     default_retry_limit: int = 0

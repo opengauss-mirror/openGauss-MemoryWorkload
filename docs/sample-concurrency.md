@@ -124,15 +124,23 @@ environment. Return an `identities` array of non-secret native identity
 strings. Shared identities or a failed preflight stop the multi-sample run.
 The default unbound serial path does not invoke this check.
 
-oGMemory 的 HTTP Gateway 可以显式开启同一样本内的只读 QA 并发。例如
-`--sample-concurrency 1 --qa-concurrency 4 --qa-per-sample 4 --judge-concurrency 4`
-允许一个 conversation 同时回答四题。多样本共用全局 QA 上限，每题使用独立会话并读取同一样本的记忆。
-日志只用于确认对应会话的召回，无法归属的错误保留在 Gateway 日志中；有效答案缺少本题回执时按召回未验证记录。
+OpenClaw 插件模式支持通过 `--qa-per-sample` 配置同一样本内的只读 QA 并发，默认值为 1。
+例如 `--sample-concurrency 10 --qa-per-sample 3 --qa-concurrency 30 --judge-concurrency 10`。
+每题使用独立会话，同一 conversation 共用记忆范围，所有 conversation 共用全局 QA 上限。
+mem0、MemOS Local、Hindsight 按题关联并发 QA 请求；不能按会话归属的 Gateway 日志不会算作已验证召回。
+MemOS Local 仍审计本题 transcript 中的正文读取，Hindsight 仍检查 bank 操作。
 
 ### 插件历史不完整时的 QA
 
-oGMemory 专用 HTTP Gateway 若确认当前 compact 的准备请求已终止失败，并确认该会话空闲、索引队列为空，
-Workload 保留失败回执，跳过本检查点剩余历史，尝试切换至同一 scope 的只读 QA 阶段。
-专用 Gateway 重启、加载原生插件并通过阶段校验后，各题沿用正常 Agent 和 Judge；评分记入
-`degraded_qa`，检查点仍为未就绪。后续检查点继承历史不完整标记。身份或配置错误、后台状态未知、
-只读阶段未确认时，QA 继续受依赖门禁保护。其他插件可通过相同的已终止失败码及只读回执接入。
+历史 ingest、commit 或就绪步骤失败时，保留该 session 的失败记录，跳过需要其失败输出的操作。下一个拥有独立 session key 和独立输入的历史段继续按计划写入、提交和等待就绪。到达检查点后尝试切换至只读 QA。
+已确认只读的样本继续答题，结果单列为降级 QA。后台工作可能晚于客户端超时完成，超时不代表后端最终失败。
+
+若准备步骤报告记忆运行失败，仍调度每道题。只读阶段无法确认，或插件检查失败时，Workload 使用该样本 OpenClaw 配置的回答模型和原始问题直接请求无记忆答案。支持 `openai-completions` 和 `openai-responses`。执行 Workload 的主机需要能访问配置中的模型地址并解析 API Key。报告的 `qa_paths.without_memory` 单列这条路径；各次模型请求独立记账。回答服务本身失败时记录该题执行失败，只有取得答案才评分。
+
+在 backend_direct 模式下，省略 `--qa-per-sample` 时沿用全局 QA 并发；显式指定为 1 时，同一样本一次只执行一道 QA。
+
+Mem0 和 Hindsight 的历史写入回调通过请求身份校验后，即使验证失败也不会一直占用写入租约。下一段开始前先检查旧回执；若旧回执尚未到达，仍可发送后续独立历史，但同一 Gateway 进程中重叠窗口的无请求 ID 日志不作为写入成功证据。Hindsight 仍执行原生 bank 就绪检查。
+
+Mem0 和 Hindsight 在串行 QA 已返回、会话身份匹配且确认只读时，可通过重启本样本的只读 Gateway 隔离超时回执。当前题保留失败记录，恢复成功后下一题重新验证召回。Hindsight 还检查重启前后的 bank 操作集合及状态。
+
+MemOS Local 在历史写入验证失败时保存失败回执。后续同阶段的独立历史只用本 session 的原生 SQLite 写入记录和 trace 核验写入，并检查 embedding 重试队列；无法归属的召回日志标为未验证。

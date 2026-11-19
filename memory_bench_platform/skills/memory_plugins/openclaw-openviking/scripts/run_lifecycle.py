@@ -475,12 +475,17 @@ def _set_phase(request: dict[str, Any]) -> dict[str, Any]:
     if phase == "qa":
         _config_set(f"{PLUGIN_CONFIG_PATH}.autoCapture", False)
         _config_set(f"{PLUGIN_CONFIG_PATH}.autoRecall", True)
+        recovering = request.get("inputs", {}).get("recover_read_only") is True
+        if recovering and (_config_get(f"{PLUGIN_CONFIG_PATH}.autoCapture") is not False
+                           or _config_get(f"{PLUGIN_CONFIG_PATH}.autoRecall") is not True):
+            raise RuntimeError("OpenViking read-only QA configuration was not confirmed")
         return _ok(
             {
                 "phase": "qa",
                 "auto_capture": False,
                 "auto_recall": True,
                 "qa_read_only": True,
+                **({"read_only_verified": True} if recovering else {}),
             }
         )
     raise ValueError(f"unsupported memory plugin phase: {phase or '<missing>'}")

@@ -372,6 +372,15 @@ def session_key(request):
     return key
 
 
+def qa_lease_key(request):
+    inputs = request.get('inputs', {})
+    agent = inputs.get('agent_request', {})
+    if (request.get('runtime_context', {}).get('concurrent_plugin_qa')
+            and agent.get('metadata', {}).get('purpose') == 'memory_qa'):
+        return 'qa_pending:' + agent['task_id']
+    return 'pending'
+
+
 def _dispatch(request, root, info, config):
     state_path = root / 'phase.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -381,6 +390,7 @@ def _dispatch(request, root, info, config):
         raise ValueError('runtime_context.run_dir required')
     if state.get('owner') and state['owner'] != owner:
         raise ValueError('Runtime already belongs to another run; use a fresh directory')
+    lease = qa_lease_key(request)
     db = root / 'memos/data/memos.db'
     output = {}
     if action == 'validate':
@@ -410,7 +420,7 @@ def _dispatch(request, root, info, config):
             phase = inputs.get('phase')
             if phase not in ('ingest', 'qa'):
                 raise ValueError('Invalid phase')
-            if state.get('pending'):
+            if state.get('pending') or any(k.startswith('qa_pending:') for k in state):
                 raise ValueError('Unfinished request prevents phase change')
             if phase != state['phase']:
                 if phase == 'ingest':
@@ -421,8 +431,10 @@ def _dispatch(request, root, info, config):
                 configure(root, info, config, False)
                 state['phase'] = phase
             output = {'phase': phase, 'capture': phase == 'ingest', 'recall': True}
+            if inputs.get('recover_read_only') and phase == 'qa':
+                output['read_only_verified'] = True
         elif action == 'before_agent':
-            if state.get('pending'):
+            if state.get("pending") or state.get(lease):
                 raise ValueError('Previous request incomplete; parallel/replayed calls are not allowed')
             req = inputs['agent_request']; meta = req.get('metadata', {})
             phase = 'ingest' if meta.get('purpose') == 'memory_ingest' else 'qa'
@@ -430,31 +442,33 @@ def _dispatch(request, root, info, config):
                 raise ValueError('Scope/phase mismatch')
             key = session_key(req)
             index = root / 'state/agents/main/sessions/sessions.json'
-            if key in state.get('failed_qa_sessions', []) or (index.exists() and key in json.loads(index.read_text())):
+            if key in state.get('failed_ingest_sessions', []) or key in state.get('failed_qa_sessions', []) or (index.exists() and key in json.loads(index.read_text())):
                 raise ValueError('Session already exists')
-            state['pending'] = {'nonce': uuid.uuid4().hex, 'session_key': key, 'phase': phase, 'log_since': time.time(), 'before': db_snapshot(db)}
+            state[lease] = {'nonce': uuid.uuid4().hex, 'session_key': key, 'phase': phase, 'log_since': time.time(), 'before': db_snapshot(db)}
             if phase == 'qa':
                 verify_exports(root, state)
-            output = state['pending']
+            output = state[lease]
         elif action == 'after_agent':
-            pending = state.get('pending')
+            pending = state.get(lease)
             if not pending or inputs.get('check_context') != pending:
                 raise ValueError('Receipt context mismatch')
             result = inputs['agent_result']; handle = result.get('output', {}).get('session_handle', {})
             if result.get('status') != 'ok' or handle.get('gateway_session_key') != pending['session_key'] or not handle.get('session_id'):
                 raise ValueError('Agent failed or actual session does not match')
             deadline = time.monotonic() + info.get('completion_timeout_seconds', 600)
+            scoped_capture = pending["phase"] == "ingest" and bool(state.get("failed_ingest_sessions"))
             while time.monotonic() < deadline:
-                log = container_logs(info['container'], pending['log_since'])
-                recall = recall_receipt(log)
+                log = container_logs(info['container'], pending['log_since']) if lease == 'pending' and not scoped_capture else ''
+                recall = (recall_receipt(log) if lease == 'pending' and not scoped_capture else
+                          {'recall_verified': False, 'recall_verification_reason': 'gateway_window_shared'})
                 snapshot = db_snapshot(db)
                 capture = capture_receipt(db, pending['before']['add_id'], pending['session_key']) if pending['phase'] == 'ingest' else None
                 if pending['phase'] == 'qa':
                     if snapshot['counts'] != pending['before']['counts'] or snapshot['add_id'] != pending['before']['add_id']:
                         raise RuntimeError('Memory write occurred during QA')
-                    done = recall and 'memos.agent_end.skipped' in log
+                    done = lease != 'pending' or (recall and 'memos.agent_end.skipped' in log)
                 else:
-                    done = recall and capture and 'memos.onTurnEnd' in log and snapshot['retry_count'] == 0
+                    done = capture and snapshot['retry_count'] == 0 and (scoped_capture or (recall and 'memos.onTurnEnd' in log))
                 if done:
                     break
                 time.sleep(0.5)
@@ -471,10 +485,13 @@ def _dispatch(request, root, info, config):
                     audit = audit_session(root, state, pending, handle)
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     audit = {'qa_valid': False, 'error_type': type(exc).__name__, 'reason': 'read_audit_unverifiable'}
-            proof = {**pending, 'actual_session_id': handle['session_id'], 'recall': recall, 'capture': capture, 'after': snapshot, 'verification': 'exclusive_serial_gateway_and_native_sqlite_receipt', 'version': VERSION, 'detail_tool': DETAIL_DISCLOSURE, 'read_audit': audit}
+            proof = {**pending, 'actual_session_id': handle['session_id'], 'recall': recall, 'capture': capture, 'after': snapshot, 'verification': ('session_bound_sqlite_capture' if scoped_capture else 'session_read_audit_and_sqlite_snapshot' if lease != 'pending' else 'exclusive_serial_gateway_and_native_sqlite_receipt'), 'version': VERSION, 'detail_tool': DETAIL_DISCLOSURE, 'read_audit': audit}
             receipt = Path(owner) / 'artifacts/memory_plugin/openclaw-memos-local' / (pending['nonce'] + '.json')
             save(receipt, proof)
-            state['pending'] = None
+            if lease == 'pending':
+                state['pending'] = None
+            else:
+                state.pop(lease, None)
             output = {'checked': True, 'phase': pending['phase'], 'receipt': str(receipt), 'recall': recall}
             if audit is not None and not audit['qa_valid']:
                 # Agent already completed and capture is disabled: release only this
@@ -493,17 +510,17 @@ def dispatch(request, root, info, config):
     try:
         return _dispatch(request, root, info, config)
     except Exception as exc:
-        # Only the owner of this failed QA can release its lease. Ingest and
-        # mismatched callbacks remain blocked; they may have changed memory.
+        # Only the matching callback can recover its own lease.
         state_path = root / 'phase.json'
         if request.get('action') != 'after_agent' or not state_path.exists():
             raise
         state = json.loads(state_path.read_text())
-        pending = state.get('pending')
+        lease = qa_lease_key(request)
+        pending = state.get(lease)
         inputs = request.get('inputs', {})
         owner = request.get('runtime_context', {}).get('run_dir')
-        if (not pending or state.get('owner') != owner or state.get('phase') != 'qa'
-                or pending.get('phase') != 'qa' or inputs.get('check_context') != pending):
+        if (not pending or state.get('owner') != owner
+                or state.get('phase') != pending.get('phase') or pending.get('phase') not in ('qa', 'ingest') or inputs.get('check_context') != pending):
             raise
         result = inputs.get('agent_result', {})
         handle = result.get('output', {}).get('session_handle', {})
@@ -511,6 +528,13 @@ def dispatch(request, root, info, config):
                 or handle.get('gateway_session_key') not in (None, pending['session_key'])
                 or (result.get('status') == 'ok' and
                     (handle.get('gateway_session_key') != pending['session_key'] or not handle.get('session_id')))):
+            raise
+        if pending['phase'] == 'ingest':
+            receipt = Path(owner) / 'artifacts/memory_plugin/openclaw-memos-local' / (pending['nonce'] + '-failure.json')
+            save(receipt, {**pending, 'error_type': type(exc).__name__, 'ingest_verified': False})
+            state.setdefault('failed_ingest_sessions', []).append(pending['session_key'])
+            state['pending'] = None
+            save(state_path, state)
             raise
         proof = {**pending, 'error_type': type(exc).__name__, 'qa_valid': False,
                  'recovery': 'blocked'}
@@ -523,15 +547,19 @@ def dispatch(request, root, info, config):
                 raise RuntimeError('Memory changed during failed QA')
             # Restart the dedicated read-only Gateway to end all late hooks.
             # configure waits for both Gateway and native plugin readiness.
-            configure(root, info, config, False)
+            if lease == 'pending':
+                configure(root, info, config, False)
             after = db_snapshot(db)
             if after != before:
                 raise RuntimeError('Memory changed during QA recovery')
             verify_exports(root, state)
-            proof.update(recovery='gateway_restarted_read_only', after=after)
+            proof.update(recovery='gateway_restarted_read_only' if lease == 'pending' else 'session_closed', after=after)
             save(receipt, proof)
             state.setdefault('failed_qa_sessions', []).append(pending['session_key'])
-            state['pending'] = None
+            if lease == 'pending':
+                state['pending'] = None
+            else:
+                state.pop(lease, None)
             save(state_path, state)
         except Exception as recovery_error:
             proof.update(recovery='blocked', recovery_error_type=type(recovery_error).__name__)
