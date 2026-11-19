@@ -50,6 +50,8 @@ autoCapture = false
 autoRecall = true
 ```
 
+当 `gateway.reload.mode=off` 时，请为每个样本设置 `OPENCLAW_CONFIG_PATH` 和 `OPENVIKING_PLUGIN_GATEWAY_CONTAINER`。后者应指向挂载该配置目录、且 `memory-bench.runtime` 标签等于该目录绝对路径的专用 Gateway。适配器在写完一个阶段的配置或恢复原配置后重启该 Gateway，并等待 `/readyz` 成功。重启失败会记录为生命周期错误。
+
 ## Session 与命名空间约束
 
 - 使用稳定算法把平台的语义 `session_key` 转换成 OpenClaw 可接受的 UUID 格式 `session_id`。

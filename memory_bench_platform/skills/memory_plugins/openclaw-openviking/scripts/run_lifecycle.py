@@ -14,6 +14,10 @@ import urllib.parse
 import urllib.request
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "agents/openclaw/scripts"))
+import gateway_recovery
+
+
 PLUGIN_CONFIG_PATH = "plugins.entries.openviking.config"
 AUTO_COMMIT_DISABLED_THRESHOLD = 100_000
 MANAGED_FIELDS = (
@@ -454,6 +458,22 @@ def _wait_settle(request: dict[str, Any]) -> dict[str, Any]:
     raise TimeoutError(f"OpenViking plugin tasks did not settle within {timeout} seconds")
 
 
+def _apply_gateway_configuration() -> None:
+    # With reload disabled, config set only changes the file. Apply the whole
+    # phase at its barrier, before allowing Agent requests into the Gateway.
+    gateway = _config_get("gateway")
+    if (gateway.get("reload") or {}).get("mode") != "off":
+        return
+    path = os.environ.get("OPENCLAW_CONFIG_PATH")
+    if not path:
+        raise ValueError("OPENCLAW_CONFIG_PATH is required for a Gateway with reload disabled")
+    path = Path(path).resolve()
+    config = json.loads(path.read_text(encoding="utf-8"))
+    gateway_recovery.restart_dedicated_gateway(
+        path.parent, "OPENVIKING_PLUGIN_GATEWAY_CONTAINER", config
+    )
+
+
 def _set_phase(request: dict[str, Any]) -> dict[str, Any]:
     inputs = request.get("inputs", {})
     phase = str(inputs.get("phase") or "").strip().lower()
@@ -463,6 +483,7 @@ def _set_phase(request: dict[str, Any]) -> dict[str, Any]:
         _config_set(f"{PLUGIN_CONFIG_PATH}.captureMode", "semantic")
         _config_set(f"{PLUGIN_CONFIG_PATH}.commitTokenThreshold", AUTO_COMMIT_DISABLED_THRESHOLD)
         _config_set(f"{PLUGIN_CONFIG_PATH}.commitKeepRecentCount", 0)
+        _apply_gateway_configuration()
         return _ok(
             {
                 "phase": "ingest",
@@ -475,6 +496,7 @@ def _set_phase(request: dict[str, Any]) -> dict[str, Any]:
     if phase == "qa":
         _config_set(f"{PLUGIN_CONFIG_PATH}.autoCapture", False)
         _config_set(f"{PLUGIN_CONFIG_PATH}.autoRecall", True)
+        _apply_gateway_configuration()
         recovering = request.get("inputs", {}).get("recover_read_only") is True
         if recovering and (_config_get(f"{PLUGIN_CONFIG_PATH}.autoCapture") is not False
                            or _config_get(f"{PLUGIN_CONFIG_PATH}.autoRecall") is not True):
@@ -518,6 +540,7 @@ def _finalize(request: dict[str, Any]) -> dict[str, Any]:
             if field in snapshot and snapshot[field] is not None:
                 _config_set(f"{PLUGIN_CONFIG_PATH}.{field}", snapshot[field])
                 restored.append(field)
+    _apply_gateway_configuration()
     return _ok(
         {
             "restored": True,
