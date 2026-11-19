@@ -14,6 +14,7 @@ from .backends import validate_openviking_source
 from .external_report_import import import_external_result
 from .integration import (
     adapter_environment,
+    sample_runtime_environment,
     build_benchmark_scenario,
     build_run_contract,
     build_cases_from_source,
@@ -73,13 +74,21 @@ def _positive_int(value: str) -> int:
 
 def _execution_options(args, configured=None) -> ExecutionSpec:
     values = dict(configured or {})
-    for name in ("qa_concurrency", "judge_concurrency"):
+    for name in ("sample_concurrency", "qa_concurrency", "qa_per_sample", "judge_concurrency"):
         value = getattr(args, name, None)
         if value is not None:
             values[name] = value
     spec = ExecutionSpec(**values)
-    if getattr(args, "memory_integration", "backend_direct") == "agent_plugin" and spec.qa_concurrency != 1:
-        raise ValueError("agent_plugin requires --qa-concurrency 1; use --judge-concurrency for parallel grading")
+    if spec.qa_per_sample > 1:
+        if (getattr(args, "memory_integration", None), getattr(args, "memory_backend", None)) != ("agent_plugin", "ogmemory"):
+            raise ValueError("--qa-per-sample > 1 requires the oGMemory agent_plugin")
+        if spec.qa_per_sample > spec.qa_concurrency:
+            raise ValueError("--qa-per-sample cannot exceed --qa-concurrency")
+    if (getattr(args, "memory_integration", "backend_direct") == "agent_plugin"
+            and spec.qa_concurrency > 1
+            and ((spec.sample_concurrency == 1 and spec.qa_per_sample == 1)
+                 or (spec.sample_concurrency > 1 and not getattr(args, "sample_runtime_config", None)))):
+        raise ValueError("agent_plugin requires --qa-concurrency 1 unless parallel samples have dedicated runtime bindings")
     return spec
 
 
@@ -174,8 +183,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--version-override", action="append", default=[])
     add_trace_arguments(p_run)
     for command_parser in (p_plan, p_run):
+        command_parser.add_argument("--sample-concurrency", type=_positive_int, default=None,
+            help="Concurrent independent samples (default: 1)")
+        command_parser.add_argument("--sample-runtime-config", type=Path,
+            help="JSON mapping sample IDs to dedicated Agent adapter environments")
         command_parser.add_argument("--qa-concurrency", type=_positive_int, default=None,
-            help="Concurrent backend_direct QA cases per checkpoint (default: 1)")
+            help="Global concurrent QA cases (default: 1)")
+        command_parser.add_argument("--qa-per-sample", type=_positive_int, default=None,
+            help="Concurrent questions per oGMemory plugin sample (default: 1)")
         command_parser.add_argument("--judge-concurrency", type=_positive_int, default=None,
             help="Concurrent Judges for either integration mode (default: 1)")
 
@@ -628,16 +643,31 @@ def _run_plugin_finalize(
         )
     ]
     try:
-        payload = run_memory_plugin_task(
-            memory_plugin_id,
-            MemoryPluginTaskInput(
-                task_id=step_id,
-                action="finalize",
-                inputs={},
-                runtime_context=runtime_context,
-                idempotency_key=f"{runtime_context.run_id}:memory-plugin-finalize",
-            ),
-        ).model_dump(mode="json")
+        if runtime_context.sample_environments:
+            sample_payloads = {}
+            child_context = runtime_context.model_copy(update={"sample_environments": {}})
+            for sample in runtime_context.sample_environments:
+                with sample_runtime_environment(runtime_context, sample):
+                    sample_payloads[sample] = _run_plugin_finalize(child_context)[0]
+            success = all(p.get("status") == "ok" and p.get("state") == "completed"
+                          for p in sample_payloads.values())
+            payload = {"protocol_version": "memory-plugin/1",
+                       "status": "ok" if success else "failed",
+                       "state": "completed" if success else "failed",
+                       "output": {"samples": sample_payloads},
+                       "artifacts": [a for p in sample_payloads.values() for a in p.get("artifacts", [])],
+                       "error": {} if success else {"message": "One or more sample runtimes failed to finalize"}}
+        else:
+            payload = run_memory_plugin_task(
+                memory_plugin_id,
+                MemoryPluginTaskInput(
+                    task_id=step_id,
+                    action="finalize",
+                    inputs={},
+                    runtime_context=runtime_context,
+                    idempotency_key=f"{runtime_context.run_id}:memory-plugin-finalize",
+                ),
+            ).model_dump(mode="json")
     except Exception as exc:
         payload = {
             "protocol_version": "memory-plugin/1",
@@ -926,6 +956,8 @@ def main(argv: list[str] | None = None) -> None:
                              if getattr(args, name, None)]
                 if conflicts or getattr(args, "memory_integration_explicit", False):
                     parser.error("--deployment cannot be combined with manual run selection options")
+                if args.sample_concurrency not in (None, 1):
+                    parser.error("--sample-concurrency currently requires a manual native run, not --deployment")
                 profile_options = ({"profiling_config": args.profiling_config}
                                    if args.profiling_config is not None else {})
                 rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker,
@@ -1098,7 +1130,7 @@ def main(argv: list[str] | None = None) -> None:
         from .profiling_config import load_profiling_config
         profiling_config = load_profiling_config(args.profiling_config)
     if entrypoint.entrypoint_kind == "external_runner" and any(
-        getattr(args, name, None) not in (None, 1) for name in ("qa_concurrency", "judge_concurrency")
+        getattr(args, name, None) not in (None, 1) for name in ("sample_concurrency", "qa_concurrency", "qa_per_sample", "judge_concurrency")
     ):
         parser.error("QA/Judge concurrency options require a native Workload entrypoint")
     source_kind = (
@@ -1454,7 +1486,9 @@ def main(argv: list[str] | None = None) -> None:
         steps = [StepRecord(**item) for item in cases_payload.get("steps", [])]
         execution_spec = _execution_options(args, cases_payload.get("execution_spec", {}))
         cases_payload["execution_spec"] = execution_spec.model_dump(mode="json")
-        run_record.config.update(qa_concurrency=execution_spec.qa_concurrency,
+        run_record.config.update(sample_concurrency=execution_spec.sample_concurrency,
+                                 qa_concurrency=execution_spec.qa_concurrency,
+                                 qa_per_sample=execution_spec.qa_per_sample,
                                  judge_concurrency=execution_spec.judge_concurrency)
         storage.write_run_record(run_dir, run_record)
         storage.write_json_record(run_dir, "records/execution_spec.json", cases_payload["execution_spec"])
@@ -1481,6 +1515,8 @@ def main(argv: list[str] | None = None) -> None:
         memory_plugin_id=str(run_contract["selection"].get("memory_plugin_id") or "") or None,
         run_contract=run_contract,
         version_selection=run_record.version_selection,
+        sample_environments=(json.loads(args.sample_runtime_config.read_text())
+                             if args.sample_runtime_config else {}),
     )
 
     trace_runtime = None

@@ -46,11 +46,15 @@ def _conversation_event(sample: dict, session_key: str) -> dict:
     conversation = sample.get("conversation", {})
     messages = []
     for turn in conversation.get(session_key, []):
+        content = str(turn.get("text", ""))
+        caption = turn.get("blip_caption")
+        if isinstance(caption, str) and caption.strip():
+            content += f" [shares {caption.strip()}]"
         messages.append(
             {
                 "role": "user" if not messages else "assistant",
                 "speaker": str(turn.get("speaker", "")),
-                "content": str(turn.get("text", "")),
+                "content": content,
                 "dia_id": str(turn.get("dia_id", "")),
             }
         )
@@ -61,8 +65,8 @@ def _conversation_event(sample: dict, session_key: str) -> dict:
         f"{session_key} @ {conversation.get(f'{session_key}_date_time', '')}",
     ]
     formatted_lines.extend(
-        f"[{turn.get('dia_id', '')}] {turn.get('speaker', '')}: {turn.get('text', '')}"
-        for turn in conversation.get(session_key, [])
+        f"[{message['dia_id']}] {message['speaker']}: {message['content']}"
+        for message in messages
     )
     return {
         "event_id": session_key,

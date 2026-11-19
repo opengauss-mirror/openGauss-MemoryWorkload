@@ -26,13 +26,14 @@ def run_operation(
     inputs = request.get("inputs", {})
     if not isinstance(inputs, dict):
         inputs = {}
-    environment = _scoped_environment(environment, inputs)
     started = time.perf_counter()
     temporary_config: Path | None = None
     temporary_home: Path | None = None
     secrets = _secret_values(environment, inputs)
 
     try:
+        environment = _scoped_environment(environment, inputs)
+        secrets = _secret_values(environment, inputs)
         cli_environment, temporary_config, temporary_home = _prepare_cli_environment(environment)
         if action == "ingest":
             result = _run_ingest(request, inputs, environment, urlopen, secrets)
@@ -441,6 +442,24 @@ def _scoped_environment(environment: dict[str, str], inputs: dict[str, Any]) -> 
     if not isinstance(operation, dict):
         operation = {}
     scope_id = str(inputs.get("scope_id") or operation.get("scope_id") or "").strip()
+    mapping_path = environment.get("OPENVIKING_SCOPE_USERS_FILE")
+    if mapping_path:
+        try:
+            users = json.loads(Path(mapping_path).read_text(encoding="utf-8"))
+            if not isinstance(users, dict) or not users:
+                raise ValueError
+            identities = [entry["user_id"] for entry in users.values()]
+            keys = [entry["api_key"] for entry in users.values()]
+            if any(not isinstance(value, str) or not value.strip() for value in identities + keys):
+                raise ValueError
+            if len(set(identities)) != len(identities) or len(set(keys)) != len(keys):
+                raise ValueError
+            binding = users[scope_id]
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise ValueError("Invalid OpenViking scope user file or missing scope binding") from exc
+        environment = dict(environment, OPENVIKING_USER_ID=binding["user_id"],
+                           OPENVIKING_API_KEY=binding["api_key"])
+        environment.pop("OPENVIKING_ROOT_API_KEY", None)
     if not scope_id:
         return environment
     scoped = dict(environment)

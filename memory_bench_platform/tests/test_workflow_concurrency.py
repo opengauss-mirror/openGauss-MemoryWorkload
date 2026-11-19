@@ -1,3 +1,4 @@
+from pathlib import Path
 from threading import Barrier, Lock
 import json
 import time
@@ -182,6 +183,18 @@ def test_cli_overrides_scenario_and_preserves_defaults():
     assert _execution_options(args).judge_concurrency == 4
     with pytest.raises(ValueError, match="qa-concurrency 1"):
         _execution_options(args, {"qa_concurrency": 2})
+
+
+def test_plugin_cli_allows_parallel_qa_only_with_sample_bindings():
+    args = build_parser().parse_args([
+        "run", "--benchmark", "locomo", "--agent", "openclaw", "--memory-integration", "agent_plugin",
+        "--sample-concurrency", "10", "--qa-concurrency", "4", "--judge-concurrency", "4",
+    ])
+    with pytest.raises(ValueError, match="dedicated runtime bindings"):
+        _execution_options(args)
+    args.sample_runtime_config = Path("sample-runtimes.json")
+    spec = _execution_options(args)
+    assert (spec.sample_concurrency, spec.qa_concurrency, spec.judge_concurrency) == (10, 4, 4)
 
 
 def test_plan_cli_reports_requested_concurrency(capsys):

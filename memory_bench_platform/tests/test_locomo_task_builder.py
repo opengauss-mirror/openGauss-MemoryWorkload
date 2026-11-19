@@ -110,8 +110,8 @@ def test_composer_builds_agent_plugin_workflow_with_generic_actions(tmp_path: Pa
         "prepare",
         "set_phase",
         "commit",
-        "commit",
         "wait_ready",
+        "commit",
         "wait_ready",
         "set_phase",
     ]
@@ -119,6 +119,8 @@ def test_composer_builds_agent_plugin_workflow_with_generic_actions(tmp_path: Pa
         step for step in steps
         if step["operator_kind"] == "memory_plugin" and step["inputs"].get("action") == "commit"
     ]
+    for step in commit_steps:
+        assert step["depends_on"] == [step["step_id"].removesuffix("-commit") + "-agent-ingest"]
     assert commit_steps[0]["inputs"]["session_handle"] == {
         "$ref": "steps.conv-1-stage-1-plugin-setup-session-1-agent-ingest.output.session_handle"
     }
@@ -134,3 +136,24 @@ def test_composer_builds_agent_plugin_workflow_with_generic_actions(tmp_path: Pa
         memory_id="openviking",
         memory_plugin_id="openclaw-openviking",
     )
+
+
+def test_caption_is_ingested_once_in_both_modes(tmp_path):
+    sample = _sample("conv-1")
+    turn = sample["conversation"]["session_1"][0]
+    turn.update(blip_caption=" a photo of a cup ", img_url=["https://example.invalid/private"], query="crawler-only")
+    sample["conversation"]["session_2"][0]["blip_caption"] = "  "
+    dataset = _write_dataset(tmp_path / "locomo.json", [sample])
+    for mode in ("backend_direct", "agent_plugin"):
+        scenario, plan = _compose(dataset, mode)
+        event = scenario.samples[0].timeline[0]
+        assert event.payload["messages"][0]["content"] == turn["text"] + " [shares a photo of a cup]"
+        if mode == "backend_direct":
+            histories = [s["inputs"]["content"] for s in plan["steps"] if s["inputs"].get("action") == "ingest"]
+        else:
+            histories = [s["inputs"]["messages"][0]["content"] for s in plan["steps"]
+                         if s["inputs"].get("metadata", {}).get("purpose") == "memory_ingest"]
+        assert histories[0] == event.payload["content"]
+        assert histories[0].count("a photo of a cup") == 1
+        assert "example.invalid" not in histories[0] and "crawler-only" not in histories[0]
+        assert histories[1].endswith("[d2] B: second-session-private-text")

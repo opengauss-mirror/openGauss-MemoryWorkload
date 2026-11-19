@@ -591,8 +591,8 @@ python -m memory_bench_platform.cli run \
 `qa_concurrency` / `judge_concurrency`，显式 CLI 参数优先。
 
 - 仅具有独立 session 的标准 QA case 在同一 sample/checkpoint 内并发；每题内部仍先召回、后回答。
-- 历史写入、compact 和 readiness 保持顺序；下一 checkpoint 或 sample 开始前等待全部 QA 和评分结束。
-- `agent_plugin` 不接受大于 `1` 的 `--qa-concurrency`；此阶段没有并发调用共享插件 runtime。
+- 历史写入、compact 和 readiness 在样本内保持顺序；下一 checkpoint 前等待该样本的 QA 和评分结束。默认样本串行；跨样本并发见下文。
+- `agent_plugin` 支持独立样本之间并发 QA：设置 `--sample-concurrency` 大于 1 并提供 `--sample-runtime-config` 后，`--qa-concurrency` 控制全局上限，每个 Gateway 默认同时最多一题。oGMemory HTTP 模式可用 `--qa-per-sample 4 --qa-concurrency 4` 开启同一 conversation 内的四题并发。
 - Judge 队列独立且提交数量有界，某题评分失败保留原始回答并记为未评分，不丢弃其他结果。
 - 完成顺序不影响最终报告排序。`records/execution_spec.json` 和 run 配置记录并发设置；
   `records/case-progress/` 在每题执行及评分结束后原子保存进度，异常中断后可用于排查，
@@ -664,3 +664,9 @@ Hindsight 官方 OpenClaw 插件的 `agent_plugin` 模式及独立运行要求�
 JiuwenMemory `backend_direct` 使用原生同步抽取和召回，配置与命令见 [JiuwenMemory 接入说明](docs/jiuwenmemory-backend-direct.md)。
 
 OpenClaw + JiuwenMemory 通过统一 `cli run --memory-integration agent_plugin` 使用 v0.2.1 官方 MCP 和 Agent 主动检索，见 [MCP 接入说明](docs/jiuwenmemory-mcp.md)。
+
+### 跨样本并发
+
+原生测试可使用 `--sample-concurrency 2`，默认 1；OpenClaw agent_plugin 需额外提供独立样本运行绑定 `--sample-runtime-config`。
+样本内继续顺序写入并等待就绪，QA/Judge 并发是全局上限。
+配置、隔离要求及 Token/性能统计边界见 [跨样本并发说明](docs/sample-concurrency.md)。

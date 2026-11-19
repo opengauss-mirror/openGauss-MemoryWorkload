@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 PLUGIN = "og-memory-context-engine"
@@ -147,6 +148,38 @@ def wait_gateway(config):
     raise TimeoutError("Dedicated OpenClaw Gateway did not become ready")
 
 
+class SettledHistoryFailure(RuntimeError):
+    """A failed write with no pending work; QA still needs a verified phase switch."""
+
+
+def idle_after_failure(base, state, sid):
+    receipt = backend(base, "/api/v1/call/wait_until_idle",
+                      {"sessionId": sid, "timeoutSeconds": 5, "drainOutbox": False, "waitOutbox": True},
+                      state["identity"], timeout=10)
+    outbox = receipt.get("outbox") or {}
+    return (receipt.get("idle") is True and not outbox.get("error")
+            and outbox.get("supported") is not False and outbox.get("total") == 0)
+
+
+def confirmed_prepare_failure(container, start):
+    # One serial compact RPC per dedicated sample Gateway. Only accept its explicit
+    # terminal receipt, never an HTTP timeout, a legacy fallback, or an older log.
+    logs = subprocess.run(["docker", "logs", "--since", start, container],
+                          capture_output=True, text=True, timeout=10)
+    if logs.returncode:
+        return False
+    marker = "[og-memory] HTTP 500 from prepare_compaction, body: "
+    bodies = [line.split(marker, 1)[1] for line in (logs.stdout + "\n" + logs.stderr).splitlines()
+              if marker in line]
+    if len(bodies) != 1:
+        return False
+    try:
+        receipt = json.loads(bodies[0])
+    except ValueError:
+        return False
+    return isinstance(receipt, dict) and (receipt.get("request_status"), receipt.get("retry_action")) == ("FAILED", "manual_review")
+
+
 def commit(path, state, inputs):
     """Invoke the native context engine on the actual Gateway transcript."""
     if state.get("phase") != "ingest" or inputs.get("scope_id") != state["scope_id"]:
@@ -160,7 +193,9 @@ def commit(path, state, inputs):
     if not sid or not key:
         raise ValueError("Compact requires the actual Gateway session ID and key")
     # Run the CLI inside the owned container, using its existing config/auth.
-    proc = subprocess.run(["docker", "exec", gateway_container(path), "openclaw",
+    container = gateway_container(path)
+    started = str(time.time())
+    proc = subprocess.run(["docker", "exec", container, "openclaw",
         "gateway", "call", "sessions.compact", "--params", json.dumps({"key": key}),
         "--json", "--timeout", "600000"], check=True, capture_output=True,
         text=True, timeout=630)
@@ -170,6 +205,12 @@ def commit(path, state, inputs):
     except json.JSONDecodeError:
         result = json.loads(text[text.find("{"):text.rfind("}") + 1])
     if not isinstance(result, dict) or result.get("ok") is not True or result.get("compacted") is not True:
+        if (isinstance(result, dict) and result.get("key") == key and result.get("compacted") is False
+                and confirmed_prepare_failure(container, started)):
+            config = json.loads(path.with_name("openclaw.json").read_text())
+            base = config["plugins"]["entries"][PLUGIN]["config"]["memoryApiBaseUrl"]
+            if idle_after_failure(base, state, sid):
+                raise SettledHistoryFailure("prepare_compaction failed; scoped backend is idle")
         raise RuntimeError("Native sessions.compact did not confirm compaction")
     if result.get("key") != key:
         raise RuntimeError("Native compact returned a different Gateway session key")
@@ -202,10 +243,18 @@ def wait_ready(base, state, inputs):
         return budget
 
     def request(path, payload, **kwargs):
-        budget = remaining()
-        result = backend(base, path, payload, identity, timeout=min(60, budget), **kwargs)
-        remaining()
-        return result
+        while True:
+            budget = remaining()
+            try:
+                result = backend(base, path, payload, identity, timeout=min(60, budget), **kwargs)
+            except (TimeoutError, urllib.error.URLError) as exc:
+                # Only readiness reads are retried; compact is never submitted here.
+                if not isinstance(exc, TimeoutError) and not isinstance(exc.reason, TimeoutError):
+                    raise
+                time.sleep(min(interval, remaining()))
+                continue
+            remaining()
+            return result
 
     def archived_session(path):
         context = request(path + "/context", {}, method="GET")
@@ -235,6 +284,8 @@ def wait_ready(base, state, inputs):
                               {**body, "drainOutbox": True})
             drain = drained.get("drain") or {}
             if int(drain.get("failed", 0)) or int(drain.get("moved_to_dlq", 0)):
+                if idle_after_failure(base, state, sid):
+                    raise SettledHistoryFailure("Compacted session indexing failed; scoped backend is idle")
                 raise RuntimeError("Compacted session indexing failed")
             settled = request("/api/v1/call/wait_until_idle",
                               {**body, "waitOutbox": True})
@@ -254,9 +305,13 @@ def wait_ready(base, state, inputs):
         time.sleep(min(interval, remaining()))
 
 
-def check_ogmemory_hook_errors(text, phase=None):
-    failures = [line for line in text.splitlines()
+def hook_failures(text):
+    return [line for line in text.splitlines()
                 if "[og-memory]" in line and any(marker in line.lower() for marker in ("http ", "failed", "compose returned null"))]
+
+
+def check_ogmemory_hook_errors(text, phase=None):
+    failures = hook_failures(text)
     if failures:
         details = [m.group(0) for line in failures
                    if (m := re.search(r"HTTP (?:[0-9]+ from )?[a-z_]+|compose returned null|failed", line, re.I))]
@@ -369,7 +424,18 @@ def check_after_agent(path, inputs):
                     "No successful native assemble receipt for this QA session; recall unverified"
                 ) from exc
             text = logs.stdout + "\n" + logs.stderr
-            check_ogmemory_hook_errors(text, phase)
+            if context.get("concurrent_qa"):
+                # Some native errors carry no session identity. Never assign those to
+                # a question based only on an overlapping Docker log time window.
+                expected = {sid, context["expected_session_key"]}
+                own = []
+                for line in hook_failures(text):
+                    ids = re.findall(r"\b(?:sessionKey|sessionId)=([^,\s]+)", line)
+                    if expected.intersection(ids):
+                        own.append(line)
+                check_ogmemory_hook_errors("\n".join(own), phase)
+            else:
+                check_ogmemory_hook_errors(text, phase)
             if phase != "qa":
                 return {"checked": True, "phase": phase}
             try:
@@ -434,6 +500,10 @@ def run(request):
         output = {"context_engine": PLUGIN, "phase_control": "native_autoCapture_autoRecall"}
     elif action == "before_agent":
         output = before_agent(path, config, state, inputs["agent_request"])
+        if output["phase"] == "qa" and request["runtime_context"].get("concurrent_plugin_qa"):
+            if transport != "http":
+                raise ValueError("Concurrent oGMemory QA requires the dedicated HTTP Gateway")
+            output["concurrent_qa"] = True
     elif action == "after_agent":
         output = after_agent(path, inputs)
     elif action == "prepare":
@@ -482,8 +552,20 @@ def run(request):
             phase = inputs.get("phase")
             if phase not in ("ingest", "qa"):
                 raise ValueError("phase must be ingest or qa")
+            recovering = inputs.get("recover_read_only") is True
+            if recovering and (phase != "qa" or inputs.get("scope_id") != state["scope_id"] or transport != "http"):
+                raise ValueError("Read-only recovery requires the same scoped HTTP Gateway")
+            started = str(time.time())
             configure(path, config, state, phase)
             output = {"phase": phase, "autoCapture": phase == "ingest", "autoRecall": phase == "qa"}
+            if recovering:
+                # configure restarted this Gateway and waited for /readyz. Verify
+                # the new process loaded the native context engine, not just HTTP.
+                logs = subprocess.run(["docker", "logs", "--since", started, gateway_container(path)],
+                                      check=True, capture_output=True, text=True, timeout=10)
+                if f"http server listening (1 plugin: {PLUGIN};" not in (logs.stdout + "\n" + logs.stderr):
+                    raise RuntimeError("Restarted Gateway did not confirm the native oGMemory plugin")
+                output["read_only_verified"] = True
         elif action == "commit":
             output = commit(path, state, inputs)
         elif action == "wait_ready":
