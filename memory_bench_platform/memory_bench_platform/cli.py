@@ -598,8 +598,43 @@ def _archive_run_failure(
     write_case_results(run_dir, [])
 
 
+def _sample_finalize_plans(cases, steps):
+    owners = {}
+    plans = {}
+    for case in cases:
+        sample = case.source_metadata.get("sample_id") or case.reference.get("sample_id")
+        owners[case.case_id] = sample
+        counts = plans.setdefault(sample, {"planned_writes": 0, "planned_qa": 0})
+        if case.reference.get("evaluation_target") == "qa_answer":
+            counts["planned_qa"] += 1
+    for step in steps:
+        if step.operator_kind == "agent" and step.inputs.get("metadata", {}).get("purpose") == "memory_ingest":
+            plans[owners[step.case_id]]["planned_writes"] += 1
+    return plans
+
+
+def _planned_verification_totals(sample_payloads):
+    outputs = [payload["output"] for payload in sample_payloads.values()]
+    totals = {}
+    for section, denominator, counters in (
+        ("ingest_verification", "planned", ("verified",)),
+        ("recall_verification", "planned_qa", ("verified", "unverified", "checked_qa", "tool_called", "with_evidence")),
+    ):
+        rows = [output.get(section, {}) for output in outputs]
+        if not rows or not all(denominator in row and "verified" in row for row in rows):
+            continue
+        counts = {key: sum(row[key] for row in rows) for key in (denominator, *counters)
+                  if all(key in row for row in rows)}
+        planned = counts[denominator]
+        counts["coverage"] = counts["verified"] / planned if planned else None
+        if "tool_called" in counts:
+            counts["tool_call_coverage"] = counts["tool_called"] / planned if planned else None
+        totals[section] = counts
+    return totals
+
+
 def _run_plugin_finalize(
-    runtime_context: WorkflowRuntimeContext,
+    runtime_context: WorkflowRuntimeContext, *, sample_plans=None, finalize_inputs=None,
 ) -> tuple[
     dict | None,
     CaseRecord | None,
@@ -648,13 +683,16 @@ def _run_plugin_finalize(
             child_context = runtime_context.model_copy(update={"sample_environments": {}})
             for sample in runtime_context.sample_environments:
                 with sample_runtime_environment(runtime_context, sample):
-                    sample_payloads[sample] = _run_plugin_finalize(child_context)[0]
+                    sample_payloads[sample] = _run_plugin_finalize(
+                        child_context, finalize_inputs=sample_plans.get(sample, {"planned_writes": 0, "planned_qa": 0})
+                        if sample_plans is not None else None,
+                    )[0]
             success = all(p.get("status") == "ok" and p.get("state") == "completed"
                           for p in sample_payloads.values())
             payload = {"protocol_version": "memory-plugin/1",
                        "status": "ok" if success else "failed",
                        "state": "completed" if success else "failed",
-                       "output": {"samples": sample_payloads},
+                       "output": {"samples": sample_payloads, **(_planned_verification_totals(sample_payloads) if success else {})},
                        "artifacts": [a for p in sample_payloads.values() for a in p.get("artifacts", [])],
                        "error": {} if success else {"message": "One or more sample runtimes failed to finalize"}}
         else:
@@ -663,7 +701,7 @@ def _run_plugin_finalize(
                 MemoryPluginTaskInput(
                     task_id=step_id,
                     action="finalize",
-                    inputs={},
+                    inputs=finalize_inputs or {},
                     runtime_context=runtime_context,
                     idempotency_key=f"{runtime_context.run_id}:memory-plugin-finalize",
                 ),
@@ -1601,7 +1639,10 @@ def main(argv: list[str] | None = None) -> None:
                     lifecycle_result,
                     lifecycle_traces,
                     lifecycle_metric,
-                ) = _run_plugin_finalize(runtime_context)
+                ) = _run_plugin_finalize(
+                    runtime_context,
+                    sample_plans=_sample_finalize_plans(cases, steps) if runtime_context.sample_environments else None,
+                )
         finally:
             token_collectors.finish(collection_run)
             if token_usage.enabled():
