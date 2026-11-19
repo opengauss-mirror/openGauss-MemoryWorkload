@@ -217,7 +217,8 @@ def test_before_agent_validates_selected_agent(dedicated_gateway, monkeypatch, m
         assert not calls
 
 
-@pytest.mark.parametrize('fault', [None, 'hook', 'write', 'unavailable', 'empty_answer', 'wrong_session'])
+@pytest.mark.parametrize('fault', [None, 'Auto-recall timed out', 'Auto-recall aborted',
+    'error recalling', 'auto-recall failed', 'auto-recall error', 'write', 'unavailable', 'empty_answer', 'wrong_session'])
 def test_qa_missing_receipt_releases_only_verified_read_only_request(dedicated_gateway, monkeypatch, tmp_path, fault):
     import json
     from types import SimpleNamespace
@@ -232,7 +233,8 @@ def test_qa_missing_receipt_releases_only_verified_read_only_request(dedicated_g
     monkeypatch.setattr(m.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(m.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     inspect = m.subprocess.run
-    log_text = 'Auto-recall timed out' if fault == 'hook' else ''
+    recall_failure = fault in ('Auto-recall timed out', 'Auto-recall aborted', 'error recalling', 'auto-recall failed', 'auto-recall error')
+    log_text = fault if recall_failure else ''
 
     def docker(command, **kwargs):
         if command[1] == 'logs':
@@ -264,11 +266,26 @@ def test_qa_missing_receipt_releases_only_verified_read_only_request(dedicated_g
                 'gateway_session_key': 'wrong' if fault == 'wrong_session' else pending['session_key']}},
         })
 
+    if recall_failure:
+        config_path = runtime / 'openclaw.json'
+        config = json.loads(config_path.read_text())
+        config['plugins']['entries'][m.PLUGIN]['config'].update(autoRetain=False, autoRecall=True, bankId='bank1')
+        m.save(config_path, config)
+        state = json.loads(phase.read_text())
+        m.save(phase, {**state, 'config_sha256': m.digest(config_path)})
+        restarts = []
+        monkeypatch.setattr(m, 'configure', lambda path, config, state, phase: restarts.append(phase))
     pending = before('q16')
     if fault:
         with pytest.raises((RuntimeError, ValueError)):
             after(pending)
-        assert json.loads(phase.read_text())['pending'] == pending
+        if recall_failure:
+            assert restarts == ['qa'] and json.loads(phase.read_text())['pending'] is None
+            log_text = 'perf: before_prompt_build results=0'
+            assert after(before('q17'))['output']['recall_verified']
+            assert call('set_phase', phase='ingest')['output']['phase'] == 'ingest'
+        else:
+            assert json.loads(phase.read_text())['pending'] == pending
         return
 
     first = after(pending)['output']
@@ -282,3 +299,71 @@ def test_qa_missing_receipt_releases_only_verified_read_only_request(dedicated_g
         'verified': 1, 'unverified': 1, 'checked_qa': 2, 'coverage': 0.5,
     }
     assert json.loads(phase.read_text())['active'] is False
+
+
+def test_concurrent_bank_reads_keep_question_receipts_separate(dedicated_gateway, tmp_path, monkeypatch):
+    runtime, _, _, _, _ = dedicated_gateway
+    owner = str(tmp_path / 'run')
+    m.save(runtime/'phase.json', {'active': True, 'owner': owner, 'scope_id': 's', 'phase': 'qa',
+           'gateway_ready': True, 'config_sha256': m.digest(runtime/'openclaw.json'), 'bank_id': 'bank'})
+    monkeypatch.setenv('OPENCLAW_AGENT_ID','main')
+    monkeypatch.setattr(m,'operations',lambda *args,**kw: [])
+    ctx = {'run_dir':owner,'concurrent_plugin_qa':True}
+    def hook(action, inputs):
+        return m.run({'action':action,'inputs':inputs,'runtime_context':ctx})['output']
+    questions = [{'task_id':str(i),'metadata':{'session_key':f'q{i}','scope_id':'s','purpose':'memory_qa'}}
+                 for i in range(3)]
+    checks = [hook('before_agent', {'agent_request':q}) for q in questions]
+    for q, check in reversed(list(zip(questions,checks))):
+        handle = {'gateway_session_key':check['session_key'],'session_id':q['task_id']}
+        proof = hook('after_agent', {'agent_request':q,'check_context':check,
+                     'agent_result':{'status':'ok','output':{'session_handle':handle}}})
+        assert proof['recall_verified'] is False
+
+
+@pytest.mark.parametrize("old_settled", [True, False])
+def test_ingest_lease_recovery(dedicated_gateway, monkeypatch, tmp_path, old_settled):
+    from types import SimpleNamespace
+    runtime = dedicated_gateway[0]
+    owner = str(tmp_path)
+    m.save(runtime / "phase.json", {"active": True, "owner":owner, "scope_id":"s", "phase":"ingest",
+           "gateway_ready":True, "config_sha256":m.digest(runtime/"openclaw.json"), "bank_id":"bank1"})
+    rows = []
+    monkeypatch.setattr(m, "operations", lambda *a, **kw: list(rows))
+    def call(action, **inputs):
+        return m.run({"action":action, "runtime_context":{"run_dir":owner}, "inputs":inputs})
+    def start(key):
+        return call("before_agent", agent_request={"metadata":{"purpose":"memory_ingest",
+                    "agent_id":"main", "scope_id":"s","session_key":key}})["output"]
+    def finish(ctx, status):
+        return call("after_agent", check_context=ctx, agent_result={"status":status,
+            "output":{"session_handle":{"session_id":"unique", "gateway_session_key":ctx["session_key"]}}})
+    old = start("first")
+    with pytest.raises(ValueError, match="Agent call/session failed"):
+        finish(old, "failed")
+    original = m.subprocess.run
+    log = "perf: agent_end elapsed=1 outcome=ok bank=bank1 messages=1" if old_settled else ""
+    def docker(cmd, **kw):
+        return SimpleNamespace(stdout=log, stderr="") if cmd[1]=="logs" else original(cmd, **kw)
+    monkeypatch.setattr(m.subprocess, "run", docker)
+    if old_settled:
+        rows.append({"operation_id":"op-old","status":"completed"})
+    new = start("second")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        finish(old, "ok")
+    log = "perf: agent_end elapsed=1 outcome=ok bank=bank1 messages=3"
+    rows.append({"operation_id":"op-new","status":"completed"})
+    if old_settled:
+        assert finish(new, "ok")["output"]["retained_messages"] == 3
+    else:
+        with pytest.raises(RuntimeError, match="overlapping"):
+            finish(new, "ok")
+
+@pytest.mark.parametrize("marker", ["retain queued", "error retaining messages", "outcome=error",
+                                    "perf: agent_end outcome=ok bank=bank1 messages=1",
+                                    "perf: before_prompt_build results=0",
+                                    "injecting 1 memories into context (bank: foreign)"])
+def test_explicit_recall_error_with_conflicting_evidence_stays_blocked(marker):
+    with pytest.raises(RuntimeError) as error:
+        m.native_receipt("auto-recall failed\n" + marker, "qa", "bank1")
+    assert not isinstance(error.value, m.RecoverableRecallError)

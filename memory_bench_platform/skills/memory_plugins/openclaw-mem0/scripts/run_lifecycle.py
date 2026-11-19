@@ -141,11 +141,19 @@ def configure(path, config, state, phase):
     raise TimeoutError("Gateway did not load the official plugin with the requested phase/identity")
 
 
+class RecoverableRecallError(RuntimeError):
+    pass
+
+
+class RecallTimeout(RecoverableRecallError):
+    pass
+
+
 def native_receipt(text, phase):
     # Official 1.2.0 logs do not carry request IDs. This check is valid only with
     # an exclusive Gateway, serial calls, fresh sessions and a per-call log window.
     lines = [line for line in text.splitlines() if "openclaw-mem0:" in line]
-    if any("capture failed:" in line or "recall failed:" in line for line in lines):
+    if any("capture failed:" in line for line in lines):
         raise RuntimeError("Official Mem0 hook failed; inspect Gateway logs")
     pattern = r"auto-captured ([1-9][0-9]*) memories" if phase == "ingest" else r"injecting ([1-9][0-9]*) memories into context"
     matches = [int(m[1]) for line in lines if (m := re.search(pattern, line))]
@@ -153,6 +161,10 @@ def native_receipt(text, phase):
         raise RuntimeError("Memory capture occurred during QA")
     if len(matches) > 1:
         raise RuntimeError("Multiple native receipts in one request window; exclusive Gateway required")
+    if any("recall failed:" in line for line in lines):
+        if phase == "qa":
+            raise RecoverableRecallError("Official Mem0 recall failed; inspect Gateway logs")
+        raise RuntimeError("Official Mem0 hook failed; inspect Gateway logs")
     if phase == "qa":
         # Upstream 1.2.0 leaves its timeout timer armed even after success.
         # A timeout before injection is a failure; one after injection is that
@@ -161,7 +173,7 @@ def native_receipt(text, phase):
             if re.search(pattern, line):
                 break
             if "recall timed out" in line:
-                raise RuntimeError("Official recall exceeded its deadline")
+                raise RecallTimeout("Official recall exceeded its deadline")
     return {"native_marker": "auto-captured" if phase == "ingest" else "injecting",
             "memory_count": matches[0],
             "native_log": next(line for line in lines if re.search(pattern, line))} if matches else None
@@ -203,6 +215,28 @@ def run(request):
         return dispatch(request, path, config)
 
 
+def isolate_ingest_window(path, state):
+    previous = state.get('unsettled_ingest')
+    if not previous or state.get('overlapping_ingests'):
+        return
+    try:
+        settled = native_receipt(logs(gateway_container(path), previous["log_since"]), "ingest")
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        settled = False
+    # Once windows overlap, untagged markers cannot identify the request.
+    state['overlapping_ingests'] = not bool(settled)
+    state.pop('unsettled_ingest')
+
+
+def qa_lease_key(request):
+    inputs = request.get('inputs', {})
+    agent = inputs.get('agent_request', {})
+    if (request.get('runtime_context', {}).get('concurrent_plugin_qa')
+            and agent.get('metadata', {}).get('purpose') == 'memory_qa'):
+        return 'qa_pending:' + agent['task_id']
+    return 'pending'
+
+
 def dispatch(request, path, config):
     inputs = request.get("inputs", {})
     action = request.get("action") or inputs.get("action")
@@ -212,11 +246,12 @@ def dispatch(request, path, config):
     state = json.loads(path.read_text())
     if state.get("active") and state.get("owner") != owner:
         raise ValueError("Dedicated runtime belongs to another run")
+    lease = qa_lease_key(request)
     output, artifacts = {}, []
     if action == "validate":
         output = {"implementation": "official_mem0_openclaw", "package": "@mem0/openclaw-mem0", "version": "1.2.0"}
     elif action == "prepare":
-        if state.get("pending"):
+        if state.get("pending") or any(k.startswith("qa_pending:") for k in state):
             raise ValueError("Cannot prepare an episode during an unfinished request")
         scope = str(inputs.get("scope_id") or "").strip()
         if not scope:
@@ -248,14 +283,18 @@ def dispatch(request, path, config):
         if not state.get("active"):
             raise ValueError("prepare must run first")
         if action == "set_phase":
-            if state.get("pending"):
+            if state.get("pending") or any(k.startswith("qa_pending:") for k in state):
                 raise ValueError("Cannot change phase during an unfinished request")
             if inputs.get("phase") not in {"ingest", "qa"}:
                 raise ValueError("phase must be ingest or qa")
             if inputs["phase"] != state["phase"]:
                 configure(path, config, state, inputs["phase"])
+                state.pop("unsettled_ingest", None)
+                state.pop("overlapping_ingests", None)
             output = {"phase": state["phase"], "capture": state["phase"] == "ingest",
                       "recall": state["phase"] == "qa"}
+            if inputs.get("recover_read_only") and state["phase"] == "qa":
+                output["read_only_verified"] = state.get("gateway_ready") is True
         elif action == "before_agent":
             if not state.get("gateway_ready") or state.get("config_sha256") != hashlib.sha256(path.with_name("openclaw.json").read_bytes()).hexdigest():
                 raise ValueError("Gateway has not loaded the active configuration")
@@ -266,7 +305,7 @@ def dispatch(request, path, config):
             phase = "ingest" if meta.get("purpose") == "memory_ingest" else "qa"
             if meta.get("scope_id") != state["scope_id"] or phase != state["phase"]:
                 raise ValueError("Agent request scope/phase mismatch")
-            if state.get("pending"):
+            if state.get("pending") or state.get(lease):
                 raise ValueError("Parallel/replayed requests are not supported")
             messages = req.get("messages", [])
             if len(messages) != 1 or messages[0].get("role") != "user" or req.get("attachments"):
@@ -290,14 +329,26 @@ def dispatch(request, path, config):
             store = path.parent / f"state/agents/{agent}/sessions/sessions.json"
             if store.exists() and key in json.loads(store.read_text()):
                 raise ValueError("OpenClaw session already exists; use a fresh run/session")
-            state["pending"] = {"nonce": secrets.token_hex(16), "session_key": key,
+            if phase == "ingest":
+                isolate_ingest_window(path, state)
+            state[lease] = {"nonce": secrets.token_hex(16), "session_key": key,
                 "scope_id": state["scope_id"], "phase": phase, "log_since": str(time.time())}
-            output = dict(state["pending"])
+            output = dict(state[lease])
         elif action == "after_agent":
             context = inputs["check_context"]
-            pending = state.get("pending") or {}
+            pending = state.get(lease) or {}
             if not pending or any(context.get(k) != v for k, v in pending.items()):
                 raise ValueError("Request receipt context mismatch")
+            if pending['phase'] == 'ingest':
+                # The lock stays held during verification. A failed callback no longer owns a live lease.
+                state.update(pending=None, unsettled_ingest=pending)
+                save(path, state)
+                if state.get('overlapping_ingests'):
+                    raise RuntimeError('Ingest receipt unverified: overlapping native log windows')
+            if lease != 'pending':
+                # The matching callback owns this lease; release it even if verification fails.
+                state.pop(lease)
+                save(path, state)
             result = inputs["agent_result"]
             handle = result.get("output", {}).get("session_handle", {})
             if result.get("status") != "ok" or result.get("transport") != "http":
@@ -310,21 +361,41 @@ def dispatch(request, path, config):
             container = gateway_container(path)
             # Allow brief Docker log visibility lag without extending native recall.
             deadline = time.monotonic() + (min(timeout, 3) if pending["phase"] == "qa" else timeout)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError("No positive native Mem0 completion marker; empty results/skipped hooks cannot be verified by official 1.2.0")
-                text = logs(container, pending["log_since"], timeout=min(20, remaining))
-                proof = native_receipt(text, pending["phase"])
-                if proof and time.monotonic() < deadline:
-                    break
-                interval = 0.2 if pending["phase"] == "qa" else 1
-                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+            if lease != 'pending':
+                proof = {'recall_verified': False, 'recall_verification_reason': 'gateway_window_shared'}
+            else:
+                try:
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RecallTimeout("No positive native Mem0 completion marker; empty results/skipped hooks cannot be verified by official 1.2.0")
+                        text = logs(container, pending["log_since"], timeout=min(20, remaining))
+                        proof = native_receipt(text, pending["phase"])
+                        if proof and time.monotonic() < deadline:
+                            break
+                        interval = 0.2 if pending["phase"] == "qa" else 1
+                        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                except (RecoverableRecallError, subprocess.TimeoutExpired):
+                    settings = config["plugins"]["entries"][PLUGIN]["config"]
+                    if (state["phase"] == pending["phase"] == "qa" and state.get("gateway_ready")
+                            and settings.get("autoCapture") is False and settings.get("autoRecall") is True
+                            and settings.get("userId") == state["user_id"]
+                            and state["config_sha256"] == hashlib.sha256(path.with_name("openclaw.json").read_bytes()).hexdigest()):
+                        configure(path, config, state, "qa")
+                        state["pending"] = None
+                        save(path, state)
+                    raise
             data = {**pending, **proof, "session_id": handle["session_id"], "user_id": state["user_id"],
-                    "verification": "exclusive_serial_gateway_log_window", "package_version": "1.2.0"}
+                    "verification": "session_identity" if lease != "pending" else "exclusive_serial_gateway_log_window", "package_version": "1.2.0"}
             save(receipt, data)
-            state["pending"] = None
-            state["next_request_after"] = time.time() + (9 if pending["phase"] == "qa" else 0)
+            if pending['phase'] == 'ingest':
+                state.pop('unsettled_ingest', None)
+            if lease == 'pending':
+                state['pending'] = None
+            else:
+                state.pop(lease, None)
+            if lease == "pending":
+                state["next_request_after"] = time.time() + (9 if pending["phase"] == "qa" else 0)
             output = {"checked": True, "phase": pending["phase"], "receipt": str(receipt), **proof}
             artifacts = [{"kind": "memory_plugin_receipt", "path": str(receipt),
                           "content_type": "application/json"}]

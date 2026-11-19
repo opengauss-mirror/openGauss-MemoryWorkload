@@ -76,12 +76,21 @@ def completed(rows):
     return all(x['status'] == 'completed' for x in rows)
 
 
+class RecoverableRecallError(RuntimeError):
+    pass
+
+
 def native_receipt(text, phase, bank):
     text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-    failures = ('Auto-recall timed out', 'error recalling', 'auto-recall failed', 'auto-recall error', 'Auto-recall aborted',
-                'error retaining messages', 'retain queued', 'outcome=error', 'outcome=queued')
+    failures = ('error retaining messages', 'retain queued', 'outcome=error', 'outcome=queued')
     if any(marker in text for marker in failures):
         raise RuntimeError('Native Hindsight hook failed or queued; see archived logs')
+    recall_errors = ('Auto-recall timed out', 'Auto-recall aborted', 'error recalling',
+                     'auto-recall failed', 'auto-recall error')
+    if any(marker in text for marker in recall_errors):
+        if phase == 'qa' and not re.search(r'perf: agent_end|perf: before_prompt_build [^\n]*results=\d+|injecting \d+ memories into context', text):
+            raise RecoverableRecallError('Native Hindsight recall failed; see archived logs')
+        raise RuntimeError('Native Hindsight recall failure outside an isolated QA error')
     if phase == 'ingest':
         rows = re.findall(r'perf: agent_end [^\n]*outcome=(\w+) bank=([^\s]+) messages=(\d+)', text)
         if len(rows) > 1:
@@ -195,6 +204,32 @@ def configure(path, config, state, phase):
     raise RuntimeError('Gateway did not become healthy')
 
 
+def isolate_ingest_window(name, state, rows):
+    previous = state.get('unsettled_ingest')
+    if not previous or state.get('overlapping_ingests'):
+        return
+    try:
+        log = subprocess.run(['docker', 'logs', '--since', previous['since'], name],
+                             capture_output=True, text=True, check=True, timeout=15)
+        proof = native_receipt(log.stdout + '\n' + log.stderr, 'ingest', previous['bank_id'])
+        ids = {row['operation_id'] for row in rows}
+        settled = proof and set(previous['operation_ids']) < ids
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        settled = False
+    # Once windows overlap, untagged markers cannot identify the request.
+    state['overlapping_ingests'] = not bool(settled)
+    state.pop('unsettled_ingest')
+
+
+def qa_lease_key(request):
+    inputs = request.get('inputs', {})
+    agent = inputs.get('agent_request', {})
+    if (request.get('runtime_context', {}).get('concurrent_plugin_qa')
+            and agent.get('metadata', {}).get('purpose') == 'memory_qa'):
+        return 'qa_pending:' + agent['task_id']
+    return 'pending'
+
+
 def run(request):
     path = Path(os.environ['HINDSIGHT_PLUGIN_RUNTIME']).resolve()/'phase.json'
     owner = str(request.get('runtime_context',{}).get('run_dir') or '')
@@ -206,6 +241,7 @@ def run(request):
         if state.get('active') and state.get('owner')!=owner:
             raise ValueError('Runtime belongs to another run')
         action=request.get('action');inputs=request.get('inputs',{});output={};artifacts=[]
+        lease = qa_lease_key(request)
         if action=='validate':
             _, _, upstream, provenance = gateway(path, config)
             validate_package(upstream, provenance)
@@ -220,7 +256,7 @@ def run(request):
             output={'plugin':PLUGIN,'version':VERSION}
         elif action=='prepare':
             scope=inputs.get('scope_id')
-            if not scope or state.get('pending'):
+            if not scope or state.get('pending') or any(k.startswith('qa_pending:') for k in state):
                 raise ValueError('Fresh scope with no pending request required')
             bank='mbp-'+hashlib.sha256((owner+':'+scope).encode()).hexdigest()[:32]
             if operations(config,bank,missing=True):
@@ -228,16 +264,20 @@ def run(request):
             state={'active':True,'owner':owner,'scope_id':scope,'bank_id':bank}
             configure(path,config,state,'ingest');output={'bank_id':bank,'scope_id':scope}
         elif action in ('set_phase','finalize'):
-            if state.get('owner')!=owner or state.get('pending'):
+            if state.get('owner')!=owner or state.get('pending') or any(k.startswith('qa_pending:') for k in state):
                 raise ValueError('Cannot switch phase with foreign/unfinished request')
             phase='inactive' if action=='finalize' else inputs.get('phase')
             if phase not in ('ingest','qa','inactive'):
                 raise ValueError('Invalid phase')
             if phase!=state.get('phase'):
                 configure(path,config,state,phase)
+                state.pop("unsettled_ingest", None)
+                state.pop("overlapping_ingests", None)
             if action=='finalize':
                 state['active']=False
             output={'phase':phase}
+            if inputs.get('recover_read_only') and phase == 'qa':
+                output['read_only_verified'] = state.get('gateway_ready') is True
             if action == 'finalize':
                 checks = []
                 receipt_dir = Path(owner) / 'artifacts/memory_plugin/openclaw-hindsight'
@@ -257,14 +297,14 @@ def run(request):
             if action=='before_agent':
                 req=inputs['agent_request'];meta=req.get('metadata',{})
                 phase='ingest' if meta.get('purpose')=='memory_ingest' else 'qa'
-                if state.get('pending') or meta.get('scope_id')!=state['scope_id'] or phase!=state['phase']:
+                if state.get('pending') or state.get(lease) or meta.get('scope_id')!=state['scope_id'] or phase!=state['phase']:
                     raise ValueError('Concurrent/replayed or mismatched request')
                 if not state.get('gateway_ready') or digest(path.with_name('openclaw.json'))!=state.get('config_sha256'):
                     raise ValueError('Runtime config drift')
                 agent_id = meta.get('agent_id') or os.environ.get('OPENCLAW_AGENT_ID')
                 if agent_id != 'main':
                     raise ValueError('Only main agent supported')
-                gateway(path, config)
+                name, _, _, _ = gateway(path, config)
                 key=str(meta.get('session_key') or '').lower()
                 if not key:raise ValueError('Explicit session key required')
                 if not key.startswith('agent:'):key='agent:main:'+key
@@ -273,11 +313,23 @@ def run(request):
                 if store.exists() and key in json.loads(store.read_text()):raise ValueError('Session already exists')
                 rows=operations(config,state['bank_id'],missing=True)
                 if not completed(rows):raise ValueError('Bank still processing')
-                state['pending']={'nonce':secrets.token_hex(16),'session_key':key,'phase':phase,'bank_id':state['bank_id'],'since':str(time.time()),'operation_ids':[x['operation_id'] for x in rows]}
-                output=state['pending'].copy()
+                if phase == 'ingest':
+                    isolate_ingest_window(name, state, rows)
+                state[lease]={'nonce':secrets.token_hex(16),'session_key':key,'phase':phase,'bank_id':state['bank_id'],'since':str(time.time()),'operation_ids':[x['operation_id'] for x in rows]}
+                output=state[lease].copy()
             elif action=='after_agent':
-                pending=state.get('pending')
+                pending=state.get(lease)
                 if not pending or pending!=inputs.get('check_context'):raise ValueError('Receipt identity mismatch')
+                if pending['phase'] == 'ingest':
+                    # Persist a recoverable owner before processing the callback under lock.
+                    state.update(pending=None, unsettled_ingest=pending)
+                    save(path, state)
+                    if state.get('overlapping_ingests'):
+                        raise RuntimeError('Ingest receipt unverified: overlapping native log windows')
+                if lease != 'pending':
+                    # The matching callback owns this lease; release it even if verification fails.
+                    state.pop(lease)
+                    save(path, state)
                 result=inputs['agent_result'];handle=result.get('output',{}).get('session_handle',{})
                 if result.get('status')!='ok' or handle.get('gateway_session_key')!=pending['session_key'] or not handle.get('session_id'):
                     raise ValueError('Agent call/session failed')
@@ -285,9 +337,26 @@ def run(request):
                 is_qa = pending['phase'] == 'qa'
                 settled = False
                 while time.monotonic()<deadline:
-                    log=subprocess.run(['docker','logs','--since',pending['since'],name],capture_output=True,text=True,check=True,timeout=15)
-                    text=log.stdout+'\n'+log.stderr
-                    proof=native_receipt(text,pending['phase'],pending['bank_id'])
+                    if lease != 'pending':
+                        proof = {'recall_verified': False, 'recall_verification_reason': 'gateway_window_shared'}
+                    else:
+                        log=subprocess.run(['docker','logs','--since',pending['since'],name],capture_output=True,text=True,check=True,timeout=15)
+                        try:
+                            proof=native_receipt(log.stdout+'\n'+log.stderr,pending['phase'],pending['bank_id'])
+                        except RecoverableRecallError:
+                            settings = config['plugins']['entries'][PLUGIN]['config']
+                            expected = set(pending['operation_ids'])
+                            def bank_unchanged():
+                                rows = operations(config, pending['bank_id'], missing=False)
+                                return completed(rows) and {row['operation_id'] for row in rows} == expected
+                            if (is_qa and state['phase'] == 'qa' and settings.get('autoRetain') is False
+                                    and settings.get('autoRecall') is True and settings.get('bankId') == pending['bank_id']
+                                    and state['config_sha256'] == digest(path.with_name('openclaw.json')) and bank_unchanged()):
+                                configure(path, config, state, 'qa')
+                                if bank_unchanged():
+                                    state['pending'] = None
+                                    save(path, state)
+                            raise
                     rows=operations(config,state['bank_id'],missing=not is_qa)
                     operation_ids = {row['operation_id'] for row in rows}
                     previous_ids = set(pending['operation_ids'])
@@ -316,10 +385,15 @@ def run(request):
                 receipt=Path(owner)/'artifacts/memory_plugin/openclaw-hindsight'
                 receipt.mkdir(parents=True,exist_ok=True)
                 target=receipt/(pending['nonce']+'.json')
-                save(target,{**pending,**proof,'session_id':handle['session_id'],'native_operations':rows,'verification':'exclusive_serial_gateway_window_and_native_bank_operations'})
+                save(target,{**pending,**proof,'session_id':handle['session_id'],'native_operations':rows,'verification':('bank_operations_and_session_identity' if lease != 'pending' else 'exclusive_serial_gateway_window_and_native_bank_operations')})
                 output={'checked':True,**proof,'receipt':str(target)}
                 artifacts=[{'kind':'memory_plugin_receipt','path':str(target)}]
-                state['pending']=None
+                if pending['phase'] == 'ingest':
+                    state.pop('unsettled_ingest', None)
+                if lease == 'pending':
+                    state['pending'] = None
+                else:
+                    state.pop(lease, None)
             else:raise ValueError('Unsupported action')
         save(path,state)
         return {'status':'ok','state':'completed','operation':{},'output':output,'error':{},'artifacts':artifacts,'metrics':[]}

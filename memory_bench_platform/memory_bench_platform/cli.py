@@ -79,14 +79,11 @@ def _execution_options(args, configured=None) -> ExecutionSpec:
         if value is not None:
             values[name] = value
     spec = ExecutionSpec(**values)
-    if spec.qa_per_sample > 1:
-        if (getattr(args, "memory_integration", None), getattr(args, "memory_backend", None)) != ("agent_plugin", "ogmemory"):
-            raise ValueError("--qa-per-sample > 1 requires the oGMemory agent_plugin")
-        if spec.qa_per_sample > spec.qa_concurrency:
-            raise ValueError("--qa-per-sample cannot exceed --qa-concurrency")
+    if spec.qa_per_sample is not None and spec.qa_per_sample > spec.qa_concurrency:
+        raise ValueError("--qa-per-sample cannot exceed --qa-concurrency")
     if (getattr(args, "memory_integration", "backend_direct") == "agent_plugin"
             and spec.qa_concurrency > 1
-            and ((spec.sample_concurrency == 1 and spec.qa_per_sample == 1)
+            and ((spec.sample_concurrency == 1 and (spec.qa_per_sample or 1) == 1)
                  or (spec.sample_concurrency > 1 and not getattr(args, "sample_runtime_config", None)))):
         raise ValueError("agent_plugin requires --qa-concurrency 1 unless parallel samples have dedicated runtime bindings")
     return spec
@@ -190,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--qa-concurrency", type=_positive_int, default=None,
             help="Global concurrent QA cases (default: 1)")
         command_parser.add_argument("--qa-per-sample", type=_positive_int, default=None,
-            help="Concurrent questions per oGMemory plugin sample (default: 1)")
+            help="Concurrent questions per sample (defaults to 1 for plugins, global QA limit for direct)")
         command_parser.add_argument("--judge-concurrency", type=_positive_int, default=None,
             help="Concurrent Judges for either integration mode (default: 1)")
 
@@ -470,7 +467,9 @@ def _summarize_native_evaluation(
                     and item.inputs.get("action") == "recall" and item.case_id in qa_cases
                     and item.step_id in result_by_id and result_by_id[item.step_id].status == "passed"
                     and not result_by_id[item.step_id].structured_output.get("output", {}).get("evidence_text")}
-    degraded_cases = setup_affected | recall_failed
+    without_memory = {item.case_id for item in steps if item.case_id in qa_cases and item.step_id in result_by_id
+                      and result_by_id[item.step_id].structured_output.get("qa_degradation", {}).get("without_memory")}
+    degraded_cases = setup_affected | recall_failed | without_memory
     degraded_scores = [item.passed for item in valid_results if item.case_id in degraded_cases]
     def qa_group(ids):
         scores = [item.passed for item in valid_results if item.case_id in ids]
@@ -494,6 +493,7 @@ def _summarize_native_evaluation(
                      "degraded": qa_group(degraded_cases),
                      "setup_failed": qa_group(setup_affected),
                      "recall_failed": qa_group(recall_failed),
+                     "without_memory": qa_group(without_memory),
                      "recall_empty": qa_group(recall_empty)},
         **({"degraded_qa": {"graded": len(degraded_scores), "correct": sum(degraded_scores),
                             "accuracy": round(sum(degraded_scores) / len(degraded_scores), 4)}}

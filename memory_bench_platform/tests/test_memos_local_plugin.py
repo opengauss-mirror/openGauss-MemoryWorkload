@@ -170,7 +170,7 @@ def test_invalid_qa_preserves_proof_and_releases_only_qa_lease(tmp_path,monkeypa
     assert json.loads(Path(response['output']['receipt']).read_text())['read_audit']['unauthorized_successful_reads']==1
     assert json.loads((tmp_path/'phase.json').read_text())['pending'] is None
 
-def test_framework_keeps_invalid_qa_answer_and_tokens(tmp_path):
+def test_framework_keeps_invalid_qa_answer_and_tokens(tmp_path, monkeypatch):
     from memory_bench_platform import token_usage
     from memory_bench_platform.protocol import MemoryPluginTaskOutput, StepRecord, WorkflowRuntimeContext
     from memory_bench_platform.workflow_operators import _execute_agent
@@ -189,12 +189,18 @@ def test_framework_keeps_invalid_qa_answer_and_tokens(tmp_path):
         if req.action=='before_agent':return MemoryPluginTaskOutput(status='ok',state='completed')
         return MemoryPluginTaskOutput(status='failed',state='failed',output={'qa_valid':False},
                                      error={'type':'InvalidQARead','message':'QA invalid: history read audit failed'})
+    def isolated(_id, request):
+        assert request.messages == [{'role':'user','content':'question'}]
+        return {'status':'ok','agent_answer':'independent answer',
+                'raw':{'usage':{'prompt_tokens':4,'completion_tokens':2,'total_tokens':6}}}
+    monkeypatch.setattr('memory_bench_platform.workflow_operators._answer_without_plugin', isolated)
     with token_usage.scope({'run_dir':str(tmp_path),'run_id':'r','memory_backend':'memos'}):
         output=_execute_agent(step,'openclaw',agent,context,plugin)
-    assert output['status']=='failed'
-    assert output['agent_answer']=='retained original answer'
+    assert output['status']=='ok' and output['qa_without_plugin']
+    assert output['agent_answer']=='independent answer'
+    assert output['plugin_attempt']['agent_answer']=='retained original answer'
     assert output['plugin_checks']['after_agent']['output']['qa_valid'] is False
-    assert token_usage.rebuild(tmp_path)['observed_agent_qa_tokens']==17
+    assert token_usage.rebuild(tmp_path)['observed_agent_qa_tokens']==23
 
 
 @pytest.mark.parametrize('console,file_log', [
@@ -368,3 +374,60 @@ def test_real_http_error_runs_cleanup_and_next_qa_preserves_usage(tmp_path,monke
         assert len(failures)==1 and json.loads(failures[0].read_text())['qa_valid'] is False
     finally:
         server.shutdown();server.server_close();worker.join(timeout=5)
+
+
+def test_concurrent_memos_audits_each_question(tmp_path, monkeypatch):
+    a.save(tmp_path/'phase.json', {'owner':str(tmp_path),'scope_id':'s','phase':'qa','pending':None})
+    monkeypatch.setattr(a,'verify_exports',lambda *args: None)
+    monkeypatch.setattr(a,'db_snapshot',lambda *args: {'counts':{},'add_id':0})
+    seen=[]
+    def audit(root,state,pending,handle):
+        seen.append(handle['session_id'])
+        return {'qa_valid':True}
+    monkeypatch.setattr(a,'audit_session',audit)
+    ctx={'run_dir':str(tmp_path),'concurrent_plugin_qa':True}
+    def hook(action,inputs):
+        return a.dispatch({'action':action,'inputs':inputs,'runtime_context':ctx},tmp_path,{}, {})['output']
+    questions=[{'task_id':str(i),'metadata':{'purpose':'memory_qa','session_key':f'q{i}','scope_id':'s'}}
+               for i in range(3)]
+    checks=[hook('before_agent',{'agent_request':q}) for q in questions]
+    for q,check in reversed(list(zip(questions,checks))):
+        handle={'gateway_session_key':check['session_key'],'session_id':q['task_id']}
+        result=hook('after_agent',{'agent_request':q,'check_context':check,
+                    'agent_result':{'status':'ok','output':{'session_handle':handle}}})
+        assert result['recall']['recall_verified'] is False
+    assert seen == ['2','1','0']
+
+
+def test_failed_ingest_next_session_checks_own_sqlite_receipt(tmp_path, monkeypatch):
+    dbpath = tmp_path / 'memos/data/memos.db'
+    dbpath.parent.mkdir(parents=True)
+    key = 'openclaw::main::agent:main:'
+    with sqlite3.connect(dbpath) as db:
+        db.execute('CREATE TABLE api_logs(id INTEGER, tool_name TEXT, input_json TEXT, output_json TEXT, success INTEGER)')
+        db.execute('CREATE TABLE traces(id TEXT,session_id TEXT)')
+    monkeypatch.setattr(a, 'db_snapshot', lambda db: {'add_id': 0, 'retry_count': 0})
+    a.save(tmp_path/'phase.json', {'owner':str(tmp_path),'phase':'ingest','scope_id':'s','trace_ids':[]})
+    info = {'completion_timeout_seconds': 0, 'container':'dedicated'}
+    def call(action, **inputs):
+        return a.dispatch({'action':action,'inputs':inputs,'runtime_context':{'run_dir':str(tmp_path)}}, tmp_path, info, {})
+    def start(session):
+        return call('before_agent', agent_request={'metadata':{'session_key':session,'purpose':'memory_ingest','scope_id':'s'}})['output']
+    def finish(ctx):
+        return call('after_agent', check_context=ctx, agent_result={'status':'ok','output':{'session_handle':
+            {'session_id':'uuid','gateway_session_key':ctx['session_key']}}})
+    old = start('old')
+    with pytest.raises(TimeoutError):
+        finish(old)
+    new = start('new')
+    with pytest.raises(ValueError, match='context mismatch'):
+        finish(old)
+    with sqlite3.connect(dbpath) as db:
+        for i,session in enumerate(('old','new'),1):
+            db.execute('INSERT INTO traces VALUES (?,?)',(session,key+session))
+            db.execute('INSERT INTO api_logs VALUES (?,?,?,?,?)',(i,'memory_add',json.dumps({'sessionId':key+session}),
+                json.dumps({'details':[{'action':'stored','traceId':session}]}),1))
+    info['completion_timeout_seconds'] = 1
+    result = finish(new)['output']
+    assert json.loads((tmp_path/result['receipt']).read_text())['capture']['id'] == 2
+    assert json.loads((tmp_path/'phase.json').read_text())['trace_ids'] == ['new']
