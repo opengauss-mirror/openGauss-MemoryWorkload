@@ -55,7 +55,7 @@ def _resources_preflight(groups: tuple[DeploymentGroup, ...], docker: DockerClie
 
 
 def _service_templates(group: DeploymentGroup, rendered: dict | None = None) -> dict[str, Service]:
-    result = {"memory": group.memory_template}
+    result = {} if group.memory_template.placement == "agent" else {"memory": group.memory_template}
     for combo in group.combinations:
         base = "agent_" + combo.id.replace("-", "_")
         names = [f"{base}_{n}" for n in range(1, combo.agent_replicas + 1)] if combo.gateway_pool else [base]
@@ -298,10 +298,17 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                     raise DeploymentFailed(f"missing host environment variable: {var}")
             if service.image.archive:
                 docker.load_image((group.source_root / service.image.archive).resolve(), service.image.name)
-            # Compose may pull named images that are absent from the local cache.
+            if config.local_images_only:
+                docker.inspect_image(service.image.name)
     store = DeploymentStore(cwd)
     directory = store.create(config.name)
     state = DeploymentState(name=config.name, config_path=str(config.source_path), config_sha256=_hash(config.source_path))
+    if config.env_file:
+        from .deployment_env import input_fingerprint
+        state.input_sha256 = input_fingerprint(config)
+    if config.env_file:
+        source = (config.source_path.parent / config.env_file).resolve()
+        state.source_hashes[str(source)] = _hash(source)
     started: list[tuple[str, Path]] = []
     try:
         for group in groups:
@@ -311,8 +318,19 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 for config_file in service.config_files.values():
                     source = (group.source_root / config_file.source).resolve()
                     state.source_hashes[str(source)] = _hash(source)
+            for combo in group.combinations:
+                if combo.plugin_runtime:
+                    for relative in (combo.plugin_runtime.source_config, combo.plugin_runtime.memory_config):
+                        if relative:
+                            source = (group.source_root / relative).resolve()
+                            state.source_hashes[str(source)] = _hash(source)
             mounts = prepare_instance_configs(group, group_dir / "configs")
             rendered = render_project(group, config.name, mounts, directory)
+            if config.local_images_only:
+                for service in rendered["services"].values():
+                    service["pull_policy"] = "never"
+            from .deployment_plugins import prepare_plugin_runtimes
+            state.plugin_runtimes.update(prepare_plugin_runtimes(group, group_dir, rendered))
             for rendered_service in rendered["services"].values():
                 for mount in rendered_service.get("volumes", []):
                     if mount["type"] == "bind" and Path(mount["source"]).is_relative_to(group_dir / "state"):
@@ -431,6 +449,13 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
             drift.append(f"source config changed: {Path(path).name}")
     try:
         config = load_deployment(config_path)
+        if state.input_sha256:
+            from .deployment_env import input_fingerprint
+            if input_fingerprint(config) != state.input_sha256:
+                drift.append("deployment environment changed; redeploy")
+        from .deployment_plugins import runtime_issues
+        for binding in state.plugin_runtimes.values():
+            drift.extend(runtime_issues(binding))
         groups = {g.project_key: g for g in resolve_groups(config)}
         for group_key, project in state.projects.items():
             group = groups[group_key]

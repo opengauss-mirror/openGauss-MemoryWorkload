@@ -28,6 +28,9 @@ def _copy_service(service: Service, root: Path, destination: Path, overrides: di
         source = (root / config_file.source).resolve()
         content = source.read_text(encoding="utf-8")
         data = json.loads(content) if config_file.format == "json" else yaml.safe_load(content)
+        if config_file.expand_env:
+            from .deployment_env import expand_environment
+            data = expand_environment(data)
         for name, parameter in config_file.parameters.items():
             if name in overrides:
                 old = _pointer_value(data, parameter.pointer)

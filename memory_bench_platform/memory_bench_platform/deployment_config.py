@@ -36,7 +36,8 @@ class ConfigFile(StrictModel):
     target: str
     format: Literal["json", "yaml"]
     mode: Literal["0600", "0644"] = "0600"
-    parameters: dict[str, Parameter]
+    parameters: dict[str, Parameter] = Field(default_factory=dict)
+    expand_env: bool = False
 
 
 class Mount(StrictModel):
@@ -68,13 +69,15 @@ class Endpoint(StrictModel):
 
 
 class Service(StrictModel):
+    privileged: bool = False
     skill: str | None = None
-    image: Image
+    image: Image | None = None
+    placement: Literal["service", "agent"] = "service"
     command: list[str] | None = None
     container_port: int | None = None
     endpoint_scheme: str = "http"
     endpoints: dict[str, Endpoint] = Field(default_factory=dict)
-    healthcheck: list[str]
+    healthcheck: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     environment_from: dict[str, str] = Field(default_factory=dict)
     config_mounts: list[Mount] = Field(default_factory=list)
@@ -164,6 +167,14 @@ class SharedMemory(StrictModel):
     preparation: Preparation = Field(default_factory=Preparation)
 
 
+class PluginRuntime(StrictModel):
+    expand_env: bool = False
+    memory_config: Path | None = None
+    source_config: Path
+    upstream_plugin: Path | None = None
+    options: dict = Field(default_factory=dict)
+
+
 class Combination(StrictModel):
     id: str
     benchmark: str
@@ -178,6 +189,7 @@ class Combination(StrictModel):
     memory_integration: Literal["backend_direct", "agent_plugin"]
     data_path: Path
     entrypoint: str | None = None
+    plugin_runtime: PluginRuntime | None = None
     preparation: Preparation = Field(default_factory=Preparation)
 
     @model_validator(mode="after")
@@ -189,7 +201,15 @@ class Combination(StrictModel):
         return self
 
 
+class ExperimentOptions(StrictModel):
+    fresh: bool = False
+    cleanup_owned_deployment: bool = False
+
+
 class DeploymentConfig(StrictModel):
+    experiment: ExperimentOptions = Field(default_factory=ExperimentOptions)
+    env_file: Path | None = None
+    local_images_only: bool = False
     schema_: Literal["deployment/1"] = Field(alias="schema")
     name: str
     agents: dict[str, Service]
@@ -267,6 +287,18 @@ def _type_matches(value, kind: str) -> bool:
 
 
 def _validate_service(service: Service, root: Path, role: str):
+    if service.placement == "agent":
+        if role != "memory" or not service.skill or not service.client:
+            raise ValueError("Agent-hosted memory requires a memory skill and client")
+        if any((service.image, service.command, service.healthcheck, service.verify, service.config_files,
+                service.config_mounts, service.state_mounts, service.resources, service.environment,
+                service.environment_from, service.service_endpoints, service.endpoints)):
+            raise ValueError("Agent-hosted memory is configured by plugin_runtime, not a separate service")
+        if service.container_port is not None and not 1 <= service.container_port <= 65535:
+            raise ValueError("Invalid Agent-hosted memory port")
+        return
+    if service.image is None or not service.healthcheck:
+        raise ValueError(f"{role} service needs image and healthcheck")
     if role in ("agent", "memory") and (not service.skill or not service.client or not service.verify):
         raise ValueError(f"{role} needs skill, client and verify")
     if role in ("agent", "memory") and service.container_port is None:
@@ -281,7 +313,7 @@ def _validate_service(service: Service, root: Path, role: str):
     names = set()
     for config_file in service.config_files.values():
         target = config_file.target
-        if not config_file.parameters:
+        if not config_file.parameters and not config_file.expand_env:
             raise ValueError("config_files parameters cannot be empty")
         if not target.startswith("/") or any(target == t or target.startswith(t.rstrip('/') + '/') or t.startswith(target.rstrip('/') + '/') for t in targets):
             raise ValueError(f"overlapping config target: {target}")
@@ -293,6 +325,9 @@ def _validate_service(service: Service, root: Path, role: str):
             data = json.loads(source.read_text()) if config_file.format == "json" else yaml.safe_load(source.read_text())
         except (ValueError, yaml.YAMLError) as exc:
             raise ValueError(f"invalid config source: {source}") from exc
+        if config_file.expand_env:
+            from .deployment_env import expand_environment
+            data = expand_environment(data)
         pointers = set()
         for name, parameter in config_file.parameters.items():
             if name in names or not _ID.fullmatch(name.replace('_', '-')):
@@ -312,8 +347,17 @@ def _validate_service(service: Service, root: Path, role: str):
 
 
 def load_deployment(path: Path) -> DeploymentConfig:
+    from .deployment_env import deployment_environment
+    with deployment_environment(path):
+        return _load_deployment(path)
+
+
+def _load_deployment(path: Path) -> DeploymentConfig:
     path = path.resolve()
     raw = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueLoader)
+    if isinstance(raw, dict) and raw.get("env_file"):
+        from .deployment_env import expand_environment
+        raw = expand_environment(raw)
     config = DeploymentConfig.model_validate(raw)
     config.source_path = path
     if not _ID.fullmatch(config.name) or not config.combinations:
@@ -409,13 +453,39 @@ def load_deployment(path: Path) -> DeploymentConfig:
         graph = shared.graph if shared else combo.graph
         memory = config.memories[shared.memory if shared else combo.memory]
         agent = config.agents[combo.agent]
+        if memory.placement == "agent":
+            if (not combo.plugin_runtime or combo.memory_instance or combo.mock
+                    or any(step.enabled for step in (combo.preparation.seed, combo.preparation.readiness, combo.preparation.warmup))):
+                raise ValueError("Agent-hosted memory requires a dedicated plugin runtime without shared services or preparation steps")
+            if memory.container_port is None and "memory" in agent.service_endpoints.values():
+                raise ValueError("In-process SDK has no memory HTTP endpoint; remove the Agent memory service reference")
+            if memory.container_port == agent.container_port:
+                raise ValueError("Agent-hosted memory endpoint must differ from Gateway port")
+        if combo.plugin_runtime:
+            if combo.memory_integration != "agent_plugin" or combo.gateway_pool:
+                raise ValueError("plugin_runtime requires agent_plugin with a dedicated Agent (no gateway pool)")
+            from .deployment_plugins import deployment_adapter
+            _, adapter = deployment_adapter(agent.skill, memory.skill)
+            if adapter.get("MAX_SAMPLES"):
+                from .integration import build_benchmark_scenario
+                scenario = build_benchmark_scenario(combo.benchmark, str((root / combo.data_path).resolve()))
+                if len(scenario.samples) > adapter["MAX_SAMPLES"]:
+                    raise ValueError("This plugin requires a fresh deployment per sample; split the dataset before deployment")
+            if adapter.get("MEMORY_PLACEMENT", "service") != memory.placement:
+                raise ValueError("Memory placement does not match the plugin deployment adapter")
+            if agent.config_files or agent.config_mounts or agent.state_mounts:
+                raise ValueError("plugin_runtime owns the Agent runtime mounts")
+            for source in (combo.plugin_runtime.source_config, combo.plugin_runtime.upstream_plugin, combo.plugin_runtime.memory_config):
+                if source is not None and not (config.source_path.parent / source).exists():
+                    raise ValueError(f"plugin runtime source missing: {source}")
         if agent.client.endpoint_env == memory.client.endpoint_env:
             raise ValueError(f"client endpoint_env collision in {combo.id}")
-        if vector and "vector" not in memory.service_endpoints.values():
+        storage_consumer = agent if memory.placement == "agent" else memory
+        if vector and "vector" not in storage_consumer.service_endpoints.values():
             raise ValueError(f"memory {memory.skill} does not reference configured vector")
-        if graph and "graph" not in memory.service_endpoints.values():
+        if graph and "graph" not in storage_consumer.service_endpoints.values():
             raise ValueError(f"memory {memory.skill} does not reference configured graph")
-        if combo.memory_integration == "agent_plugin" and "memory" not in agent.service_endpoints.values():
+        if combo.memory_integration == "agent_plugin" and memory.placement == "service" and "memory" not in agent.service_endpoints.values():
             raise ValueError(f"agent {combo.agent} does not reference configured memory")
         for consumer, role, mock_ref in ((agent, "agent", combo.mock), (memory, "memory", shared.mock if shared else combo.mock)):
             for ref in consumer.service_endpoints.values():

@@ -1,0 +1,113 @@
+schema: deployment/1
+env_file: .env
+local_images_only: true
+name: ogmemory-openclaw-locomo
+agents:
+  claw:
+    skill: openclaw
+    image:
+      name: ${OPENCLAW_IMAGE}
+    command:
+    - openclaw
+    - gateway
+    - run
+    container_port: 18789
+    healthcheck:
+    - CMD
+    - node
+    - -e
+    - fetch('http://127.0.0.1:18789/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+    verify:
+      command:
+      - node
+      - -e
+      - (async()=>{if(!(await
+        fetch(process.env.MEMORY_URL+'/api/v1/health')).ok)throw Error('memory not
+        ready');console.log(JSON.stringify({version:require('/app/package.json').version,endpoints:{MEMORY_URL:process.env.MEMORY_URL},reachable:{memory:true},effective_parameters:{}}))})().catch(e=>{console.error(e.message);process.exit(1)})
+      expected_version: 2026.6.9
+    client:
+      endpoint_env: OPENCLAW_GATEWAY_URL
+    service_endpoints:
+      MEMORY_URL: memory
+memories:
+  ogmemory:
+    skill: ogmemory
+    client:
+      endpoint_env: OGMEM_API_URL
+    image:
+      name: ${MEMORY_IMAGE}
+    container_port: 8090
+    healthcheck:
+    - CMD
+    - python3
+    - -c
+    - import json,os,urllib.request,yaml,psycopg2;from pathlib import Path;h=json.load(urllib.request.urlopen('http://127.0.0.1:8090/api/v1/health',timeout=5));assert
+      h.get('status')=='ok' and h.get('agfs') is True;c=yaml.safe_load(Path('/tmp/ogmem.resolved.yaml').read_text());db=psycopg2.connect(c['vector_db']['connection_string'],connect_timeout=5);cur=db.cursor();cur.execute("SELECT
+      '[1,0]'::vector <=> '[1,0]'::vector");assert cur.fetchone()[0]==0;db.close();print(json.dumps({'version':'http-health/1','endpoints':{'VECTOR_URL':os.environ['VECTOR_URL']},'reachable':{'vector':True},'effective_parameters':{}}))
+    environment:
+      BENCH_PORT: '8090'
+      BENCH_HEALTH_PATH: /api/v1/health
+      OGMEM_CONFIG: /etc/ogmem/config.yaml
+      OPENGAUSS_HOST: vector
+      OPENGAUSS_PORT: '5432'
+      OPENGAUSS_DBNAME: postgres
+      OPENGAUSS_USER: gaussdb
+    verify:
+      command:
+      - python3
+      - -c
+      - import json,os,urllib.request,yaml,psycopg2;from pathlib import Path;h=json.load(urllib.request.urlopen('http://127.0.0.1:8090/api/v1/health',timeout=5));assert
+        h.get('status')=='ok' and h.get('agfs') is True;c=yaml.safe_load(Path('/tmp/ogmem.resolved.yaml').read_text());db=psycopg2.connect(c['vector_db']['connection_string'],connect_timeout=5);cur=db.cursor();cur.execute("SELECT
+        '[1,0]'::vector <=> '[1,0]'::vector");assert cur.fetchone()[0]==0;db.close();print(json.dumps({'version':'http-health/1','endpoints':{'VECTOR_URL':os.environ['VECTOR_URL']},'reachable':{'vector':True},'effective_parameters':{}}))
+      expected_version: http-health/1
+    environment_from:
+      LLM_BASE_URL: LLM_BASE_URL
+      LLM_MODEL: LLM_MODEL
+      LLM_API_KEY: LLM_API_KEY
+      EMBEDDING_BASE_URL: EMBEDDING_BASE_URL
+      EMBEDDING_MODEL: EMBEDDING_MODEL
+      EMBEDDING_API_KEY: EMBEDDING_API_KEY
+      EMBEDDING_DIMENSION: EMBEDDING_DIMENSION
+      OPENGAUSS_PASSWORD: DB_PASSWORD
+      OG_ROOT_API_KEY: OGMEM_API_KEY
+    service_endpoints:
+      VECTOR_URL: vector
+    config_files:
+      runtime:
+        source: configs/ogmemory.yaml
+        target: /etc/ogmem/config.yaml
+        format: yaml
+        mode: '0644'
+        expand_env: true
+    state_mounts:
+    - target: /data/agfs
+    - target: /data/chroma
+combinations:
+- id: ogmemory-openclaw
+  benchmark: locomo
+  agent: claw
+  memory: ogmemory
+  memory_integration: agent_plugin
+  data_path: ${DATA_PATH}
+  plugin_runtime:
+    source_config: configs/openclaw.json
+    expand_env: true
+    upstream_plugin: ${PLUGIN_PATH}
+  vector: database
+vectors:
+  database:
+    image:
+      name: ${OPENGAUSS_IMAGE}
+    container_port: 5432
+    state_mounts:
+    - target: /var/lib/opengauss
+    privileged: true
+    environment_from:
+      GS_PASSWORD: DB_PASSWORD
+      GS_USER_PASSWORD: DB_PASSWORD
+    healthcheck:
+    - CMD-SHELL
+    - su - omm -c "gsql -d postgres -p 5432 -c 'SELECT 1;'" >/dev/null 2>&1
+experiment:
+  fresh: true
+  cleanup_owned_deployment: true

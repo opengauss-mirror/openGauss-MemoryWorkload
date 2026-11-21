@@ -81,6 +81,7 @@ class EntryPoints(BaseModel):
     teardown: str | None = None
     server: str | None = None
     importer: str | None = None
+    deployer: str | None = None
 
 
 class SmokeEntryPoints(BaseModel):

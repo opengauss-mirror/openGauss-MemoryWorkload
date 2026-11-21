@@ -13,6 +13,9 @@ import shutil
 import sys
 import time
 
+import runpy
+validate_gateway_url = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/deployment_openclaw.py"))["validate_gateway_url"]
+
 PLUGIN = "openclaw-mem0"
 
 
@@ -160,7 +163,8 @@ def native_receipt(text, phase):
     if phase == "qa" and any("auto-captured" in line for line in lines):
         raise RuntimeError("Memory capture occurred during QA")
     if len(matches) > 1:
-        raise RuntimeError("Multiple native receipts in one request window; exclusive Gateway required")
+        error = RecoverableRecallError if phase == "qa" else RuntimeError
+        raise error("Multiple native receipts in one request window; exclusive Gateway required")
     if any("recall failed:" in line for line in lines):
         if phase == "qa":
             raise RecoverableRecallError("Official Mem0 recall failed; inspect Gateway logs")
@@ -196,8 +200,7 @@ def load_runtime():
     if os.environ.get("OPENCLAW_TRANSPORT") != "http":
         raise ValueError("Mem0 plugin requires OPENCLAW_TRANSPORT=http")
     gateway = config["gateway"]
-    if os.environ.get("OPENCLAW_GATEWAY_URL", "").rstrip("/") != f"http://127.0.0.1:{gateway['port']}":
-        raise ValueError("Gateway URL does not match dedicated runtime")
+    validate_gateway_url(config, gateway_container(path))
     if os.environ.get("OPENCLAW_GATEWAY_TOKEN") != gateway["auth"]["token"]:
         raise ValueError("Gateway token does not match dedicated runtime")
     state_dir = os.environ.get("OPENCLAW_STATE_DIR", "")

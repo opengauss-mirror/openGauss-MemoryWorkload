@@ -115,8 +115,11 @@ def validate_gateway_binding(container, config_path, state_dir):
     state = info["State"]
     config = info["Config"]
     env = dict(item.split("=", 1) for item in config["Env"])
-    if (not state["Running"] or info["HostConfig"]["NetworkMode"] != "host"
-            or (config.get("Cmd") or [])[:2] != ["gateway", "run"]):
+    command = config.get("Cmd") or []
+    if command[:1] == ["openclaw"]:
+        command = command[1:]
+    if (not state["Running"] or (info["HostConfig"]["NetworkMode"] != "host" and not os.environ.get("JIUWENMEMORY_DEPLOYMENT_RUNTIME"))
+            or command[:2] != ["gateway", "run"]):
         raise ValueError("Expected the dedicated running host-network OpenClaw Gateway")
 
     def host_path(variable):
@@ -134,6 +137,10 @@ def validate_gateway_binding(container, config_path, state_dir):
 
     if host_path("OPENCLAW_CONFIG_PATH") != config_path or host_path("OPENCLAW_STATE_DIR") != state_dir:
         raise ValueError("Gateway config and state mounts must match the Workload paths")
+    managed = os.environ.get("JIUWENMEMORY_DEPLOYMENT_RUNTIME")
+    if managed and (Path(managed).resolve() != config_path.parent or
+                    (config.get("Labels") or {}).get("memory-bench.runtime") != managed):
+        raise ValueError("Managed Gateway runtime ownership mismatch")
     started = datetime.fromisoformat(state["StartedAt"].replace("Z", "+00:00")).timestamp()
     if config_path.stat().st_mtime > started:
         raise ValueError("Restart the dedicated Gateway after editing its configuration")
@@ -144,15 +151,19 @@ def validate():
     state = Path(os.environ["OPENCLAW_STATE_DIR"]).resolve(strict=True)
     validate_gateway_binding(os.environ["JIUWEN_MCP_GATEWAY_CONTAINER"], config_path, state)
     config = json.loads(config_path.read_text())
+    managed = os.environ.get("JIUWENMEMORY_DEPLOYMENT_RUNTIME")
+    if managed:
+        helper = runpy.run_path(str(Path(__file__).resolve().parents[2] / 'scripts/deployment_openclaw.py'))
+        helper['validate_gateway_url'](config, os.environ['JIUWEN_MCP_GATEWAY_CONTAINER'])
     url = os.environ["JIUWENMEMORY_MCP_URL"]
     server = config.get("mcp", {}).get("servers", {}).get("jiuwen", {})
     port = config.get("gateway", {}).get("port", 18789)
     endpoint = urlsplit(url)
     agents = {item["id"]: item for item in config.get("agents", {}).get("list", [])}
-    if (os.environ.get("OPENCLAW_GATEWAY_URL", "").rstrip("/") != f"http://127.0.0.1:{port}"
+    if ((not managed and os.environ.get("OPENCLAW_GATEWAY_URL", "").rstrip("/") != f"http://127.0.0.1:{port}")
             or os.environ.get("OPENCLAW_TRANSPORT") != "http"
             or os.environ.get("OPENCLAW_POOL_ENABLED") == "1" or os.environ.get("OPENCLAW_SESSION_JSONL")
-            or endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1"
+            or endpoint.scheme != "http" or endpoint.hostname != ("memory" if managed else "127.0.0.1")
             or endpoint.username is not None or endpoint.query or endpoint.fragment
             or server.get("url") != url or server.get("transport") != "streamable-http"
             or set(server.get("toolFilter", {}).get("include", [])) != {"memory_add", "memory_search"}

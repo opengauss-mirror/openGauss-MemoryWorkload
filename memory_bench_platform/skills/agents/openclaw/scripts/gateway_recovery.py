@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import time
 import urllib.request
@@ -21,10 +22,9 @@ def dedicated_container(runtime_dir, container_env):
     return container
 
 
-def wait_gateway(config):
-    expected = f"http://127.0.0.1:{config['gateway']['port']}"
-    if os.environ.get("OPENCLAW_GATEWAY_URL", "").rstrip("/") != expected:
-        raise ValueError("OPENCLAW_GATEWAY_URL must match the dedicated loopback Gateway port")
+def wait_gateway(config, container):
+    helper = Path(__file__).resolve().parents[3] / "memory_plugins/scripts/deployment_openclaw.py"
+    expected = runpy.run_path(str(helper))["validate_gateway_url"](config, container)
     if os.environ.get("OPENCLAW_GATEWAY_TOKEN") != config["gateway"]["auth"]["token"]:
         raise ValueError("OPENCLAW_GATEWAY_TOKEN must match the dedicated Gateway config")
     deadline = time.monotonic() + 60
@@ -59,7 +59,7 @@ def restart_dedicated_gateway(runtime_dir, container_env, config, *, expected_pl
     container = dedicated_container(runtime_dir, container_env)
     started = str(time.time())
     subprocess.run(["docker", "restart", container], check=True, capture_output=True, timeout=90)
-    wait_gateway(config)
+    wait_gateway(config, container)
     if expected_plugin is None:
         return
     startup = operation_logs(container, started)

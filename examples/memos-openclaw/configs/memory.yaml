@@ -1,0 +1,12 @@
+version: 1
+llm:
+  provider: openai_compatible
+  endpoint: ${LLM_BASE_URL}
+  apiKey: ${LLM_API_KEY}
+  model: ${LLM_MODEL}
+  fallbackToHost: false
+embedding:
+  provider: openai_compatible
+  endpoint: ${EMBEDDING_BASE_URL}
+  apiKey: ${EMBEDDING_API_KEY}
+  model: ${EMBEDDING_MODEL}

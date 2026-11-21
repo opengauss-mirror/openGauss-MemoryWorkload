@@ -20,6 +20,7 @@ class DeploymentState(BaseModel):
     name: str
     config_path: str
     config_sha256: str
+    input_sha256: str | None = None
     ready: bool = False
     projects: dict[str, str] = Field(default_factory=dict)
     containers: dict[str, dict[str, str]] = Field(default_factory=dict)
@@ -34,6 +35,7 @@ class DeploymentState(BaseModel):
     owned_directories: list[str] = Field(default_factory=list)
     preparation: dict[str, dict] = Field(default_factory=dict)
     rollback_errors: dict[str, str] = Field(default_factory=dict)
+    plugin_runtimes: dict[str, dict] = Field(default_factory=dict)
 
 
 class DeploymentStore:

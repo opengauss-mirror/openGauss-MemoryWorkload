@@ -6,6 +6,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +27,22 @@ def _child_url(group_ports: dict[str, dict[str, int]], service_name: str, templa
 def _invoke_native(argv: list[str], *, env: dict[str, str], cwd: Path) -> int:
     result = subprocess.run([sys.executable, "-m", "memory_bench_platform.cli", *argv],
                             env=env, cwd=cwd, check=False)
-    return result.returncode
+    if result.returncode:
+        return result.returncode
+    # The native CLI archives failed/invalid evaluations without always exiting
+    # nonzero. An incorrect answer (partial) is still a valid benchmark run;
+    # missing evidence, failed setup or an unavailable judge is not.
+    try:
+        run_id = argv[argv.index("--run-id") + 1]
+        summary = json.loads((cwd / "runs" / run_id / "reports" / "summary.json").read_text())
+        valid = (summary.get("status") in {"passed", "partial"}
+                 and summary.get("run_validity", {}).get("valid", True) is True)
+    except (OSError, ValueError, IndexError, AttributeError):
+        valid = False
+    if not valid:
+        print("Native run has a missing, failed or invalid summary; see its run archive.", file=sys.stderr)
+        return 1
+    return 0
 
 
 def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: DockerClient,
@@ -65,7 +81,9 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                 for template in (agent, memory):
                     for target, source in template.client.environment_from.items():
                         env[target] = os.environ[source]
-                env[memory.client.endpoint_env] = _child_url(group_ports, "memory", memory)
+                memory_service = "agent_" + combo.id.replace("-", "_") if memory.placement == "agent" else "memory"
+                if memory.container_port:
+                    env[memory.client.endpoint_env] = _child_url(group_ports, memory_service, memory)
                 if combo.gateway_pool:
                     pool = group.gateway_pools[combo.id]
                     pool_name = "gateway_pool_" + combo.id.replace("-", "_")
@@ -75,6 +93,11 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                     env["OPENCLAW_POOL_ROUTE_PREFIX"] = f"{suite_id}:{combo.id}"
                 else:
                     env[agent.client.endpoint_env] = _child_url(group_ports, "agent_" + combo.id.replace("-", "_"), agent)
+                binding = state.plugin_runtimes.get(combo.id)
+                if binding:
+                    from .deployment_plugins import plugin_environment
+                    env.update(plugin_environment(binding, state, env[agent.client.endpoint_env],
+                                                  env.get(memory.client.endpoint_env, "")))
                 argv = ["run", "--benchmark", combo.benchmark, "--agent", agent.skill,
                         "--memory-backend", memory.skill, "--memory-integration", combo.memory_integration,
                         "--data-path", str((group.source_root / combo.data_path).resolve()),
@@ -105,7 +128,31 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                         if not target_id:
                             raise ValueError(f"unknown warmup target: {warmup.target}")
                         record["warmup"] = docker.exec_json(target_id, warmup.command)
-                    rc = invoke(argv, env=env, cwd=cwd)
+                    try:
+                        rc = invoke(argv, env=env, cwd=cwd)
+                    finally:
+                        if binding:
+                            from .deployment_plugins import runtime_issues
+                            issues = runtime_issues(binding)
+                            cid = state.containers[binding["group"]][binding["service"]]
+                            inspect = docker.inspect(cid)
+                            deadline = time.monotonic() + 60
+                            while (inspect.get("State", {}).get("Running") and
+                                   inspect.get("State", {}).get("Health", {}).get("Status") == "starting" and
+                                   time.monotonic() < deadline):
+                                time.sleep(1)
+                                inspect = docker.inspect(cid)
+                            if inspect.get("State", {}).get("Health", {}).get("Status") != "healthy":
+                                issues.append("plugin Agent is not healthy after phase restoration")
+                            if inspect.get("Id") != cid or not inspect.get("State", {}).get("Running"):
+                                issues.append("plugin Agent container stopped or replaced")
+                            if issues:
+                                raise ValueError("plugin runtime not restored: " + "; ".join(issues))
+                            # Native lifecycle phase switches may restart this owned Agent.
+                            # Accept only a surviving container with a clean, unchanged runtime.
+                            state.restart_counts[cid] = int(inspect.get("RestartCount", 0))
+                            state.start_times[cid] = inspect.get("State", {}).get("StartedAt", "")
+                            store.write_atomic(state)
                     if combo.gateway_pool:
                         names = [f"agent_{combo.id.replace('-', '_')}_{n}"
                                  for n in range(1, combo.agent_replicas + 1)]

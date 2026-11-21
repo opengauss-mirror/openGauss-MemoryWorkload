@@ -23,7 +23,7 @@ def test_quarantine_requires_matching_plugin_and_operation():
 def test_restart_requires_owned_gateway_and_exact_plugin(tmp_path, monkeypatch, owned, engine, expected, duration):
     commands = []
     monkeypatch.setenv("EXAMPLE_GATEWAY_CONTAINER", "sample-gateway")
-    monkeypatch.setattr(recovery, "wait_gateway", lambda config: commands.append("ready"))
+    monkeypatch.setattr(recovery, "wait_gateway", lambda config, container: commands.append("ready"))
 
     def docker(cmd, **kwargs):
         commands.append(cmd[1])

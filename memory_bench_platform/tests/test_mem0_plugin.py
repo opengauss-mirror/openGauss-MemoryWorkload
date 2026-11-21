@@ -31,6 +31,7 @@ def runtime(tmp_path, monkeypatch):
         "OPENCLAW_GATEWAY_TOKEN": config["gateway"]["auth"]["token"]}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(plugin, "gateway_container", lambda path: "dedicated")
+    monkeypatch.setattr(plugin, "validate_gateway_url", lambda config, container: "http://127.0.0.1:18789")
     clock = [0.0]
     def sleep(seconds):
         clock[0] += seconds
@@ -246,15 +247,19 @@ def test_ingest_lease_recovery(runtime, monkeypatch, old_settled):
             finish(life, new)
     life("set_phase", phase="qa")
 
-def test_explicit_qa_recall_error_recovers_only_its_own_session(runtime, monkeypatch):
+@pytest.mark.parametrize("log, expected", [
+    ("openclaw-mem0: recall failed: unavailable", "recall failed"),
+    ("openclaw-mem0: injecting 2 memories into context\n" * 2, "Multiple native receipts"),
+])
+def test_explicit_qa_recall_error_recovers_only_its_own_session(runtime, monkeypatch, log, expected):
     root, _, life, restarts = runtime
     life("set_phase", phase="qa")
     old = life("before_agent", agent_request=request("qa", "q1"))["output"]
-    monkeypatch.setattr(plugin, "logs", lambda *a, **kw: "openclaw-mem0: recall failed: unavailable")
+    monkeypatch.setattr(plugin, "logs", lambda *a, **kw: log)
     with pytest.raises(ValueError, match="context mismatch"):
         finish(life, {**old, "nonce": "foreign"})
     assert json.loads((root / "phase.json").read_text())["pending"] == old
-    with pytest.raises(plugin.RecoverableRecallError, match="recall failed"):
+    with pytest.raises(plugin.RecoverableRecallError, match=expected):
         finish(life, old)
     assert restarts == ["ingest", "qa", "qa"]
     new = life("before_agent", agent_request=request("qa", "q2"))["output"]

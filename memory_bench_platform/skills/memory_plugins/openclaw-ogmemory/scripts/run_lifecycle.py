@@ -566,7 +566,7 @@ def run(request):
         elif action == "commit":
             output = commit(path, state, inputs)
         elif action == "wait_ready":
-            output = wait_ready(entry["config"]["memoryApiBaseUrl"], state, inputs)
+            output = wait_ready(os.environ.get("OGMEM_API_URL") or entry["config"]["memoryApiBaseUrl"], state, inputs)
         else:
             raise ValueError(f"Unsupported action: {action}")
     if action != "finalize":

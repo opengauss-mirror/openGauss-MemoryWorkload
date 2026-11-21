@@ -143,6 +143,11 @@ def load_runtime():
     info = json.loads((root / 'runtime.json').read_text())
     if info.get('version') != VERSION or info.get('ingest_recall') != 'native_enabled':
         raise ValueError('Requires pinned 2.0.8 and explicit ingest_recall=native_enabled acknowledgment')
+    # Deployment binds actual ports/ID at run time without rewriting immutable provenance.
+    if os.environ.get('MEMOS_LOCAL_GATEWAY_CONTAINER'):
+        info = {**info, 'container': os.environ['MEMOS_LOCAL_GATEWAY_CONTAINER'],
+                'gateway_url': os.environ['OPENCLAW_GATEWAY_URL'],
+                'viewer_url': os.environ['MEMOS_LOCAL_VIEWER_URL']}
     upstream = Path(info['plugin_path'])
     package = json.loads((upstream / 'package.json').read_text())
     if package.get('name') != '@memtensor/memos-local-plugin' or package.get('version') != VERSION:

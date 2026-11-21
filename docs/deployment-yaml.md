@@ -1,5 +1,30 @@
 # Compose 部署配置
 
+可直接取得的模板和完整操作步骤见 [一键实验示例](../examples/README.md)。
+复用现有部署 YAML 即可执行 `memory-bench experiment --config deployment.yaml`；
+`--profiling-config` 现在可选，未指定时不启动性能采集。
+
+```yaml
+schema: deployment/1
+env_file: .env                 # 相对于 YAML 目录，显式加载；Shell 环境优先
+local_images_only: true        # 本地缺镜像时启动前失败，不自动拉取
+experiment:
+  fresh: true                 # 拒绝复用已有部署，不隐式删除
+  cleanup_owned_deployment: true  # 成功/失败均清理本命令创建的部署，保留报告
+```
+
+声明 `env_file` 后，部署 YAML 的值支持 `${NAME}`、`${NAME:-default}`；
+完整标量 `${NAME:int}`、`${NAME:float}`、`${NAME:bool}` 保留对应类型，
+`$${NAME}` 表示字面量 `${NAME}`。替换发生在解析后，不执行 Shell。
+`config_files` 和 `plugin_runtime` 可显式设置 `expand_env: true`，为源 JSON/YAML
+生成运行副本，源文件不变；这时 `config_files.parameters` 可以省略。
+对含密钥的配置保持默认 `0600`；`0644` 仅用于仍保留占位符、不含密钥的模板。
+`.env`、模板和有效环境输入变化会导致状态检查失败，需要重建。
+
+清理前自动归档每个自有容器最近 10000 行日志，目录 0700、日志 0600。
+已有部署不归当前实验所有，永远不会被该实验自动清理。
+`Service.privileged` 默认 false，仅在目标镜像官方部署确实要求时显式启用。
+
 `memory-bench deploy` 从一份 YAML 创建本机 Docker Compose 测试环境。需要 Docker Compose v2、可用的镜像、已存在的 Agent/Memory/Benchmark Skill 和实际测试数据。服务镜像需提供健康检查所需的程序，以及返回结构化 JSON 的只读 `verify.command`。部署命令本身不构造被测系统的配置文件；它从提供的 JSON/YAML 配置源文件生成各实例的副本。
 
 ```bash
@@ -146,3 +171,179 @@ shared_memory_instances:
 匹配时比较 collection、用户列表、每用户行数、维度、seed 版本和索引参数；服务名称及 Milvus 镜像 ID 只记录在清单中，不阻止复用。封存时记录卷内全部目录、文件内容和符号链接的 SHA-256 摘要；复用前及复制后再次校验。旧版清单没有摘要，不能复用，需要使用新的 Golden 卷名重新构建。部署开始前也会拒绝已存在的同名 Runtime 卷，避免使用或清理遗留数据。Golden 发布通过 Docker daemon 上的同名临时容器互斥；如果进程被强制终止，需确认没有构建仍在运行，再清理带 `memory-bench.golden-lock` 标签的遗留容器。换镜像后的 Runtime 卷仍须通过当前部署的健康检查和索引就绪检查。Golden 卷不完整或基线不匹配时，部署在写入前失败；需要重建基线时请使用新的 Golden 卷名。`state.json` 的 `preparation.<实例>.golden_volume` 记录本次是 `built` 还是 `reused`、Runtime 卷名及复制耗时。对于已部署的 Mem0，可从 `.memory-bench/deployments/<部署名>/state.json` 中读取 `ports.<实例>.memory["8000/tcp"]`，设为 `MEM0_API_URL=http://127.0.0.1:<端口>`，再运行 `production-mem0-sample` 的 trace replay。回放产生的写入只进入 Runtime 卷；若要再次从同一基线测试，先 `undeploy` 并重新 `deploy`，不要复用已写入的 Runtime 卷。
 
 Agent/Memory 的 `verify.command` 返回 JSON，至少包含 `version`、`endpoints`、`reachable` 和 `effective_parameters`。平台用它核对实际版本、依赖地址、连通性及允许覆盖的配置项生效值。敏感配置内容和 CLI 值不会写入状态或日志。`deploy status` 与 `run --deployment` 都复核容器、镜像、配置文件哈希和实际生效配置；发现漂移时拒绝运行。`undeploy` 仅清理部署状态记录归属的 Compose project、数据卷和生成文件。
+
+
+## Managed Agent + memory-plugin runtimes
+
+The deployment bridge is provider-neutral: it selects the memory-plugin manifest by
+`agent.skill` and `memory.skill`. Provider-specific preparation stays in that skill;
+the deployment core does not select memory systems by name.
+
+Add `plugin_runtime` to an existing `agent_plugin` combination:
+
+```yaml
+combinations:
+  - id: claw-ogmemory
+    benchmark: locomo
+    agent: claw
+    memory: ogmemory
+    memory_integration: agent_plugin
+    data_path: ./datasets/locomo-small.json
+    plugin_runtime:
+      source_config: ./configs/openclaw-source.json
+      upstream_plugin: ./vendor/ogmemory/openclaw_context_engine_plugin
+```
+
+Keep the existing `agents`, `memories`, storage, image, healthcheck and verification
+sections. The Agent must expose its gateway port and reference the memory service
+through `service_endpoints`. Remove the Agent's `config_files`, `config_mounts` and
+`state_mounts` when using `plugin_runtime`: the adapter owns its private runtime
+mounts. Paths above are relative to the deployment YAML. Source files and official
+plugin implementation are not modified. Provide model/API configuration in the
+source OpenClaw JSON; generated credential-bearing JSON files use mode 0600.
+
+Run from the same working directory throughout:
+
+```bash
+memory-bench deploy --config deployment.yaml
+memory-bench deploy status --deployment locomo-matrix
+memory-bench run --deployment locomo-matrix --combination claw-ogmemory
+memory-bench undeploy --deployment locomo-matrix
+```
+
+Use the YAML's actual `name` in place of `locomo-matrix`. `deploy` prepares the
+private runtime before starting containers. `run --deployment` binds the actual
+container ID, automatically selected loopback ports and plugin-specific variables,
+then invokes the existing native workflow. That workflow still owns ingest, QA,
+commit/readiness and finalize; deployment does not reimplement memory extraction.
+The host's memory API URL is separate from the container-internal URL.
+
+Native phase switching may restart the dedicated Agent. Its host port is selected
+automatically at deployment and explicitly pinned in Compose so Docker cannot
+reallocate it during a phase restart. If another process takes the selected port
+before startup, deployment fails and rolls back; retry the deployment. After a run, deployment
+accepts the new start timestamp only if the same container survives and the plugin
+adapter confirms an unchanged, inactive runtime. A changed base configuration or
+unfinished lifecycle makes the run fail and blocks reuse. Failed deployment rolls
+back its own containers and files; `undeploy` removes only its recorded resources.
+`undeploy` is not a deletion API for externally configured databases.
+
+### Available preparation adapters and limits
+
+| Memory system | Native integration | Deployment topology | Preparation inputs |
+|---|---|---|---|
+| oGMemory | Official context engine | Separate memory service | `source_config`, `upstream_plugin` |
+| OpenViking | Official context engine | Separate memory service | `source_config`, `upstream_plugin` |
+| Hindsight | Official plugin 1.2.0 | Separate memory service | `source_config`, `upstream_plugin` |
+| JiuwenMemory | Native OpenClaw MCP tools | Separate MCP service | `source_config`; optional `options.mcp_path` (default `/mcp`) |
+| Mem0 | Official `@mem0/openclaw-mem0@1.2.0` OSS SDK | Inside the Agent; no memory HTTP server | `source_config`, installed `upstream_plugin`; optional `top_k`, `timeout` |
+| MemOS Local | Official `@memtensor/memos-local-plugin@2.0.8` | Inside the Agent; native HTTP viewer at port 18799 | `source_config`, `upstream_plugin`, `memory_config` |
+
+Remote services use the existing `memories` service configuration. Set the
+JiuwenMemory service's main `container_port` to its MCP endpoint, not a separate
+REST API port. Its deployment creates two Agents: ingestion can only call
+`memory_add`, and QA can only call `memory_search`. No replacement plugin is installed.
+
+For **Mem0**, declare the actual embedded topology:
+
+```yaml
+memories:
+  mem0:
+    skill: mem0
+    placement: agent
+    client: {endpoint_env: MEM0_API_URL}
+```
+
+Do not specify a memory image, container port, healthcheck or a fictitious Agent
+`service_endpoints: {MEMORY_URL: memory}`. No Mem0 HTTP URL is exported: the
+unmodified official plugin uses its OSS SDK. Supply `mode: open-source` and `oss`
+settings in the source OpenClaw JSON. Use an installed
+`node_modules/@mem0/openclaw-mem0` package with its dependencies. If the SDK uses
+managed vector/graph services, declare those endpoints on the Agent and enable
+`allow_agent_storage_access`; its OSS settings must reference those actual services.
+
+For **MemOS Local**, the memory HTTP endpoint belongs to the Agent container:
+
+```yaml
+memories:
+  memos:
+    skill: memos
+    placement: agent
+    container_port: 18799
+    client: {endpoint_env: MEMOS_API_URL}
+combinations:
+  - id: claw-memos
+    benchmark: locomo
+    agent: claw
+    memory: memos
+    memory_integration: agent_plugin
+    data_path: ./datasets/one-sample.json
+    plugin_runtime:
+      source_config: ./configs/openclaw-source.json
+      upstream_plugin: ./vendor/memos-local-plugin
+      memory_config: ./configs/memos.yaml
+```
+
+`memory_config` is the official MemOS YAML containing LLM/Embedding settings;
+paths are relative to deployment.yaml. The adapter copies it into a private
+runtime, enables native lightweight mode, disables hub/telemetry and exposes the
+native viewer through the Agent's loopback-published port. It never reuses an old
+SQLite database. Its existing test adapter supports **one sample per fresh
+deployment**; datasets containing multiple samples are rejected before startup.
+After a completed run, undeploy and deploy again for the next sample. The official
+2.0.8 plugin retains native recall during ingestion, as disclosed by the existing
+adapter. QA retains its native search/read audit policy.
+
+All adapters use dedicated Agent instances and the existing memory-plugin
+lifecycle. OpenViking phase changes are applied by restarting the owned Gateway;
+compact still calls native `sessions.compact` inside that container. Hindsight
+preserves per-bank isolation and native operation receipts. Source configs and
+upstream plugin implementation are never edited. If OpenClaw would reject an
+installation owned by another UID, deployment makes a private copy with unchanged
+contents; it does not chown or chmod the shared installation. The copy is removed
+with the deployment.
+
+`plugin_runtime` cannot be combined with `gateway_pool`. This bridge does not
+claim automatic provisioning of a concurrent per-sample Gateway pool. Embedded
+memories cannot use `shared_memory_instances`, because they belong to their
+individual Agent containers. Other future plugin pairs must declare
+`entry.deployer`; unsupported pairs fail before creating containers.
+
+### Adding another memory system
+
+Declare `entry.deployer: scripts/deploy_runtime.py` in the existing memory-plugin
+manifest and implement three Python functions:
+
+1. `prepare(spec, context)` creates only the assigned `context.directory`. `spec`
+   contains absolute `source_config`, optional `upstream_plugin`, `memory_config` and `options`;
+   `context` contains the internal `memory_url`, `memory_port` and `gateway_port`.
+   An embedded SDK with no HTTP endpoint receives an empty `memory_url`. Return
+   `service` additions (`volumes`, `environment`, `labels`, optional `user`) and
+   non-secret `metadata` used by subsequent checks.
+2. `environment(binding, endpoints)` returns string environment variables for the
+   existing workflow. `endpoints` contains the actual container ID, host gateway
+   URL and host memory URL. Read secrets from the private runtime, not state.json.
+3. `issues(binding)` returns a list of problems, or an empty list only when the
+   runtime is unchanged and safely inactive. Do not ignore arbitrary config
+   changes or an unfinished phase merely to make reuse pass.
+
+Keep capture/recall policy, native hooks, receipts and cleanup semantics in the
+existing plugin lifecycle. A new provider adapter does not require changes to
+`deployment_run.py`, benchmark datasets, QA prompts or scoring.
+
+The Agent image entrypoint must honor `OPENCLAW_CONFIG_PATH` and start OpenClaw
+without replacing the generated plugin configuration. An image that bootstraps a
+fixed memory provider needs a suitable entrypoint before it can be used here.
+
+For embedded memory adapters, declare `MEMORY_PLACEMENT = "agent"` in the deployer.
+`MAX_SAMPLES = 1` can declare a native single-sample constraint; configuration
+validation uses the existing benchmark scenario builder to reject larger inputs.
+The core does not branch on provider names.
+
+Embedded SDKs do not have an independent `memory` profiling container. Their
+process resources belong to the Agent container and cannot be reported as pure
+memory-service CPU/RSS. Native phase transitions restart that container; existing
+profilers may invalidate continuous captures on restart. Functional benchmarking
+and native receipts do not imply validated continuous hardware profiling across
+those restarts. Do not compare an Agent+SDK total against a standalone service's
+CPU/RSS as if the measurement scopes were identical.

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -49,8 +50,10 @@ def _openclaw_bin() -> str:
 
 
 def _run_openclaw(*args: str, timeout: float = 60) -> str:
+    command = (["docker", "exec", _deployment_control()["gateway"](), "openclaw"]
+               if os.environ.get("OPENVIKING_DEPLOYMENT_RUNTIME") else [_openclaw_bin()])
     proc = subprocess.run(
-        [_openclaw_bin(), *args],
+        [*command, *args],
         text=True,
         capture_output=True,
         check=False,
@@ -75,14 +78,22 @@ def _parse_json_output(text: str) -> Any:
 
 
 def _config_get(path: str) -> Any:
+    if os.environ.get("OPENVIKING_DEPLOYMENT_RUNTIME"):
+        return _deployment_control()["config_action"]("get", path)
     return _parse_json_output(_run_openclaw("config", "get", path, "--json"))
 
 
 def _config_set(path: str, value: Any) -> None:
+    if os.environ.get("OPENVIKING_DEPLOYMENT_RUNTIME"):
+        _deployment_control()["config_action"]("set", path, value)
+        return
     _run_openclaw("config", "set", path, json.dumps(value), "--json")
 
 
 def _config_unset(path: str) -> None:
+    if os.environ.get("OPENVIKING_DEPLOYMENT_RUNTIME"):
+        _deployment_control()["config_action"]("unset", path)
+        return
     try:
         _config_get(path)
     except RuntimeError as exc:
@@ -459,6 +470,9 @@ def _wait_settle(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _apply_gateway_configuration() -> None:
+    if os.environ.get("OPENVIKING_DEPLOYMENT_RUNTIME"):
+        # deployment_control applies the completed phase once under its lock.
+        return
     # With reload disabled, config set only changes the file. Apply the whole
     # phase at its barrier, before allowing Agent requests into the Gateway.
     gateway = _config_get("gateway")
@@ -551,7 +565,7 @@ def _finalize(request: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def run(request: dict[str, Any]) -> dict[str, Any]:
+def _native_run(request: dict[str, Any]) -> dict[str, Any]:
     action = str(request.get("action") or "")
     if action == "validate":
         return _validate()
@@ -568,6 +582,16 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
     if action == "finalize":
         return _finalize(request)
     raise ValueError(f"unsupported memory plugin action: {action}")
+
+
+def _deployment_control():
+    return runpy.run_path(str(Path(__file__).with_name("deployment_control.py")))
+
+
+def run(request):
+    if os.environ.get("OPENVIKING_DEPLOYMENT_RUNTIME"):
+        return _deployment_control()["run"](request, _native_run)
+    return _native_run(request)
 
 
 def main() -> None:

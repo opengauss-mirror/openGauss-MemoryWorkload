@@ -51,6 +51,8 @@ def _service(template: Service, root: Path, mounts: list[dict[str, object]], net
     if ports:
         result["ports"] = ports
     volumes = list(mounts)
+    if template.privileged:
+        result["privileged"] = True
     if template.skill == "openclaw" and result["environment"].get("MEMORY_BENCH_IPV4_ONLY_HOSTS"):
         script = SKILLS_ROOT / "agents/openclaw/scripts/ipv4_provider_dns.cjs"
         volumes.append({"type": "bind", "source": str(script.resolve()),
@@ -108,7 +110,7 @@ def render_project(group: DeploymentGroup, deployment_name: str,
         result = {}
         for env, target in template.service_endpoints.items():
             if target == "memory":
-                result[env] = _url(group.memory_template, "memory")
+                result[env] = _url(group.memory_template, "127.0.0.1" if group.memory_template.placement == "agent" else "memory")
             elif target == "vector" and group.vector_template:
                 result[env] = _url(group.vector_template, "vector")
             elif target == "graph" and group.graph_template:
@@ -137,12 +139,13 @@ def render_project(group: DeploymentGroup, deployment_name: str,
     memory_deps = [name for name in ("vector", "graph") if name in services]
     if group.memory_mock_template and any(v.startswith("mock.") for v in group.memory_template.service_endpoints.values()):
         memory_deps.append(mock_memory_name)
-    services["memory"] = _service(group.memory_template, group.source_root, generated_mounts.get("memory", []),
+    if group.memory_template.placement != "agent":
+        services["memory"] = _service(group.memory_template, group.source_root, generated_mounts.get("memory", []),
                                    memory_networks, endpoint_vars(group.memory_template), memory_deps, "memory", state_root)
     for combo in group.combinations:
         base = "agent_" + combo.id.replace("-", "_")
         template = group.agents[combo.id]
-        deps = ["memory"] if combo.memory_integration == "agent_plugin" else []
+        deps = ["memory"] if combo.memory_integration == "agent_plugin" and group.memory_template.placement != "agent" else []
         storage_refs = {ref for ref in template.service_endpoints.values() if ref in ("vector", "graph")}
         deps.extend(sorted(storage_refs))
         if any(v.startswith("mock.") for v in template.service_endpoints.values()):
@@ -154,6 +157,8 @@ def render_project(group: DeploymentGroup, deployment_name: str,
         for name in names:
             services[name] = _service(template, group.source_root, generated_mounts.get(name, []),
                                       agent_network_membership, endpoint_vars(template, combo.id), deps, name, state_root)
+            if group.memory_template.placement == "agent" and group.memory_template.container_port:
+                services[name].setdefault("ports", []).append(_port(group.memory_template.container_port))
             if combo.gateway_pool:
                 services[name].pop("ports", None)
         if combo.gateway_pool:
