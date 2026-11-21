@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 
 RUNNER_PATH = Path("skills/memory_plugins/openclaw-openviking/scripts/run_lifecycle.py")
@@ -274,3 +277,38 @@ def test_plugin_accepts_generic_commit_and_wait_ready_aliases(monkeypatch, tmp_p
 
     assert runner.run(_request(tmp_path, "commit"))["action"] == "commit"
     assert runner.run(_request(tmp_path, "wait_ready"))["action"] == "wait_ready"
+
+
+@pytest.mark.parametrize("reload_mode", ["off", "hybrid"])
+def test_openviking_phase_applies_config_to_live_gateway(tmp_path, monkeypatch, reload_mode):
+    runner = _load_runner()
+    path = tmp_path / "openclaw.json"
+    gateway = {"reload": {"mode": reload_mode}}
+    config = {"autoCapture": False, "autoRecall": True}
+    path.write_text(json.dumps({"gateway": gateway}))
+    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(path))
+    monkeypatch.setattr(runner, "_config_get", lambda key: gateway if key == "gateway" else dict(config))
+    monkeypatch.setattr(runner, "_config_set", lambda key, value: config.update({key.split(".")[-1]: value}))
+    monkeypatch.setattr(runner, "_config_unset", lambda key: config.pop(key.split(".")[-1], None))
+    applied = []
+
+    def restart(runtime, container_env, settings):
+        assert runtime == tmp_path
+        assert container_env == "OPENVIKING_PLUGIN_GATEWAY_CONTAINER"
+        assert settings["gateway"] == gateway
+        applied.append((config["autoCapture"], config["autoRecall"]))
+
+    monkeypatch.setattr(runner.gateway_recovery, "restart_dedicated_gateway", restart)
+    runner.run(_request(tmp_path, "prepare"))
+    for phase in ["ingest", "qa"]:
+        runner.run(_request(tmp_path, "set_phase", {"phase": phase}))
+    runner.run(_request(tmp_path, "finalize"))
+    assert applied == ([(True, False), (False, True), (False, True)] if reload_mode == "off" else [])
+
+    if reload_mode == "off":
+        def failed_restart(*args):
+            raise TimeoutError("Gateway did not become ready")
+
+        monkeypatch.setattr(runner.gateway_recovery, "restart_dedicated_gateway", failed_restart)
+        with pytest.raises(TimeoutError, match="did not become ready"):
+            runner.run(_request(tmp_path, "set_phase", {"phase": "qa", "recover_read_only": True}))

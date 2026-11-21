@@ -16,7 +16,12 @@ import urllib.parse
 import urllib.error
 import urllib.request
 
+# Lifecycle scripts also run directly from a checkout without installing Workload.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "agents/openclaw/scripts"))
+import gateway_recovery
+
 PLUGIN = "og-memory-context-engine"
+CONTAINER_ENV = "OGMEM_GATEWAY_CONTAINER"
 
 
 def digest(value):
@@ -98,7 +103,7 @@ def backend(base, path, body, identity, *, method="POST", timeout=60):
     return result
 
 
-def configure(path, config, state, phase):
+def configure(path, config, state, phase, *, verify_native=False):
     config["agents"]["defaults"]["heartbeat"] = {"every": "0m"}
     entry = config["plugins"]["entries"][PLUGIN]["config"]
     entry.update(state.get("identity", {}))
@@ -110,42 +115,14 @@ def configure(path, config, state, phase):
     # Mark the new state usable only after the dedicated Gateway has loaded it.
     save(path, {**state, "phase": phase, "gateway_ready": False})
     if os.environ.get("OPENCLAW_TRANSPORT") == "http":
-        container = gateway_container(path)
-        subprocess.run(["docker", "restart", container], check=True, capture_output=True, timeout=90)
-        wait_gateway(config)
+        gateway_recovery.restart_dedicated_gateway(
+            path.parent, CONTAINER_ENV, config, expected_plugin=PLUGIN if verify_native else None)
         save(path, {**state, "phase": phase, "gateway_ready": True,
                     "config_sha256": hashlib.sha256(path.with_name("openclaw.json").read_bytes()).hexdigest()})
 
 
 def gateway_container(path):
-    container = os.environ.get("OGMEM_GATEWAY_CONTAINER", "")
-    if not container:
-        raise ValueError("HTTP phase switching requires OGMEM_GATEWAY_CONTAINER for a dedicated Docker Gateway")
-    result = subprocess.run(["docker", "inspect", container], check=True, capture_output=True, text=True, timeout=15)
-    info = json.loads(result.stdout)[0]
-    if (info.get("Config", {}).get("Labels") or {}).get("memory-bench.runtime") != str(path.parent):
-        raise ValueError("Gateway container must have memory-bench.runtime label matching the dedicated runtime directory")
-    if not any(Path(m.get("Source", "")).resolve() == path.parent for m in info.get("Mounts", [])):
-        raise ValueError("Gateway container must mount the dedicated runtime directory")
-    return container
-
-
-def wait_gateway(config):
-    expected = f"http://127.0.0.1:{config['gateway']['port']}"
-    if os.environ.get("OPENCLAW_GATEWAY_URL", "").rstrip("/") != expected:
-        raise ValueError("OPENCLAW_GATEWAY_URL must match the dedicated loopback Gateway port")
-    if os.environ.get("OPENCLAW_GATEWAY_TOKEN") != config["gateway"]["auth"]["token"]:
-        raise ValueError("OPENCLAW_GATEWAY_TOKEN must match the dedicated Gateway config")
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(expected + "/readyz", timeout=2) as response:
-                if response.status == 200:
-                    return
-        except OSError:
-            pass
-        time.sleep(0.5)
-    raise TimeoutError("Dedicated OpenClaw Gateway did not become ready")
+    return gateway_recovery.dedicated_container(path.parent, CONTAINER_ENV)
 
 
 class SettledHistoryFailure(RuntimeError):
@@ -161,15 +138,9 @@ def idle_after_failure(base, state, sid):
             and outbox.get("supported") is not False and outbox.get("total") == 0)
 
 
-def confirmed_prepare_failure(container, start):
-    # One serial compact RPC per dedicated sample Gateway. Only accept its explicit
-    # terminal receipt, never an HTTP timeout, a legacy fallback, or an older log.
-    logs = subprocess.run(["docker", "logs", "--since", start, container],
-                          capture_output=True, text=True, timeout=10)
-    if logs.returncode:
-        return False
+def confirmed_prepare_failure(text):
     marker = "[og-memory] HTTP 500 from prepare_compaction, body: "
-    bodies = [line.split(marker, 1)[1] for line in (logs.stdout + "\n" + logs.stderr).splitlines()
+    bodies = [line.split(marker, 1)[1] for line in text.splitlines()
               if marker in line]
     if len(bodies) != 1:
         return False
@@ -178,6 +149,41 @@ def confirmed_prepare_failure(container, start):
     except ValueError:
         return False
     return isinstance(receipt, dict) and (receipt.get("request_status"), receipt.get("retry_action")) == ("FAILED", "manual_review")
+
+
+def recover_quarantined_compact(path, state, sid, logs):
+    # A quarantined engine can even produce a successful legacy compact reply.
+    # The dedicated Gateway runs only one history commit at a time.
+    if ("[og-memory] HTTP compact error: TimeoutError" in logs and
+            gateway_recovery.engine_quarantined(logs, PLUGIN, "compact")):
+        config = json.loads(path.with_name("openclaw.json").read_text())
+        base = config["plugins"]["entries"][PLUGIN]["config"]["memoryApiBaseUrl"]
+        archive_status = "unconfirmed"
+        try:
+            context = backend(base, "/api/v1/sessions/" + urllib.parse.quote(sid, safe="") + "/context",
+                              {}, state["identity"], method="GET", timeout=5)
+            if context.get("session_id") == sid and any(
+                isinstance(row, dict) and row.get("archive_id") for row in (context.get("archives") or [])
+            ):
+                archive_status = "observed"
+        except (OSError, RuntimeError, ValueError):
+            pass  # A missing read receipt must not prevent Gateway recovery.
+        configure(path, config, state, "ingest", verify_native=True)
+        raise RuntimeError(f"Native compact timed out; archive={archive_status}; "
+                           "dedicated Gateway recovered; compact was not resubmitted")
+
+
+def native_compact(container, key):
+    proc = subprocess.run(["docker", "exec", container, "openclaw",
+        "gateway", "call", "sessions.compact", "--params", json.dumps({"key": key}),
+        "--json", "--timeout", "600000"], check=True, capture_output=True,
+        text=True, timeout=630)
+    text = proc.stdout.strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        result = json.loads(text[text.find("{"):text.rfind("}") + 1])
+    return result
 
 
 def commit(path, state, inputs):
@@ -195,18 +201,16 @@ def commit(path, state, inputs):
     # Run the CLI inside the owned container, using its existing config/auth.
     container = gateway_container(path)
     started = str(time.time())
-    proc = subprocess.run(["docker", "exec", container, "openclaw",
-        "gateway", "call", "sessions.compact", "--params", json.dumps({"key": key}),
-        "--json", "--timeout", "600000"], check=True, capture_output=True,
-        text=True, timeout=630)
-    text = proc.stdout.strip()
     try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
-        result = json.loads(text[text.find("{"):text.rfind("}") + 1])
+        result = native_compact(container, key)
+    except (subprocess.SubprocessError, ValueError):
+        recover_quarantined_compact(path, state, sid, gateway_recovery.operation_logs(container, started))
+        raise
+    logs = gateway_recovery.operation_logs(container, started)
+    recover_quarantined_compact(path, state, sid, logs)
     if not isinstance(result, dict) or result.get("ok") is not True or result.get("compacted") is not True:
         if (isinstance(result, dict) and result.get("key") == key and result.get("compacted") is False
-                and confirmed_prepare_failure(container, started)):
+                and confirmed_prepare_failure(logs)):
             config = json.loads(path.with_name("openclaw.json").read_text())
             base = config["plugins"]["entries"][PLUGIN]["config"]["memoryApiBaseUrl"]
             if idle_after_failure(base, state, sid):
@@ -555,16 +559,9 @@ def run(request):
             recovering = inputs.get("recover_read_only") is True
             if recovering and (phase != "qa" or inputs.get("scope_id") != state["scope_id"] or transport != "http"):
                 raise ValueError("Read-only recovery requires the same scoped HTTP Gateway")
-            started = str(time.time())
-            configure(path, config, state, phase)
+            configure(path, config, state, phase, verify_native=recovering)
             output = {"phase": phase, "autoCapture": phase == "ingest", "autoRecall": phase == "qa"}
             if recovering:
-                # configure restarted this Gateway and waited for /readyz. Verify
-                # the new process loaded the native context engine, not just HTTP.
-                logs = subprocess.run(["docker", "logs", "--since", started, gateway_container(path)],
-                                      check=True, capture_output=True, text=True, timeout=10)
-                if f"http server listening (1 plugin: {PLUGIN};" not in (logs.stdout + "\n" + logs.stderr):
-                    raise RuntimeError("Restarted Gateway did not confirm the native oGMemory plugin")
                 output["read_only_verified"] = True
         elif action == "commit":
             output = commit(path, state, inputs)
