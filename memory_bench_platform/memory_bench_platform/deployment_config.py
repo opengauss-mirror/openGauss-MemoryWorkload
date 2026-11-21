@@ -78,6 +78,7 @@ class Service(StrictModel):
     endpoint_scheme: str = "http"
     endpoints: dict[str, Endpoint] = Field(default_factory=dict)
     healthcheck: list[str] = Field(default_factory=list)
+    healthcheck_interval_seconds: int | None = Field(default=None, gt=0)
     environment: dict[str, str] = Field(default_factory=dict)
     environment_from: dict[str, str] = Field(default_factory=dict)
     config_mounts: list[Mount] = Field(default_factory=list)
@@ -290,7 +291,7 @@ def _validate_service(service: Service, root: Path, role: str):
     if service.placement == "agent":
         if role != "memory" or not service.skill or not service.client:
             raise ValueError("Agent-hosted memory requires a memory skill and client")
-        if any((service.image, service.command, service.healthcheck, service.verify, service.config_files,
+        if any((service.image, service.command, service.healthcheck, service.healthcheck_interval_seconds, service.verify, service.config_files,
                 service.config_mounts, service.state_mounts, service.resources, service.environment,
                 service.environment_from, service.service_endpoints, service.endpoints)):
             raise ValueError("Agent-hosted memory is configured by plugin_runtime, not a separate service")

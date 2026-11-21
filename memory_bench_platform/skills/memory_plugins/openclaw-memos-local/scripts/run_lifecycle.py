@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import posixpath
 import sqlite3
 import subprocess
@@ -213,7 +214,11 @@ def export_history(root, info, state):
     manifest = {'scope_id': state['scope_id'], 'files': files,
                 'policy_sha256': digest(policy), 'disclosure': DETAIL_DISCLOSURE}
     save(root / 'history-export.json', manifest)
-    save(Path(state['owner']) / 'artifacts/memory_plugin/openclaw-memos-local/history-export.json', manifest)
+    artifacts = Path(state['owner']) / 'artifacts/memory_plugin/openclaw-memos-local'
+    save(artifacts / 'history-export.json', manifest)
+    if info.get('serial_samples'):
+        scope_digest = hashlib.sha256(state['scope_id'].encode()).hexdigest()
+        save(artifacts / f'history-export-{scope_digest}.json', manifest)
 
 
 def verify_exports(root, state):
@@ -360,6 +365,39 @@ def configure(root, info, config, capture):
     raise TimeoutError('Dedicated Gateway / official MemOS plugin not ready')
 
 
+def make_history_removable(root):
+    history = root / 'qa-workspace/history'
+    if history.is_dir() and not history.is_symlink():
+        history.chmod(history.stat().st_mode | 0o200)
+
+
+def reset_sample(root, info, config):
+    # Stop the Gateway and its plugin daemon before touching their files.
+    memory_config = (root / 'memos/config.yaml').read_bytes()
+    subprocess.run(['docker', 'stop', '--time', '120', info['container']],
+                   check=True, capture_output=True, timeout=150)
+    make_history_removable(root)
+    keep = {'runtime.json', 'phase.json', 'openclaw.json', 'lifecycle.lock'}
+    upstream = Path(info['plugin_path'])
+    if upstream.parent == root:
+        keep.add(upstream.name)
+    for path in root.iterdir():
+        if path.name in keep:
+            continue
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    memory = root / 'memos'
+    memory.mkdir(mode=0o700)
+    with os.fdopen(os.open(memory / 'config.yaml', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+        output.write(memory_config)
+    (root / 'state').mkdir(mode=0o700)
+    config['agents']['defaults']['workspace'] = '/runtime/workspace'
+    # Managed deployments start with an implicit main agent.
+    config['agents'].pop('list', None)
+
+
 def session_key(request):
     meta = request.get('metadata', {})
     agent = str(meta.get('agent_id') or os.environ.get('OPENCLAW_AGENT_ID') or 'main').lower()
@@ -401,21 +439,33 @@ def _dispatch(request, root, info, config):
     if action == 'validate':
         output = {'implementation': 'official_memos_local', 'version': VERSION, 'ingest_recall': 'native_enabled', 'memory_algorithm': 'native_lightweight', 'detail_tool': DETAIL_DISCLOSURE}
     elif action == 'prepare':
-        if state.get('owner'):
-            raise ValueError('One scope per dedicated runtime; cannot repeat prepare')
-        if any(db_snapshot(db)['counts'].values()):
-            raise ValueError('Runtime memory is not empty')
         scope = inputs.get('scope_id')
         if not scope:
             raise ValueError('scope_id required')
+        previous_scope = state.get('scope_id')
+        completed_scopes = state.get('completed_scopes', [])
+        if state.get('owner'):
+            if (not info.get('serial_samples') or state.get('phase') != 'qa'
+                    or scope == previous_scope or scope in completed_scopes):
+                raise ValueError('Cannot repeat prepare for the active or a completed sample')
+            if state.get('pending') or any(key.startswith('qa_pending:') for key in state):
+                raise ValueError('Unfinished request prevents switching samples')
+            reset_sample(root, info, config)
+            completed_scopes = [*completed_scopes, previous_scope]
+        if any(db_snapshot(db)['counts'].values()):
+            raise ValueError('Runtime memory is not empty')
         state = {'owner': owner, 'scope_id': scope, 'phase': 'ingest', 'pending': None, 'trace_ids': []}
+        if completed_scopes:
+            state['completed_scopes'] = completed_scopes
         save(Path(owner) / 'artifacts/memory_plugin/openclaw-memos-local/detail-tool-policy.json', DETAIL_DISCLOSURE)
         configure(root, info, config, True)
-        output = {'scope_id': scope, 'ingest_recall': 'native_enabled'}
+        output = {'scope_id': scope, 'ingest_recall': 'native_enabled', 'previous_scope': previous_scope}
     elif action == 'finalize':
         if state.get('owner') != owner:
             raise ValueError('Cannot finalize another runtime')
         configure(root, info, config, False)
+        if info.get('serial_samples'):
+            make_history_removable(root)
         state['phase'] = 'finished'
         output = {'capture_disabled': True, 'pending_failure_preserved': bool(state.get('pending'))}
     else:

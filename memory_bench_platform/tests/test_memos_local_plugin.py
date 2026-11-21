@@ -431,3 +431,44 @@ def test_failed_ingest_next_session_checks_own_sqlite_receipt(tmp_path, monkeypa
     result = finish(new)['output']
     assert json.loads((tmp_path/result['receipt']).read_text())['capture']['id'] == 2
     assert json.loads((tmp_path/'phase.json').read_text())['trace_ids'] == ['new']
+
+
+def test_managed_sample_switch_discards_old_state_and_rejects_replay(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    memory = root / 'memos'
+    memory.mkdir(parents=True)
+    config_bytes = b'{"version": 1}'
+    (memory / 'config.yaml').write_bytes(config_bytes)
+    database = memory / 'data'
+    database.mkdir()
+    (database / 'memos.db').write_text('old database')
+    history = root / 'qa-workspace/history'
+    history.mkdir(parents=True)
+    (history / 'old.txt').write_text('private history')
+    history.chmod(0o555)
+    owner = str(tmp_path / 'run')
+    prior = {'owner': owner, 'scope_id': 'first', 'phase': 'qa', 'pending': {'active': True}}
+    a.save(root / 'phase.json', prior)
+    calls = []
+    monkeypatch.setattr(a.subprocess, 'run', lambda command, **kwargs: calls.append(command))
+    monkeypatch.setattr(a, 'configure', lambda *_: None)
+    info = {'container': 'dedicated', 'serial_samples': True, 'plugin_path': str(tmp_path / 'official')}
+    config = {'agents': {'defaults': {'workspace': a.QA_WORKSPACE}, 'list': [{'id': 'main'}]}}
+    request = {'action': 'prepare', 'inputs': {'scope_id': 'second'}, 'runtime_context': {'run_dir': owner}}
+    with pytest.raises(ValueError, match='Unfinished request'):
+        a.dispatch(request, root, info, config)
+    assert (history / 'old.txt').exists() and calls == []
+    a.save(root / 'phase.json', {**prior, 'pending': None})
+
+    result = a.dispatch(request, root, info, config)
+    assert result['output']['previous_scope'] == 'first'
+    assert calls == [['docker', 'stop', '--time', '120', 'dedicated']]
+    assert (memory / 'config.yaml').read_bytes() == config_bytes
+    assert not database.exists() and not history.exists()
+    assert config['agents'] == {'defaults': {'workspace': '/runtime/workspace'}}
+
+    state = json.loads((root / 'phase.json').read_text())
+    a.save(root / 'phase.json', {**state, 'phase': 'qa'})
+    request['inputs']['scope_id'] = 'first'
+    with pytest.raises(ValueError, match='completed sample'):
+        a.dispatch(request, root, info, config)

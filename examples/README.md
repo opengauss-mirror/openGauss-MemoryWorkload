@@ -27,7 +27,7 @@ docker compose version
 |---|---|---|
 | `ogmemory-openclaw` | OpenClaw、AGFS 版 oGMemory、独立 openGauss | 官方插件目录；数据库镜像为 ARM64 的 `opengauss-distributed:0328` 时，需要 ARM64 主机；该镜像按官方 Compose 使用 privileged |
 | `mem0-openclaw` | OpenClaw 内的官方 Mem0 OSS 插件、独立 pgvector | 官方 `@mem0/openclaw-mem0@1.2.0`，保留安装后的 node_modules 依赖树 |
-| `memos-openclaw` | OpenClaw 内的官方 MemOS Local | [一键部署教程](#memos-local-与-openclaw-全量-locomo)，官方插件 2.0.8，每次部署仅一个 sample |
+| `memos-openclaw` | OpenClaw 内的官方 MemOS Local | [一键部署教程](#memos-local-与-openclaw-全量-locomo)，官方插件 2.0.8，一次部署可顺序运行全部样本 |
 | `openviking-openclaw` | OpenClaw、原生 OpenViking HTTP 服务 | 官方 context-engine 插件须有 autoCapture/autoRecall/baseUrl；提供与镜像匹配的原生后端配置 |
 | `hindsight-openclaw` | OpenClaw、原生 Hindsight HTTP 服务 | [一键部署教程](#hindsight--openclaw部署并运行-locomo)，使用官方镜像、内置 PostgreSQL 和官方插件 1.2.0 |
 | `jiuwenmemory-openclaw` | OpenClaw 内置 MCP、原生 JiuwenMemory 服务 | 服务须提供 memory_add/memory_search；提供镜像所需原生配置及后端依赖 |
@@ -619,7 +619,7 @@ docker run --rm --network host --user "$(id -u):$(id -g)" \
 test -f "$PLUGIN_PATH/openclaw.plugin.json"
 ```
 
-安装依赖后应看到 `SQLite OK`。请保留插件目录中的 `node_modules`，Workload 会把整个目录只读挂载到网关。实验模板固定使用 `2.0.8`。每个样本是一整段 LoCoMo conversation，包含其全部 session 和 QA。Workload 为每个样本新建空 SQLite 库和独立插件状态，避免跨样本召回。
+安装依赖后应看到 `SQLite OK`。请保留插件目录中的 `node_modules`，Workload 会把整个目录只读挂载到网关。实验模板固定使用 `2.0.8`。每个样本是一整段 LoCoMo conversation，包含其全部 session 和 QA。Workload 复用同一个 OpenClaw 容器，在样本切换时停止网关，再换成空 SQLite 和新的会话状态。每个样本的写入和 QA 使用同一个库。
 
 ### 2. 获取全量 LoCoMo 并配置模型
 
@@ -630,18 +630,7 @@ printf '%s  %s\n' \
   5da1af63b66d5bba1c00e40eecff7a825ba202927f5c1e563670f89d0dfbfad4 \
   data-source/data/locomo10.json | sha256sum -c -
 
-python - <<'PY'
-import json
-from pathlib import Path
-
-data = json.loads(Path("data-source/data/locomo10.json").read_text())
-assert len(data) == 10
-for number, sample in enumerate(data, 1):
-    directory = Path("samples") / f"{number:02d}"
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "locomo.json").write_text(json.dumps([sample], ensure_ascii=False))
-    print(directory, sample["sample_id"], len(sample["qa"]))
-PY
+export DATA_PATH="$PWD/data-source/data/locomo10.json"
 
 read -r -p '聊天 API Base URL（含 /v1）: ' LLM_BASE_URL
 read -r -p '聊天模型名: ' LLM_MODEL
@@ -661,76 +650,32 @@ export MEMORY_BENCH_JUDGE_MAX_TOKENS=2048
 
 聊天接口用于回答和默认 Judge。Embedding 接口必须提供 `/embeddings`。如果使用无需鉴权的内部 Embedding 服务，密钥可填 `local`。Judge 若使用独立服务，设置相应的三个 `LOCOMO_*` 变量。
 
-### 3. 逐样本部署、运行和清理
-
-将 10 个样本依次交给同一个 `experiment` 入口。每个样本使用独立的部署目录和 SQLite 数据。在当前版本，MemOS 的历史导出目录为只读，因此这段命令在测试结束后先恢复该目录写权限，再调用 Workload 清理。若某个样本失败，循环会继续运行其余样本并汇总失败目录。
+### 3. 部署、测试、看报告
 
 ```bash
-sed -i 's/cleanup_owned_deployment: true/cleanup_owned_deployment: false/' "$WORK/deployment.yaml"
-failed=0
-for sample in "$WORK"/samples/*; do
-  if (
-    cd "$sample" || exit 1
-    cp -r "$WORK/configs" "$WORK/deployment.yaml" . || exit 1
-    install -m 600 "$WORK/.env" .env || exit 1
-    export DATA_PATH="$PWD/locomo.json"
-
-    rc=0
-    memory-bench experiment --config deployment.yaml || rc=$?
-    deployment="$PWD/.memory-bench/deployments/memos-openclaw-locomo"
-    history="$deployment/memos-openclaw/plugin-runtimes/memos-openclaw/qa-workspace/history"
-    if [ -d "$history" ]; then
-      chmod u+w "$history" || exit 1
-    fi
-    if [ -f "$deployment/state.json" ]; then
-      memory-bench undeploy --deployment memos-openclaw-locomo || rc=1
-    fi
-    exit "$rc"
-  ); then
-    printf '完成 %s\n' "$sample"
-  else
-    printf '失败 %s\n' "$sample" >&2
-    failed=$((failed + 1))
-  fi
-done
-printf '运行或清理失败的样本数 %s\n' "$failed"
+memory-bench experiment --config deployment.yaml
 ```
 
-### 4. 查看报告并汇总全量准确率
-
-每个样本的报告保存在自己的 `runs/<run-id>/reports/` 下。以下命令核对报告是否有效，按总答对数除以参与评分的总题数计算全量准确率。Workload 按现有 LoCoMo 评测规则跳过 category 5。LoCoMo10 原始文件有 1,986 道题，本流程评测其中 1,540 道。
+一个命令启动一个专用容器，并依次执行全部 10 个 conversation。每个 conversation 先完成历史写入和只读 QA，再切换到下一个样本。样本切换会重启同一个容器，清除上一个样本的 SQLite、会话和运行状态。Workload 保留每个样本的写入和召回凭证。运行时保持样本串行。
 
 ```bash
-cd "$WORK"
 python - <<'PY'
 import json
 from pathlib import Path
 
-correct = total = 0
-invalid = []
-directories = sorted(Path("samples").iterdir())
-for sample_dir in directories:
-    sample = json.loads((sample_dir / "locomo.json").read_text())[0]
-    reports = list(sample_dir.glob("runs/*/reports/summary.json"))
-    if len(reports) != 1:
-        invalid.append(sample["sample_id"])
-        continue
-    summary = json.loads(reports[0].read_text())
-    print(sample["sample_id"], summary["status"],
-          f'{summary["case_passed"]}/{summary["case_total"]}', reports[0])
-    expected = sum(str(q.get("category", "")) != "5" for q in sample["qa"])
-    if (not summary.get("run_validity", {}).get("valid")
-            or summary["evaluation_coverage"] != 1
-            or summary["case_total"] != expected):
-        invalid.append(sample["sample_id"])
-        continue
-    correct += summary["case_passed"]
-    total += summary["case_total"]
-if invalid or len(directories) != 10 or total == 0:
-    raise SystemExit(f"缺少有效的全量结果，异常样本 {invalid}")
-print(f"全量准确率 {correct}/{total} = {correct / total:.2%}")
+p = max(Path("runs").glob("*/reports/summary.json"), key=lambda f: f.stat().st_mtime)
+s = json.loads(p.read_text())
+print("答对", s["case_passed"], "/", s["case_total"])
+print("正式准确率", s["benchmark_score"], "评分覆盖率", s["evaluation_coverage"],
+      "就绪率", s["checkpoint_ready_rate"], "有效性", s["run_validity"]["valid"])
+print((p.parent / "case_results.json").resolve())
+print((p.parent / "run_report.html").resolve())
 PY
 ```
+
+全量数据保留原有 10 个 conversation 和全部历史。Workload 跳过 category 5，正式评测共计 1,540 题。默认自动清理容器及运行数据，保留 `$WORK/runs` 中的报告。逐样本历史导出清单及写入、召回凭证位于同一次 run 的 `artifacts/memory_plugin/openclaw-memos-local/`。
+
+验证使用两个样本。先写入一个带干扰事实的样本，再切到第二个样本并运行一道 QA，检查只召回第二个样本的历史。全量示例沿用同一入口。
 
 ## 扩展与验证边界
 

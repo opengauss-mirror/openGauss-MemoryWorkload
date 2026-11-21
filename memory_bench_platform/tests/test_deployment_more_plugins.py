@@ -77,14 +77,26 @@ def test_real_adapter_prepare_bind_drift_cleanup(tmp_path, provider):
     assert not root.exists()
 
 
-def test_memos_rejects_multiple_samples_and_separate_memory_container(tmp_path):
+def test_memos_accepts_multiple_samples_and_rejects_separate_memory_container(tmp_path):
     path,raw=fixture(tmp_path,'memos')
     (tmp_path/'data.json').write_text(json.dumps([SAMPLE,{**SAMPLE,'sample_id':'s2'}]))
-    with pytest.raises(ValueError,match='fresh deployment per sample'):load_deployment(path)
-    (tmp_path/'data.json').write_text(json.dumps([SAMPLE]))
+    load_deployment(path)
     raw['memories']['mem0']['placement']='service'
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ValueError):load_deployment(path)
+
+
+def test_memos_compose_overrides_image_healthcheck_interval(tmp_path):
+    path, raw = fixture(tmp_path, 'memos')
+    raw['agents']['claw']['healthcheck_interval_seconds'] = 5
+    path.write_text(yaml.safe_dump(raw))
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    binding = state.plugin_runtimes['claw-common']
+    compose = Path(binding['directory']).parents[1] / 'compose.yaml'
+    service = yaml.safe_load(compose.read_text())['services'][binding['service']]
+    assert service['healthcheck']['interval'] == '5s'
+    undeploy('suite', tmp_path, docker)
 
 
 def test_hindsight_host_operations_url(monkeypatch):

@@ -44,6 +44,8 @@ def _service(template: Service, root: Path, mounts: list[dict[str, object]], net
                                   "environment": {**template.environment,
                                                   **{name: "${" + source + "}" for name, source in template.environment_from.items()},
                                                   **endpoint_vars}}
+    if template.healthcheck_interval_seconds is not None:
+        result["healthcheck"]["interval"] = f"{template.healthcheck_interval_seconds}s"
     if template.command:
         result["command"] = template.command
     ports = [_port(template.container_port)] if template.container_port else []

@@ -8,7 +8,6 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 C = runpy.run_path(str(ROOT.parent.parent / 'scripts/deployment_openclaw.py'))
 MEMORY_PLACEMENT = 'agent'
-MAX_SAMPLES = 1
 PLUGIN = 'memos-local-plugin'
 
 
@@ -43,7 +42,7 @@ def prepare(spec, context):
     final['agents']['defaults']['workspace'] = '/runtime/qa-workspace'
     final['agents']['list'] = [{'id': 'main', 'workspace': '/runtime/qa-workspace'}]
     info = {'version': '2.0.8', 'plugin_path': str(upstream), 'plugin_hashes': C['file_hashes'](upstream),
-            'ingest_recall': 'native_enabled',
+            'ingest_recall': 'native_enabled', 'serial_samples': True,
             'memos_config_sha256': hashlib.sha256((directory / 'memos/config.yaml').read_bytes()).hexdigest()}
     C['save'](directory / 'runtime.json', info)
     service['environment']['MEMOS_HOME'] = '/runtime/memos'
@@ -54,7 +53,7 @@ def prepare(spec, context):
 def environment(binding, endpoints):
     directory = Path(binding['directory'])
     if json.loads((directory / 'phase.json').read_text()).get('owner'):
-        raise ValueError('MemOS Local requires a fresh deployment per sample; undeploy and deploy again')
+        raise ValueError('MemOS Local requires a fresh deployment per run; undeploy and deploy again')
     return {**C['environment'](directory, endpoints), 'MEMOS_LOCAL_RUNTIME_DIR': str(directory),
             'MEMOS_LOCAL_GATEWAY_CONTAINER': endpoints['container'], 'MEMOS_LOCAL_VIEWER_URL': endpoints['memory_url']}
 
