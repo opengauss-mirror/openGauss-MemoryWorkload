@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 import pytest
 
@@ -10,11 +11,16 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+def task_status(url, state="completed"):
+    task = parse_qs(urlsplit(url).query)["task_id"][0]
+    return {"code": 200, "data": [{"task_id": task, "status": state}]}
+
+
 def invoke(action="recall", inputs=None, data=None, env=None):
     calls = []
     def opener(req, timeout):
         if req.get_method() == "GET":
-            return io.BytesIO(json.dumps({"code": 200, "data": {"scheduler_summary": dict(waiting=0, in_progress=0, pending=0, failed=0, cancelled=0)}}).encode())
+            return io.BytesIO(json.dumps(task_status(req.full_url)).encode())
         calls.append((req, json.loads(req.data), timeout))
         return io.BytesIO(json.dumps(data).encode())
     result = runner.run_operation({"action": action, "task_id": "task1", "inputs": {"scope_id": "run:episode", **(inputs or {})}}, environ={"MEMOS_EXCLUSIVE_INSTANCE": "1", **(env or {})}, urlopen=opener)
@@ -82,19 +88,40 @@ def test_manifest_and_composer():
     assert not any(s["inputs"].get("action") in ("flush", "status") for s in plan["steps"])
 
 
-@pytest.mark.parametrize("summary", [None, {}, {"waiting": 0, "in_progress": 0, "pending": 0, "failed": 1, "cancelled": 0}])
-def test_failed_or_missing_scheduler_ack_is_failure(summary):
+@pytest.mark.parametrize("rows", [None, {}, [], [{"task_id": "other", "status": "completed"}]])
+def test_missing_or_mismatched_scheduler_ack_is_failure(rows):
     def opener(req, timeout):
-        result = {"code": 200, "message": "Memory added successfully", "data": []} if req.get_method() == "POST" else {"code": 200, "data": {"scheduler_summary": summary}}
+        result = {"code": 200, "message": "Memory added successfully", "data": []} if req.get_method() == "POST" else {"code": 200, "data": rows}
         return io.BytesIO(json.dumps(result).encode())
     r=runner.run_operation({"action":"ingest", "task_id":"x", "inputs":{"scope_id":"s", "content":"history"}}, environ={"MEMOS_EXCLUSIVE_INSTANCE":"1"}, urlopen=opener)
     assert r["state"] == "failed"
 
 
-def test_shared_instance_rejected_before_write():
-    calls=[]
-    r=runner.run_operation({"action":"ingest", "task_id":"x", "inputs":{"scope_id":"s", "content":"history"}}, environ={}, urlopen=lambda *a,**kw:calls.append(1))
-    assert r["state"] == "failed" and not calls
+def test_concurrent_writes_wait_for_their_own_task():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(2)
+    def write(sample):
+        posted = {}
+        def service(req, timeout):
+            if req.get_method() == "POST":
+                posted.update(json.loads(req.data))
+                barrier.wait(timeout=5)
+                payload = {"code": 200, "message": "Memory added successfully", "data": []}
+            else:
+                url = urlsplit(req.full_url)
+                assert url.path == "/product/scheduler/status"
+                assert parse_qs(url.query) == {k: [posted[k]] for k in ("user_id", "task_id")}
+                payload = task_status(req.full_url, "completed" if sample == "A" else "failed")
+            return io.BytesIO(json.dumps(payload).encode())
+        return runner.run_operation({"action": "ingest", "task_id": "history-1",
+            "inputs": {"scope_id": sample, "content": "history"}}, environ={}, urlopen=service)
+    with ThreadPoolExecutor(2) as pool:
+        a, b = pool.map(write, ["A", "B"])
+    assert (a["state"], b["state"]) == ("completed", "failed")
+    assert a["operation"]["task_id"] != b["operation"]["task_id"]
+    assert a["output"]["memory_count"] == 0
 
 
 def test_pending_scheduler_is_polled_without_repeating_write(monkeypatch):
@@ -105,10 +132,37 @@ def test_pending_scheduler_is_polled_without_repeating_write(monkeypatch):
         if req.get_method()=="POST":
             response={"code":200,"message":"Memory added successfully","data":[]}
         else:
-            response={"code":200,"data":{"scheduler_summary":dict(waiting=0,in_progress=int(len(methods)==2),pending=0,failed=0,cancelled=0)}}
+            response=task_status(req.full_url, "in_progress" if len(methods)==2 else "completed")
         return io.BytesIO(json.dumps(response).encode())
     r=runner.run_operation({"action":"ingest","task_id":"x","inputs":{"scope_id":"s","content":"history"}},environ={"MEMOS_EXCLUSIVE_INSTANCE":"1"},urlopen=opener)
     assert r["state"]=="completed" and methods==["POST","GET","GET"]
+
+
+@pytest.mark.parametrize("appears", [True, False])
+def test_task_registration_lag_only_retries_status(monkeypatch, appears):
+    from urllib.error import HTTPError
+
+    clock = [0]
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runner.time, "sleep", lambda n: clock.__setitem__(0, clock[0] + n))
+    methods = []
+    def service(req, timeout):
+        methods.append(req.get_method())
+        if req.get_method() == "POST":
+            result = {"code": 200, "message": "Memory added successfully", "data": []}
+        elif clock[0] and appears:
+            result = task_status(req.full_url)
+        else:
+            raise HTTPError(req.full_url, 404, "Not Found", {}, None)
+        return io.BytesIO(json.dumps(result).encode())
+    result = runner.run_operation({"action": "ingest", "task_id": "q",
+        "inputs": {"scope_id": "s", "content": "history"}},
+        environ={"MEMOS_HTTP_TIMEOUT_SECONDS": "2"}, urlopen=service)
+    assert methods == ["POST", "GET", "GET"]
+    if appears:
+        assert result["state"] == "completed"
+    else:
+        assert result["error"]["code"] == "IndexReadinessUnconfirmed"
 
 
 @pytest.mark.parametrize("value, expected", [
@@ -178,7 +232,7 @@ def test_nullable_native_results_remain_supported(data):
 
 @pytest.mark.parametrize("code", [200, 301, 302, 303, 307, 308])
 @pytest.mark.parametrize("redirect_path", [
-    "/product/add", "/product/search", "/product/scheduler/allstatus",
+    "/product/add", "/product/search", "/product/scheduler/status",
 ])
 def test_http_redirect_never_reaches_target(code, redirect_path):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -191,8 +245,7 @@ def test_http_redirect_never_reaches_target(code, redirect_path):
         if path == "/product/search":
             return {"code": 200, "message": "Search completed successfully",
                     "data": {"text_mem": []}}
-        return {"code": 200, "data": {"scheduler_summary": dict(
-            waiting=0, in_progress=0, pending=0, failed=0, cancelled=0)}}
+        return task_status(path)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -205,8 +258,8 @@ def test_http_redirect_never_reaches_target(code, redirect_path):
         def do_GET(self):
             calls = source_calls if self.server is source else target_calls
             calls.append((self.command,
-                          self.path, self.headers.get("Authorization")))
-            if self.server is source and self.path == redirect_path and code != 200:
+                          urlsplit(self.path).path, self.headers.get("Authorization")))
+            if self.server is source and urlsplit(self.path).path == redirect_path and code != 200:
                 self.send_response(code)
                 self.send_header("Location", target_url + self.path)
                 self.send_header("Content-Length", "0")
@@ -235,8 +288,8 @@ def test_http_redirect_never_reaches_target(code, redirect_path):
         assert result["state"] == ("completed" if code == 200 else "failed")
         assert target_calls == []
         assert [c[1] for c in source_calls] == (
-            ["/product/add", "/product/scheduler/allstatus"]
-            if redirect_path.endswith("allstatus") or (code == 200 and action == "ingest")
+            ["/product/add", "/product/scheduler/status"]
+            if redirect_path.endswith("/status") or (code == 200 and action == "ingest")
             else [redirect_path])
         assert all(c[2] == "Token synthetic-redirect-secret" for c in source_calls)
         assert "synthetic-redirect-secret" not in json.dumps(result)

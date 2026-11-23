@@ -179,9 +179,11 @@ def memory_scope(request, scope_id):
     if not scope_id:
         raise ValueError("Missing history/QA scope")
     owner = request["runtime_context"]["run_dir"]
-    return {"org": os.environ.get("JIUWENMEMORY_ORG", "local"),
-            "user": os.environ.get("JIUWENMEMORY_USER", "developer"),
-            "session": hashlib.sha256(f"{owner}:{scope_id}".encode()).hexdigest()}
+    session = hashlib.sha256(f"{owner}:{scope_id}".encode()).hexdigest()
+    user = os.environ.get("JIUWENMEMORY_USER", "developer")
+    if os.environ.get("MEMORY_BENCH_POOL_RUN_DIR"):
+        user = f"{user}-{session}"
+    return {"org": os.environ.get("JIUWENMEMORY_ORG", "local"), "user": user, "session": session}
 
 
 def run(request):

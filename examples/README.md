@@ -7,10 +7,10 @@
 ## 获取和安装
 
 在包含这些示例的源码分支中执行。Python 要求 3.11+，Docker 要求 Compose v2。
-目前本功能位于 `feat/agent-plugin-deployment-20261119`，尚未宣称已合入主分支。
+以下命令使用包含跨样本并发示例的 PR #28 分支。
 
 ```bash
-git clone --branch feat/agent-plugin-deployment-20261119 \
+git clone --branch feat/ogmemory-shared-backend-gateways \
   https://gitcode.com/weixin_44204324/openGauss-MemoryWorkload.git
 cd openGauss-MemoryWorkload
 python3.11 -m venv .venv
@@ -19,16 +19,18 @@ python -m pip install -e .
 docker compose version
 ```
 
-## 可选：配置评分并发
+## 可选：配置样本、QA 和评分并发
 
-在所选示例的 `deployment.yaml` 中找到 `combinations` 条目，在 `memory_integration` 同级添加以下配置：
+六个 OpenClaw 示例默认串行。在所选示例的 `deployment.yaml` 中取消以下四行的注释，再运行部署：
 
 ```yaml
-    execution:
-      judge_concurrency: 4
+  execution:
+    sample_concurrency: 2
+    qa_concurrency: 2
+    judge_concurrency: 4
 ```
 
-运行 `memory-bench experiment --config deployment.yaml` 即可。OpenClaw 插件示例逐题执行 QA，Judge 最多同时评分四题。直接连接记忆后端的组合还可以配置 QA 并发。[完整配置说明](../docs/deployment-yaml.md#配置-qa-和-judge-并发)
+这组配置适用于原生 LoCoMo 和 LongMemEval。每个样本独占一个 Gateway，同一样本的 QA 逐题执行，跨样本最多同时回答两题，全局最多同时评分四题。数据只有一个样本时只启动一个 Gateway。只想并发评分时，取消 `execution:` 和 `judge_concurrency: 4` 两行的注释即可。[完整配置说明](../docs/deployment-yaml.md#配置-qa-和-judge-并发)
 
 ## 选择组合
 
@@ -207,6 +209,7 @@ export PLUGIN_PATH="$(realpath -e "$PLUGIN_PATH")"
 export DATA_PATH="$(realpath -e "$DATA_PATH")"
 export MEMORY_CONFIG_PATH="$PWD/ov.conf"
 export MEMORY_CONFIG_TARGET=/app/.openviking/ov.conf MEMORY_DATA_TARGET=/data/openviking MEMORY_PORT=1933
+export MEMORY_ACCOUNT_ID=locomo MEMORY_USER_ID=bench
 export MEMORY_API_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 export LOCOMO_BASE_URL="$LLM_BASE_URL" LOCOMO_METRIC_MODEL="$LLM_MODEL" LOCOMO_API_KEY="$LLM_API_KEY"
 python - <<'PY'
@@ -224,19 +227,13 @@ config = {
     "auto_generate_l0": False, "auto_generate_l1": False
 }
 Path(e["MEMORY_CONFIG_PATH"]).write_text(json.dumps(config))
-# 向插件和就绪检查传入同一个测试租户。
-p = Path("configs/openclaw.json")
-claw = json.loads(p.read_text())
-claw["plugins"]["entries"]["openviking"]["config"].update(accountId="locomo", userId="bench")
-p.write_text(json.dumps(claw, indent=2) + "\n")
-
 keys = [line.split("=", 1)[0] for line in Path(".env.example").read_text().splitlines()
         if line and not line.startswith("#")]
 Path(".env").write_text("".join(f"{k}={e[k]}\n" for k in keys))
 PY
 ```
 
-这段命令在本次工作目录生成私有的 `.env` 和 `ov.conf`，并更新复制出来的 `configs/openclaw.json`。示例为独立的本机部署使用原生 `trusted` 鉴权，每次生成随机服务密钥，插件显式发送 `accountId` 和 `userId`。在已有的多租户服务上使用 `api_key` 模式时，数据接口需要租户用户密钥；root 管理密钥用于数据接口会返回 `PERMISSION_DENIED`。
+这段命令在本次工作目录生成私有的 `.env` 和 `ov.conf`。部署时会展开 `configs/openclaw.json` 中的环境变量。示例为独立的本机部署使用原生 `trusted` 鉴权，每次生成随机服务密钥，插件通过 `MEMORY_ACCOUNT_ID` 和 `MEMORY_USER_ID` 显式发送账号和初始用户。已有服务请填写实际租户身份。启用 `sample_concurrency > 1` 时，Workload 在该账号下为各样本生成独立用户，并在写入前核对后端返回的身份。在已有的多租户服务上使用 `api_key` 模式时，数据接口需要租户用户密钥；root 管理密钥用于数据接口会返回 `PERMISSION_DENIED`。
 
 ### 3. 部署、测试、看报告
 

@@ -206,3 +206,18 @@ def test_plan_cli_reports_requested_concurrency(capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["execution_spec"]["qa_concurrency"] == 4
     assert payload["execution_spec"]["judge_concurrency"] == 3
+
+
+@pytest.mark.parametrize("command", ["run", "plan-run"])
+def test_ogmemory_uses_only_managed_sample_gateways(command, monkeypatch):
+    args = build_parser().parse_args([command, "--benchmark", "locomo", "--agent", "openclaw",
+        "--memory-backend", "ogmemory", "--memory-integration", "agent_plugin"])
+    monkeypatch.delenv("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS", raising=False)
+    assert _execution_options(args).sample_concurrency == 1
+    with pytest.raises(ValueError, match="deployment.yaml"):
+        _execution_options(args, {"sample_concurrency": 2})
+    monkeypatch.setenv("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS", '[{}, {}]')
+    assert _execution_options(args, {"sample_concurrency": 2}).sample_concurrency == 2
+    args.sample_runtime_config = Path("manual.json")
+    with pytest.raises(ValueError, match="--sample-runtime-config"):
+        _execution_options(args)

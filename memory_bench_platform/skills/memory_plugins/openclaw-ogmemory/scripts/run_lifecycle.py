@@ -239,6 +239,7 @@ def wait_ready(base, state, inputs):
     if not math.isfinite(timeout) or not math.isfinite(interval) or interval < 0:
         raise ValueError("Readiness timeout and interval must be finite; interval must be non-negative")
     deadline = time.monotonic() + timeout
+    retry_seen = False
 
     def remaining():
         budget = deadline - time.monotonic()
@@ -287,19 +288,21 @@ def wait_ready(base, state, inputs):
             drained = request("/api/v1/call/wait_until_idle",
                               {**body, "drainOutbox": True})
             drain = drained.get("drain") or {}
-            if int(drain.get("failed", 0)) or int(drain.get("moved_to_dlq", 0)):
-                if idle_after_failure(base, state, sid):
-                    raise SettledHistoryFailure("Compacted session indexing failed; scoped backend is idle")
-                raise RuntimeError("Compacted session indexing failed")
+            # A batch drain can include other accounts; waitOutbox filters by this account.
+            retry_seen |= bool(int(drain.get("failed", 0)) or int(drain.get("moved_to_dlq", 0)))
             settled = request("/api/v1/call/wait_until_idle",
                               {**body, "waitOutbox": True})
             outbox = settled.get("outbox") or {}
             if outbox.get("supported") is False or outbox.get("error"):
                 raise RuntimeError("Backend cannot verify readiness")
+            if int(outbox.get("failed", 0)):
+                raise SettledHistoryFailure("Compacted session indexing failed")
+            if retry_seen and "failed" not in outbox:
+                raise RuntimeError("Backend cannot confirm indexing after a retry")
             if settled.get("idle") is True and "total" in outbox and int(outbox["total"]) == 0:
                 missing = any(r.get("reason") == "session_not_found" for r in (idle, drained, settled))
                 if missing:
-                    if drain.get("failed") != 0:
+                    if drain.get("failed") is None:
                         raise RuntimeError("Backend cannot confirm indexing for archived session")
                     if not session.get("archive_ids"):
                         session = archived_session(session_path)

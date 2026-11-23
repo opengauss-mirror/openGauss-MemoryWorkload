@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -79,6 +80,35 @@ def _memories(data):
     return memories
 
 
+class IndexReadinessUnconfirmed(TimeoutError):
+    pass
+
+
+def _wait_for_task(opener, base, headers, user, task, deadline):
+    query = urllib.parse.urlencode({"user_id": user, "task_id": task})
+    req = urllib.request.Request(f"{base}/product/scheduler/status?{query}", headers=headers)
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            with opener(req, timeout=min(30, remaining)) as response:
+                status = json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            exc.close()
+        else:
+            rows = status.get("data") if isinstance(status, dict) and status.get("code") == 200 else None
+            if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                    or rows[0].get("task_id") != task):
+                raise ValueError("Invalid MemOS task receipt")
+            state = rows[0].get("status")
+            if state == "completed" and time.monotonic() < deadline:
+                return status
+            if state not in ("completed", "waiting", "in_progress"):
+                raise ValueError("MemOS scheduler task did not succeed")
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise IndexReadinessUnconfirmed("MemOS write acknowledged; scheduler task not confirmed")
+
+
 def run_operation(request, *, environ=None, urlopen=None):
     env = dict(os.environ if environ is None else environ)
     opener = urlopen or urllib.request.build_opener(NoRedirect()).open
@@ -96,14 +126,13 @@ def run_operation(request, *, environ=None, urlopen=None):
         action = request.get("action")
         body = {"user_id": user, "mem_cube_id": user}
         if action == "ingest":
-            if env.get("MEMOS_EXCLUSIVE_INSTANCE") != "1":
-                raise ValueError("MemOS requires a dedicated instance for scheduler completion")
             content = inputs.get("content")
             seed = request.get("idempotency_key") or request.get("task_id")
             if not isinstance(content, str) or not content.strip() or not seed:
                 raise ValueError("MemOS ingest requires content and task identity")
             session = "mbp-session-" + digest(scope + ":" + str(seed))
             operation["session_id"] = session
+            operation["task_id"] = "mbp-add-" + digest(scope + ":" + str(seed))
             occurred = inputs.get("occurred_at")
             if occurred is None:
                 occurred = inputs.get("timestamp")
@@ -112,7 +141,7 @@ def run_operation(request, *, environ=None, urlopen=None):
                 message["chat_time"] = _chat_time(occurred)
                 message["content"] = f"[Historical conversation date: {occurred}]\n{content}"
             body.update(messages=[message],
-                        session_id=session, writable_cube_ids=[user], async_mode="sync")
+                        session_id=session, task_id=operation["task_id"], writable_cube_ids=[user], async_mode="sync")
             path, expected = "/product/add", "Memory added successfully"
         elif action == "recall":
             query = inputs.get("query")
@@ -153,26 +182,7 @@ def run_operation(request, *, environ=None, urlopen=None):
                 raise ValueError("MemOS synchronous write requires memory results")
             if any(row.get("cube_id") not in (None, user) for row in data):
                 raise ValueError("MemOS write result belongs to another scope")
-            # A sync add can still enqueue consolidation. Drain the native queue
-            # on a dedicated instance before exposing a completed ingest.
-            if env.get("MEMOS_EXCLUSIVE_INSTANCE") != "1":
-                raise ValueError("MemOS requires a dedicated instance for scheduler completion")
-            deadline = started + timeout
-            while True:
-                status_req = urllib.request.Request(base + "/product/scheduler/allstatus", headers=headers)
-                with opener(status_req, timeout=max(1, min(30, deadline-time.monotonic()))) as response:
-                    status = json.load(response)
-                summary = (status.get("data") or {}).get("scheduler_summary") if isinstance(status, dict) else None
-                fields = ("waiting", "in_progress", "pending", "failed", "cancelled")
-                if status.get("code") != 200 or not isinstance(summary, dict) or any(type(summary.get(k)) is not int or summary[k] < 0 for k in fields):
-                    raise ValueError("MemOS scheduler status is unavailable")
-                if summary["failed"] or summary["cancelled"]:
-                    raise ValueError("MemOS scheduler reported failed tasks")
-                if not any(summary[k] for k in ("waiting", "in_progress", "pending")):
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("MemOS scheduler did not settle")
-                time.sleep(min(1, max(0, deadline-time.monotonic())))
+            status = _wait_for_task(opener, base, headers, user, operation["task_id"], started + timeout)
             output.update(session_id=session, memory_count=len(data), scheduler_status=status)
         else:
             memories = _memories(data)

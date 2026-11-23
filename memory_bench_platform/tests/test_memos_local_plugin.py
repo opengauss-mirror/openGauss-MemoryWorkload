@@ -481,7 +481,8 @@ def test_failed_ingest_next_session_checks_own_sqlite_receipt(tmp_path, monkeypa
     assert json.loads((tmp_path/'phase.json').read_text())['trace_ids'] == ['new']
 
 
-def test_managed_sample_switch_discards_old_state_and_rejects_replay(tmp_path, monkeypatch):
+@pytest.mark.parametrize('pooled', [False, True])
+def test_managed_sample_switch_discards_old_state_and_rejects_replay(tmp_path, monkeypatch, pooled):
     root = tmp_path / 'runtime'
     memory = root / 'memos'
     memory.mkdir(parents=True)
@@ -494,15 +495,26 @@ def test_managed_sample_switch_discards_old_state_and_rejects_replay(tmp_path, m
     history.mkdir(parents=True)
     (history / 'old.txt').write_text('private history')
     history.chmod(0o555)
-    owner = str(tmp_path / 'run')
-    prior = {'owner': owner, 'scope_id': 'first', 'phase': 'qa', 'pending': {'active': True}}
+    run = tmp_path / 'run'
+    owner = str(run)
+    next_owner = owner
+    if pooled:
+        monkeypatch.setenv('MEMORY_BENCH_POOL_RUN_DIR', str(run))
+        owner = str(run / 'artifacts/sample-runtimes/first')
+        next_owner = str(run / 'artifacts/sample-runtimes/second')
+    prior = {'owner': owner, 'scope_id': 'first', 'phase': 'finished' if pooled else 'qa',
+             'pending': {'active': True}}
     a.save(root / 'phase.json', prior)
     calls = []
     monkeypatch.setattr(a.subprocess, 'run', lambda command, **kwargs: calls.append(command))
     monkeypatch.setattr(a, 'configure', lambda *_: None)
     info = {'container': 'dedicated', 'serial_samples': True, 'plugin_path': str(tmp_path / 'official')}
     config = {'agents': {'defaults': {'workspace': a.QA_WORKSPACE}, 'list': [{'id': 'main'}]}}
-    request = {'action': 'prepare', 'inputs': {'scope_id': 'second'}, 'runtime_context': {'run_dir': owner}}
+    request = {'action': 'prepare', 'inputs': {'scope_id': 'second'}, 'runtime_context': {'run_dir': next_owner}}
+    if pooled:
+        with pytest.raises(ValueError, match='another run'):
+            a.dispatch({**request, 'runtime_context': {'run_dir': str(tmp_path / 'foreign')}}, root, info, config)
+        assert (history / 'old.txt').exists() and calls == []
     with pytest.raises(ValueError, match='Unfinished request'):
         a.dispatch(request, root, info, config)
     assert (history / 'old.txt').exists() and calls == []

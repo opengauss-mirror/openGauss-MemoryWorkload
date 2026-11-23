@@ -13,7 +13,7 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .integration import sample_runtime_environment, validate_sample_identities, run_agent_task, run_memory_plugin_task, run_memory_task
+from .integration import MANAGED_GATEWAYS, sample_runtime_environment, validate_sample_identities, run_agent_task, run_memory_plugin_task, run_memory_task
 from .judges import run_builtin_judge, run_llm_judge
 from .protocol import (
     ArtifactRecord,
@@ -771,7 +771,7 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
                   runtime_context: WorkflowRuntimeContext | None = None,
                   cases: list[CaseRecord], steps: list[StepRecord],
                   execution_spec: ExecutionSpec, run_dir: Path,
-                  phase_sink=None, target_ids: list[str] | None = None) -> dict[str, list]:
+                  phase_sink=None, target_ids: list[str] | None = None, sample_gateways=None, finalize_sample=None) -> dict[str, list]:
     runtime_context = runtime_context or WorkflowRuntimeContext(
         run_id=run_id, run_dir=str(run_dir), benchmark_id="", agent_id=agent_id, memory_id=memory_id)
     integration = runtime_context.memory_integration
@@ -790,14 +790,32 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
     if parallel_samples and phase_sink is not None:
         raise ValueError("Phase profiling requires sample_concurrency=1")
     bound_samples = bool(runtime_context.sample_environments)
+    if (integration == "agent_plugin" and runtime_context.memory_plugin_id == "openclaw-ogmemory"
+            and (bound_samples or (parallel_samples and not sample_gateways))):
+        raise ValueError("oGMemory plugin sample concurrency requires deployment-managed Gateways")
     if bound_samples and phase_sink is not None:
         raise ValueError("Phase profiling does not support sample runtime bindings")
     partitions, scope_owners = _sample_partitions(cases, by_case, plugin=integration == "agent_plugin") if parallel_samples or bound_samples else ({}, {})
     if integration == "agent_plugin" and (parallel_samples or bound_samples):
         environments = runtime_context.sample_environments
-        if set(environments) != set(partitions):
+        if sample_gateways:
+            if (runtime_context.memory_plugin_id not in MANAGED_GATEWAYS or environments
+                    or len(sample_gateways) != execution_spec.sample_concurrency or not finalize_sample):
+                raise ValueError("Invalid managed sample Gateway configuration")
+            container_key, endpoint_key = MANAGED_GATEWAYS[runtime_context.memory_plugin_id]
+            if endpoint_key:
+                endpoints = {env.get(endpoint_key) for env in sample_gateways}
+                if len(endpoints) != 1 or not all(endpoints):
+                    raise ValueError("Managed Gateways require one shared memory endpoint")
+            else:
+                for key in ("MEMOS_LOCAL_RUNTIME_DIR", "MEMOS_LOCAL_VIEWER_URL"):
+                    values = {env.get(key) for env in sample_gateways}
+                    if len(values) != len(sample_gateways) or not all(values):
+                        raise ValueError(f"Embedded MemOS Gateways require distinct {key}")
+            environments = dict(enumerate(sample_gateways))
+        elif set(environments) != set(partitions):
             raise ValueError("Every plugin sample requires a dedicated runtime environment")
-        for key in ("OPENCLAW_GATEWAY_URL", "OPENCLAW_STATE_DIR", "OPENCLAW_BIN"):
+        for key in ("OPENCLAW_GATEWAY_URL", "OPENCLAW_STATE_DIR", container_key if sample_gateways else "OPENCLAW_BIN"):
             values = [env.get(key, "").rstrip("/") for env in environments.values()]
             if any(not value for value in values) or len(set(values)) != len(values):
                 raise ValueError(f"Plugin samples require distinct {key}")
@@ -811,7 +829,7 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
         for scope, sample in scope_owners.items():
             sample_scopes[sample].add(scope)
         skill = runtime_context.memory_plugin_id if integration == "agent_plugin" else memory_id
-        validate_sample_identities(runtime_context, skill, sample_scopes)
+        validate_sample_identities(runtime_context, skill, sample_scopes, **({"managed_gateway": sample_gateways[0]} if sample_gateways else {}))
     groups = []
     keys = []
     sessions = set()
@@ -984,14 +1002,35 @@ def execute_cases(*, run_id: str, agent_id: str, memory_id: str | None = None,
         owners = {case.case_id: sample for sample, rows in partitions.items() for case in rows}
         for group in groups:
             sample_groups[owners[group[0].case_id]].append(group)
-        def run_sample(sample):
+        def run_sample(sample, gateway=None):
             sample_statuses, sample_failures = {}, {}
-            with sample_runtime_environment(runtime_context, sample):
-                for group in sample_groups[sample]:
-                    run_group(group, group_phase(group), sample_statuses, sample_failures)
+            with sample_runtime_environment(runtime_context, sample, gateway):
+                try:
+                    for group in sample_groups[sample]:
+                        run_group(group, group_phase(group), sample_statuses, sample_failures)
+                finally:
+                    if gateway:
+                        finalize_sample(sample, gateway)
+
+        def run_gateway(gateway, work):
+            from queue import Empty
+            while True:
+                try:
+                    sample = work.get_nowait()
+                except Empty:
+                    return
+                run_sample(sample, gateway)
         with ThreadPoolExecutor(max_workers=execution_spec.sample_concurrency) as sample_pool:
-            pending_samples = [sample_pool.submit(copy_context().run, run_sample, sample)
-                               for sample in sample_groups]
+            if sample_gateways:
+                from queue import Queue
+                work = Queue()
+                for sample in sample_groups:
+                    work.put(sample)
+                pending_samples = [sample_pool.submit(copy_context().run, run_gateway, gateway, work)
+                                   for gateway in sample_gateways]
+            else:
+                pending_samples = [sample_pool.submit(copy_context().run, run_sample, sample)
+                                   for sample in sample_groups]
             for future in pending_samples:
                 future.result()
       else:

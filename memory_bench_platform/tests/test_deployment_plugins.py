@@ -157,3 +157,67 @@ def test_inactive_config_without_gateway_ack_is_not_reusable(tmp_path, provider)
     phase.write_text('{"active":false,"phase":"inactive","gateway_ready":true}')
     assert status('suite', tmp_path, docker).ready
     undeploy('suite', tmp_path, docker)
+
+
+@pytest.mark.parametrize(("samples", "gateways"), [(1, 1), (3, 2)])
+@pytest.mark.parametrize("benchmark", ["locomo", "longmemeval"])
+def test_managed_ogmemory_gateways_share_service(tmp_path, samples, gateways, benchmark):
+    path, raw = configured(tmp_path, "ogmemory")
+    combo = raw["combinations"][0]
+    combo["benchmark"] = benchmark
+    combo["execution"] = {"sample_concurrency": 2}
+    (tmp_path / combo["data_path"]).write_text(json.dumps([{"sample_id": str(i)} for i in range(samples)]))
+    path.write_text(yaml.safe_dump(raw))
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    bindings = list(state.plugin_runtimes.values())
+    assert len({item["directory"] for item in bindings}) == gateways
+    assert len({item["service"] for item in bindings}) == gateways
+    assert len({item["group"] for item in bindings}) == 1
+    for binding in bindings:
+        cid = state.containers[binding["group"]][binding["service"]]
+        assert docker.specs[cid]["healthcheck"]["interval"] == "10s"
+    assert "memory" in state.containers[bindings[0]["group"]]
+
+
+def test_managed_gateway_preparation_and_qa_budget(tmp_path, monkeypatch):
+    from memory_bench_platform.cli import _execution_options
+    from memory_bench_platform import deployment_run
+
+    path, raw = configured(tmp_path, "ogmemory")
+    combo = raw["combinations"][0]
+    raw.pop("shared_memory_instances")
+    combo.pop("memory_instance")
+    combo.update(memory="mem0", execution={"sample_concurrency": 2, "qa_concurrency": 2, "judge_concurrency": 4})
+    combo["preparation"] = {step: {"enabled": True, "target": "agent", "command": [command]}
+                           for step, command in (("seed", "seed"), ("readiness", "ready"), ("warmup", "warmup"))}
+    raw["agents"]["claw"]["healthcheck_interval_seconds"] = 90
+    (tmp_path / combo["data_path"]).write_text(json.dumps([{"sample_id": "a"}, {"sample_id": "b"}]))
+    path.write_text(yaml.safe_dump(raw))
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    ids = {state.containers[b["group"]][b["service"]] for b in state.plugin_runtimes.values()}
+    assert len(ids) == 2
+    assert all(docker.specs[cid]["healthcheck"]["interval"] == "90s" for cid in ids)
+    elapsed = [0]
+    def invoke(argv, *, env, cwd):
+        monkeypatch.setenv("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS", env["MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS"])
+        spec = _execution_options(SimpleNamespace(memory_integration="agent_plugin", memory_backend="ogmemory",
+            sample_concurrency=int(argv[argv.index("--sample-concurrency") + 1]),
+            qa_concurrency=int(argv[argv.index("--qa-concurrency") + 1]),
+            judge_concurrency=int(argv[argv.index("--judge-concurrency") + 1])))
+        assert spec.sample_concurrency == spec.qa_concurrency == 2
+        assert spec.judge_concurrency == 4
+        for cid in ids:
+            docker.containers[cid]["State"]["Health"]["Status"] = "starting"
+        return 0
+    def sleep(seconds):
+        elapsed[0] += seconds
+        if elapsed[0] >= 90:
+            for cid in ids:
+                docker.containers[cid]["State"]["Health"]["Status"] = "healthy"
+    monkeypatch.setattr(deployment_run, "time", SimpleNamespace(monotonic=lambda: elapsed[0], sleep=sleep))
+    assert run_deployment("suite", tmp_path, None, docker, invoke) == 0
+    for command in ("seed", "ready", "warmup"):
+        assert {cid for cid, cmd in docker.exec_calls if cmd == [command]} == ids
+    assert elapsed[0] == 90

@@ -152,28 +152,53 @@ def _validate() -> dict[str, Any]:
     )
 
 
+class _NoIdentityRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def managed_user(scope, config):
+    if not scope or not config.get("accountId"):
+        raise ValueError("Managed OpenViking samples require a scope and accountId")
+    user = "mbp-" + hashlib.sha256(scope.encode()).hexdigest()[:32]
+    headers = _task_headers()
+    headers["X-OpenViking-User"] = user
+    req = urllib.request.Request(_base_url() + "/health", headers=headers)
+    with urllib.request.build_opener(_NoIdentityRedirect()).open(req, timeout=10) as response:
+        identity = json.load(response)
+    if identity.get("user_id") != user or identity.get("account_id") != config["accountId"]:
+        raise ValueError("OpenViking did not confirm the requested sample identity")
+    return user
+
+
 def _prepare(request: dict[str, Any]) -> dict[str, Any]:
     path = _state_path(request)
     config = _config_get(PLUGIN_CONFIG_PATH)
     if not isinstance(config, dict):
         raise RuntimeError("OpenViking plugin config is unavailable")
+    fields = MANAGED_FIELDS + (("userId",) if os.environ.get("OPENVIKING_MANAGED_SAMPLE_USER") == "1" else ())
     if not path.exists():
         snapshot = {
             "schema_version": 1,
             "managed_fields": {
                 field: {"present": field in config, "value": config.get(field)}
-                for field in MANAGED_FIELDS
+                for field in fields
             },
         }
         path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     inputs = request.get("inputs", {})
+    user = None
+    if os.environ.get("OPENVIKING_MANAGED_SAMPLE_USER") == "1":
+        user = managed_user(inputs.get("scope_id"), config)
+        _config_set(f"{PLUGIN_CONFIG_PATH}.userId", user)
     namespace = _sanitize_identifier(str(inputs.get("namespace") or ""))
     if namespace:
         _config_set(f"{PLUGIN_CONFIG_PATH}.agent_prefix", namespace)
     return _ok(
         {
             "namespace": namespace,
+            **({"user_id": user} if user else {}),
             "snapshot": str(path),
         },
         artifacts=[{"kind": "memory_plugin_state", "path": str(path), "content_type": "application/json"}],
@@ -540,7 +565,9 @@ def _finalize(request: dict[str, Any]) -> dict[str, Any]:
     unset = []
     managed = snapshot.get("managed_fields") if isinstance(snapshot, dict) else None
     if isinstance(managed, dict):
-        for field in MANAGED_FIELDS:
+        for field in managed:
+            if field not in (*MANAGED_FIELDS, "userId"):
+                raise ValueError("Unknown OpenViking phase setting")
             field_state = managed.get(field, {})
             if field_state.get("present"):
                 _config_set(f"{PLUGIN_CONFIG_PATH}.{field}", field_state.get("value"))

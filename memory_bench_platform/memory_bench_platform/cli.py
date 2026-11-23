@@ -13,6 +13,7 @@ import traceback
 from .backends import validate_openviking_source
 from .external_report_import import import_external_result
 from .integration import (
+    MANAGED_GATEWAYS,
     adapter_environment,
     sample_runtime_environment,
     build_benchmark_scenario,
@@ -79,12 +80,19 @@ def _execution_options(args, configured=None) -> ExecutionSpec:
         if value is not None:
             values[name] = value
     spec = ExecutionSpec(**values)
+    if (getattr(args, "memory_integration", None) == "agent_plugin"
+            and getattr(args, "memory_backend", None) == "ogmemory"
+            and (getattr(args, "sample_runtime_config", None) or
+                 (spec.sample_concurrency > 1 and not os.environ.get("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS")))):
+        raise ValueError("Use deployment.yaml execution.sample_concurrency for oGMemory plugin sample concurrency; "
+                         "--sample-runtime-config is unsupported")
     if spec.qa_per_sample is not None and spec.qa_per_sample > spec.qa_concurrency:
         raise ValueError("--qa-per-sample cannot exceed --qa-concurrency")
     if (getattr(args, "memory_integration", "backend_direct") == "agent_plugin"
             and spec.qa_concurrency > 1
             and ((spec.sample_concurrency == 1 and (spec.qa_per_sample or 1) == 1)
-                 or (spec.sample_concurrency > 1 and not getattr(args, "sample_runtime_config", None)))):
+                 or (spec.sample_concurrency > 1 and not (getattr(args, "sample_runtime_config", None)
+                                                          or os.environ.get("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS"))))):
         raise ValueError("agent_plugin requires --qa-concurrency 1 unless parallel samples have dedicated runtime bindings")
     return spec
 
@@ -184,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--sample-concurrency", type=_positive_int, default=None,
             help="Concurrent independent samples (default: 1)")
         command_parser.add_argument("--sample-runtime-config", type=Path,
-            help="JSON mapping sample IDs to dedicated Agent adapter environments")
+            help="Manual sample-to-Gateway bindings for other plugins; use deployment.yaml for oGMemory")
         command_parser.add_argument("--qa-concurrency", type=_positive_int, default=None,
             help="Global concurrent QA cases (default: 1)")
         command_parser.add_argument("--qa-per-sample", type=_positive_int, default=None,
@@ -635,7 +643,7 @@ def _planned_verification_totals(sample_payloads):
 
 
 def _run_plugin_finalize(
-    runtime_context: WorkflowRuntimeContext, *, sample_plans=None, finalize_inputs=None,
+    runtime_context: WorkflowRuntimeContext, *, sample_plans=None, finalize_inputs=None, completed_samples=None,
 ) -> tuple[
     dict | None,
     CaseRecord | None,
@@ -679,8 +687,8 @@ def _run_plugin_finalize(
         )
     ]
     try:
-        if runtime_context.sample_environments:
-            sample_payloads = {}
+        if runtime_context.sample_environments or completed_samples is not None:
+            sample_payloads = dict(completed_samples or {})
             child_context = runtime_context.model_copy(update={"sample_environments": {}})
             for sample in runtime_context.sample_environments:
                 with sample_runtime_environment(runtime_context, sample):
@@ -690,6 +698,8 @@ def _run_plugin_finalize(
                     )[0]
             success = all(p.get("status") == "ok" and p.get("state") == "completed"
                           for p in sample_payloads.values())
+            if completed_samples is not None:
+                success = success and set(sample_payloads) == set(sample_plans)
             payload = {"protocol_version": "memory-plugin/1",
                        "status": "ok" if success else "failed",
                        "state": "completed" if success else "failed",
@@ -1010,12 +1020,12 @@ def _main(args, parser) -> None:
                     parser.error("--pressure-test requires the separate multi-agent pressure implementation")
                 if args.combination and not args.deployment:
                     parser.error("--combination requires --deployment")
-                conflicts = [name for name in ("benchmark", "agent", "memory_backend", "data_path", "workload_config", "entrypoint")
+                conflicts = [name for name in ("benchmark", "agent", "memory_backend", "data_path", "workload_config", "entrypoint", "sample_runtime_config")
                              if getattr(args, name, None)]
                 if conflicts or getattr(args, "memory_integration_explicit", False):
                     parser.error("--deployment cannot be combined with manual run selection options")
                 if args.sample_concurrency not in (None, 1):
-                    parser.error("--sample-concurrency currently requires a manual native run, not --deployment")
+                    parser.error("Configure sample concurrency in deployment.yaml for supported deployment combinations")
                 profile_options = ({"profiling_config": args.profiling_config}
                                    if args.profiling_config is not None else {})
                 rc = run_deployment(args.deployment, Path.cwd(), args.combination, docker,
@@ -1577,6 +1587,20 @@ def _main(args, parser) -> None:
                              if args.sample_runtime_config else {}),
     )
 
+    gateways = json.loads(os.environ.get("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS", "[]"))
+    if gateways and (runtime_context.sample_environments or execution_spec.sample_concurrency < 2
+                     or runtime_context.memory_plugin_id not in MANAGED_GATEWAYS):
+        raise ValueError("Managed sample Gateways require a supported parallel plugin run")
+    sample_plans = _sample_finalize_plans(cases, steps) if gateways or runtime_context.sample_environments else None
+    completed_samples = {} if gateways else None
+
+    def finalize_sample(sample, gateway):
+        payload = _run_plugin_finalize(runtime_context, finalize_inputs=sample_plans[sample])[0]
+        payload["gateway_container"] = gateway[MANAGED_GATEWAYS[runtime_context.memory_plugin_id][0]]
+        completed_samples[sample] = payload
+        if payload.get("state") != "completed" or payload.get("status") != "ok":
+            raise RuntimeError(f"Could not restore the Gateway after sample {sample}")
+
     trace_runtime = None
     trace_environment: dict[str, str] = {}
     trace_verification_payload: dict = {"valid": True, "reasons": []}
@@ -1645,6 +1669,7 @@ def _main(args, parser) -> None:
                 run_dir=run_dir,
                 phase_sink=phase_sink,
                 target_ids=list(phase_sink.session.targets) if phase_sink else None,
+                **({"sample_gateways": gateways, "finalize_sample": finalize_sample} if gateways else {}),
             )
     except Exception as exc:
         execution_error = exc
@@ -1661,7 +1686,8 @@ def _main(args, parser) -> None:
                     lifecycle_metric,
                 ) = _run_plugin_finalize(
                     runtime_context,
-                    sample_plans=_sample_finalize_plans(cases, steps) if runtime_context.sample_environments else None,
+                    sample_plans=sample_plans,
+                    **({"completed_samples": completed_samples} if gateways else {}),
                 )
         finally:
             token_collectors.finish(collection_run)

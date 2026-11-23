@@ -23,7 +23,7 @@ def required_resources(groups: tuple[DeploymentGroup, ...]) -> ResourceRequest:
     cpu = 0.0
     memory = 0
     for group in groups:
-        services = [*(group.agents[combo.id] for combo in group.combinations for _ in range(combo.agent_replicas)),
+        services = [*(group.agents[combo.id] for combo in group.combinations for _ in combo.agent_services()),
                     *group.gateway_pools.values(), group.memory_template, group.vector_template, group.graph_template,
                     group.memory_mock_template, *group.agent_mocks.values()]
         for service in services:
@@ -179,7 +179,6 @@ def render_project(group: DeploymentGroup, deployment_name: str,
         services["memory"] = _service(group.memory_template, group.source_root, generated_mounts.get("memory", []),
                                    memory_networks, endpoint_vars(group.memory_template), memory_deps, "memory", state_root)
     for combo in group.combinations:
-        base = "agent_" + combo.id.replace("-", "_")
         template = group.agents[combo.id]
         deps = ["memory"] if combo.memory_integration == "agent_plugin" and group.memory_template.placement != "agent" else []
         storage_refs = {ref for ref in template.service_endpoints.values() if ref in ("vector", "graph")}
@@ -189,10 +188,13 @@ def render_project(group: DeploymentGroup, deployment_name: str,
         agent_network_membership = [agent_networks[combo.id]]
         if template.allow_agent_storage_access and storage_refs:
             agent_network_membership.append("storage_net")
-        names = [f"{base}_{index}" for index in range(1, combo.agent_replicas + 1)] if combo.gateway_pool else [base]
+        names = combo.agent_services()
         for name in names:
             services[name] = _service(template, group.source_root, generated_mounts.get(name, []),
                                       agent_network_membership, endpoint_vars(template, combo.id), deps, name, state_root)
+            if combo.execution.sample_concurrency > 1 and template.healthcheck_interval_seconds is None:
+                # Check restarted sample Gateways promptly unless the deployment overrides the interval.
+                services[name]["healthcheck"]["interval"] = "10s"
             if group.memory_template.placement == "agent" and group.memory_template.container_port:
                 services[name].setdefault("ports", []).append(_port(group.memory_template.container_port))
             if combo.gateway_pool:

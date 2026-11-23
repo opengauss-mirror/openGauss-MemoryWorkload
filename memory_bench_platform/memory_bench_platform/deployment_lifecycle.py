@@ -58,8 +58,7 @@ def _resources_preflight(groups: tuple[DeploymentGroup, ...], docker: DockerClie
 def _service_templates(group: DeploymentGroup, rendered: dict | None = None) -> dict[str, Service]:
     result = {} if group.memory_template.placement == "agent" else {"memory": group.memory_template}
     for combo in group.combinations:
-        base = "agent_" + combo.id.replace("-", "_")
-        names = [f"{base}_{n}" for n in range(1, combo.agent_replicas + 1)] if combo.gateway_pool else [base]
+        names = combo.agent_services()
         result.update({name: group.agents[combo.id] for name in names})
         if combo.gateway_pool:
             result["gateway_pool_" + combo.id.replace("-", "_")] = group.gateway_pools[combo.id]
@@ -180,22 +179,25 @@ def _execute_preparation(group: DeploymentGroup, containers: dict[str, str], doc
                     raise DeploymentFailed("seed_resource_boost requires a vector with original resource limits")
                 docker.update_resources(vector_id, cpus=boost.cpus, memory_mb=boost.memory_mb)
                 boosted = True
-            seed_summary = docker.exec_json(containers[_target_service(group, prep.seed.target)],
-                                            prep.seed.command, timeout_seconds=prep.seed.timeout_seconds)
-            if golden_manifest is not None:
-                validate_seed_summary(seed_summary, golden_manifest)
+            for service in _target_services(group, prep.seed.target):
+                seed_summary = docker.exec_json(containers[service],
+                                                prep.seed.command, timeout_seconds=prep.seed.timeout_seconds)
+                if golden_manifest is not None:
+                    validate_seed_summary(seed_summary, golden_manifest)
             outcome["seed"] = True
         if prep.readiness.enabled:
-            _wait_readiness(prep.readiness, containers[_target_service(group, prep.readiness.target)], docker)
+            for service in _target_services(group, prep.readiness.target):
+                _wait_readiness(prep.readiness, containers[service], docker)
             outcome["readiness"] = True
     finally:
         if boosted:
             old = group.vector_template.resources
             docker.update_resources(vector_id, cpus=old.cpus, memory_mb=old.memory_mb)
     if boosted and prep.readiness.enabled:
-        result = docker.exec_json(containers[_target_service(group, prep.readiness.target)], prep.readiness.command)
-        if result.get("ready") is not True:
-            raise DeploymentFailed("baseline not ready after resource restoration")
+        for service in _target_services(group, prep.readiness.target):
+            result = docker.exec_json(containers[service], prep.readiness.command)
+            if result.get("ready") is not True:
+                raise DeploymentFailed("baseline not ready after resource restoration")
     return outcome
 
 
@@ -247,10 +249,11 @@ def _golden_before_deploy(group: DeploymentGroup, rendered: dict,
 def _golden_after_seed(group: DeploymentGroup, rendered: dict, containers: dict[str, str],
                        compose_file: Path, docker: DockerClient, manifest: dict) -> None:
     spec = group.preparation.golden_volume
-    result = docker.exec_json(containers[_target_service(group, spec.finalize.target)],
-                              spec.finalize.command,
-                              timeout_seconds=spec.finalize.timeout_seconds)
-    validate_finalize_summary(result, manifest)
+    for service in _target_services(group, spec.finalize.target):
+        result = docker.exec_json(containers[service],
+                                  spec.finalize.command,
+                                  timeout_seconds=spec.finalize.timeout_seconds)
+        validate_finalize_summary(result, manifest)
     docker.stop_container(containers["memory"])
     docker.stop_container(containers["vector"])
     _, runtime = _golden_volume_names(rendered)
@@ -273,15 +276,16 @@ def _golden_after_seed(group: DeploymentGroup, rendered: dict, containers: dict[
         if docker.compose_ps(rendered["name"], compose_file, service_name) != containers[service_name]:
             raise DeploymentFailed(f"{service_name} was replaced after Golden seal")
     readiness = group.preparation.readiness
-    _wait_readiness(readiness, containers[_target_service(group, readiness.target)], docker)
+    for service in _target_services(group, readiness.target):
+        _wait_readiness(readiness, containers[service], docker)
 
 
-def _target_service(group: DeploymentGroup, target: str) -> str:
+def _target_services(group: DeploymentGroup, target: str, combination=None) -> list[str]:
     if target == "agent":
-        return "agent_" + group.combination_ids[0].replace("-", "_")
-    if target == "mock":
-        return "mock_memory" if group.shared_memory_instance_id else "mock"
-    return target
+        return (combination or group.combinations[0]).agent_services()
+    if target == "mock" and group.shared_memory_instance_id:
+        return ["mock_" + combination.id.replace("-", "_") if combination and combination.mock else "mock_memory"]
+    return [target]
 
 
 def deploy(config_path: Path, cwd: Path, docker: DockerClient,
@@ -320,6 +324,9 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                     source = (group.source_root / config_file.source).resolve()
                     state.source_hashes[str(source)] = _hash(source)
             for combo in group.combinations:
+                if combo.execution.sample_concurrency > 1:
+                    data = (group.source_root / combo.data_path).resolve()
+                    state.source_hashes[str(data)] = _hash(data)
                 if combo.plugin_runtime:
                     for relative in (combo.plugin_runtime.source_config, combo.plugin_runtime.memory_config):
                         if relative:
@@ -484,9 +491,10 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
             drift.extend(_pool_issues(group, state.ports[group_key]))
             if group.preparation.readiness.enabled:
                 step = group.preparation.readiness
-                result = docker.exec_json(state.containers[group_key][_target_service(group, step.target)], step.command)
-                if result.get("ready") is not True:
-                    drift.append(f"baseline not ready: {group_key}")
+                for service in _target_services(group, step.target):
+                    result = docker.exec_json(state.containers[group_key][service], step.command)
+                    if result.get("ready") is not True:
+                        drift.append(f"baseline not ready: {group_key}")
     except Exception as exc:
         drift.append(f"status inspection failed: {type(exc).__name__}")
     return DeploymentStatus(state.ready and not drift, tuple(drift), state)
