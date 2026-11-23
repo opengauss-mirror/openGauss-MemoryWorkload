@@ -93,6 +93,36 @@ def test_owned_cleanup_only_when_requested(tmp_path, monkeypatch):
     assert (result.archive_dir / "experiment.json").is_file()
 
 
+def test_interrupted_experiment_removes_readonly_history(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_experiment as module
+    from test_deployment_more_plugins import fixture
+
+    config, raw = fixture(tmp_path, "memos")
+    raw["experiment"] = {"fresh": True, "cleanup_owned_deployment": True}
+    config.write_text(yaml.safe_dump(raw))
+    history = None
+
+    def interrupt(*args, **kwargs):
+        nonlocal history
+        state = module.DeploymentStore(tmp_path).read("suite")
+        runtime = Path(state.plugin_runtimes["claw-common"]["directory"])
+        history = runtime / "qa-workspace/history"
+        history.mkdir(parents=True)
+        (history / "trace-1.txt").write_text("synthetic history")
+        history.chmod(0o555)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "run_deployment", interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            module.run_experiment(config, None, tmp_path, RecordingDocker())
+    finally:
+        if history is not None and history.exists():
+            history.chmod(0o755)
+    assert history is not None
+    assert not module.DeploymentStore(tmp_path).directory("suite").exists()
+
+
 def test_run_failure_retains_experiment_archive(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_experiment as module
     config, profile = _files(tmp_path)

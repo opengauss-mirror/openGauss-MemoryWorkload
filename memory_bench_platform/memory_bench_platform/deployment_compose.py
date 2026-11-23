@@ -9,6 +9,7 @@ from .deployment_config import DeploymentGroup, Service
 from .paths import SKILLS_ROOT
 
 
+_ESCAPED_LITERALS = "x-workload-escaped-literals"
 _OPENCLAW_DNS_SCRIPT = "/opt/memory-bench/ipv4_provider_dns.cjs"
 
 
@@ -83,6 +84,39 @@ def _service(template: Service, root: Path, mounts: list[dict[str, object]], net
         if limits:
             result["deploy"] = {"resources": {"limits": limits}}
     return result
+
+
+def _replace_in_values(value, old: str, new: str):
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, list):
+        return [_replace_in_values(item, old, new) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_in_values(item, old, new) for key, item in value.items()}
+    return value
+
+
+def compose_document(rendered: dict, templates: dict[str, Service]) -> dict:
+    """Protect Workload-expanded literals from Compose interpolation."""
+    document = _replace_in_values(rendered, "$", "$$")
+    document[_ESCAPED_LITERALS] = True
+    for name, template in templates.items():
+        original = rendered["services"][name]["environment"]
+        environment = document["services"][name]["environment"]
+        for target, source in template.environment_from.items():
+            reference = "$" + "{" + source + "}"
+            value = original.get(target)
+            if value == reference or (target == "NODE_OPTIONS" and template.skill == "openclaw"
+                                      and value == f"{reference} --require={_OPENCLAW_DNS_SCRIPT}"):
+                environment[target] = value
+    return document
+
+
+def compose_expectations(document: dict) -> dict:
+    """Recover literal paths and other values for local status checks."""
+    if document.get(_ESCAPED_LITERALS) is True:
+        return _replace_in_values(document, "$$", "$")
+    return document
 
 
 def _url(template: Service, name: str, endpoint_name: str | None = None) -> str:

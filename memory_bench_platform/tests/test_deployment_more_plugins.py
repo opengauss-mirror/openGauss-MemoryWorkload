@@ -179,3 +179,25 @@ def test_jiuwen_gateway_command(tmp_path, monkeypatch, command, accepted):
     else:
         with pytest.raises(ValueError, match="Gateway"):
             validate("gateway", config, state)
+
+
+def test_undeploy_cleans_readonly_memos_history(tmp_path):
+    path, _ = fixture(tmp_path, "memos")
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    runtime = Path(state.plugin_runtimes["claw-common"]["directory"])
+    history = runtime / "qa-workspace/history"
+    history.mkdir(parents=True)
+    (history / "trace-1.txt").write_text("synthetic history")
+    outside = tmp_path / "external"
+    outside.mkdir()
+    (outside / "keep").write_text("external file")
+    (history / "external").symlink_to(outside, target_is_directory=True)
+    history.chmod(0o555)
+    try:
+        undeploy(state.name, tmp_path, docker)
+    finally:
+        if history.exists():
+            history.chmod(0o755)
+    assert not runtime.exists()
+    assert (outside / "keep").read_text() == "external file"

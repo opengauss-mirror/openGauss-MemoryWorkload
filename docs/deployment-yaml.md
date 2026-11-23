@@ -13,6 +13,24 @@ experiment:
   cleanup_owned_deployment: true  # 成功/失败均清理本命令创建的部署，保留报告
 ```
 
+## 配置 QA 和 Judge 并发
+
+在 `deployment.yaml` 中找到要运行的 `combinations` 条目，在 `memory_integration` 同级添加 `execution`。例如：
+
+```yaml
+    memory_integration: backend_direct
+    execution:
+      qa_concurrency: 4
+      judge_concurrency: 4
+```
+
+`experiment --config deployment.yaml` 和 `run --deployment <部署名>` 都会读取对应组合的配置。使用 Workload 原生入口时，这两个值须为正整数，省略时各为 `1`。
+
+- `backend_direct` 支持配置 QA 和 Judge 并发。同一样本完成历史写入后，再并发执行 QA，并对已生成的答案并发评分。
+- `agent_plugin` 支持配置 Judge 并发。QA 逐题执行，可省略 `qa_concurrency` 或显式设为 `1`。
+
+## 环境变量和服务配置
+
 声明 `env_file` 后，部署 YAML 的值支持 `${NAME}`、`${NAME:-default}`；
 完整标量 `${NAME:int}`、`${NAME:float}`、`${NAME:bool}` 保留对应类型，
 `$${NAME}` 表示字面量 `${NAME}`。替换发生在解析后，不执行 Shell。

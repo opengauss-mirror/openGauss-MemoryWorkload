@@ -19,6 +19,17 @@ python -m pip install -e .
 docker compose version
 ```
 
+## 可选：配置评分并发
+
+在所选示例的 `deployment.yaml` 中找到 `combinations` 条目，在 `memory_integration` 同级添加以下配置：
+
+```yaml
+    execution:
+      judge_concurrency: 4
+```
+
+运行 `memory-bench experiment --config deployment.yaml` 即可。OpenClaw 插件示例逐题执行 QA，Judge 最多同时评分四题。直接连接记忆后端的组合还可以配置 QA 并发。[完整配置说明](../docs/deployment-yaml.md#配置-qa-和-judge-并发)
+
 ## 选择组合
 
 六套组合使用同一官方 Gateway 镜像 `ghcr.io/openclaw/openclaw:2026.6.9`。各记忆系统的后端镜像和插件版本见对应示例。

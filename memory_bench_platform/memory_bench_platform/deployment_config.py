@@ -176,6 +176,11 @@ class PluginRuntime(StrictModel):
     options: dict = Field(default_factory=dict)
 
 
+class DeploymentExecution(StrictModel):
+    qa_concurrency: int | None = Field(default=None, gt=0, strict=True)
+    judge_concurrency: int | None = Field(default=None, gt=0, strict=True)
+
+
 class Combination(StrictModel):
     id: str
     benchmark: str
@@ -191,6 +196,7 @@ class Combination(StrictModel):
     data_path: Path
     entrypoint: str | None = None
     plugin_runtime: PluginRuntime | None = None
+    execution: DeploymentExecution = Field(default_factory=DeploymentExecution)
     preparation: Preparation = Field(default_factory=Preparation)
 
     @model_validator(mode="after")
@@ -199,6 +205,8 @@ class Combination(StrictModel):
             raise ValueError("exactly one of memory and memory_instance is required")
         if self.memory_instance and (self.vector or self.graph):
             raise ValueError("shared memory combination cannot override vector or graph")
+        if self.memory_integration == "agent_plugin" and (self.execution.qa_concurrency or 1) > 1:
+            raise ValueError("agent_plugin deployment requires execution.qa_concurrency=1")
         return self
 
 

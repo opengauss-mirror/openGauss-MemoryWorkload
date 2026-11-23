@@ -68,6 +68,34 @@ def test_rendered_service_config_is_private_and_source_unchanged(tmp_path, monke
     assert '${MODEL_KEY}' in source.read_text()
 
 
+def test_compose_escapes_expanded_values_and_preserves_environment_references(tmp_path, monkeypatch):
+    from memory_bench_platform.deployment_compose import compose_document, compose_expectations, render_project
+
+    path, raw = configured(tmp_path)
+    agent = raw["agents"]["claw"]
+    agent["environment"] = {"LITERAL": "$${OTHER}", "PASSWORD": "${PASSWORD}",
+                            "MEMORY_BENCH_IPV4_ONLY_HOSTS": "example.test"}
+    agent["environment_from"] = {"FORWARDED": "PASSWORD", "NODE_OPTIONS": "NODE_OPTIONS_SOURCE"}
+    agent["command"] = ["echo", "$${OTHER}"]
+    agent["healthcheck"] = ["CMD-SHELL", 'test -n "$$PASSWORD"']
+    path.write_text(yaml.safe_dump(raw))
+    monkeypatch.setenv("PASSWORD", "demo$OTHER")
+    group, = resolve_groups(load_deployment(path))
+    mount = {"type": "bind", "source": str(tmp_path / "$source"), "target": "/config/$file"}
+    rendered = render_project(group, "dotenv-bench", {"agent_claw_common": [mount]})
+    name = "agent_claw_common"
+    document = compose_document(rendered, {name: group.agents["claw-common"]})
+    service = document["services"][name]
+    assert service["environment"]["LITERAL"] == "$${OTHER}"
+    assert service["environment"]["PASSWORD"] == "demo$$OTHER"
+    assert service["environment"]["FORWARDED"] == "${PASSWORD}"
+    assert service["environment"]["NODE_OPTIONS"].startswith("${NODE_OPTIONS_SOURCE} ")
+    assert service["command"] == ["echo", "$${OTHER}"]
+    assert service["healthcheck"]["test"] == ["CMD-SHELL", 'test -n "$$PASSWORD"']
+    assert compose_expectations(document)["services"] == rendered["services"]
+    assert compose_expectations(rendered) == rendered
+
+
 def test_cli_experiment_needs_no_profiling_and_loads_env(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from memory_bench_platform import cli, profiling_experiment

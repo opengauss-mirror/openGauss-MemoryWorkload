@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from .deployment_compose import render_project, required_resources
+from .deployment_compose import compose_document, compose_expectations, render_project, required_resources
 from .deployment_config import (DeploymentConfig, DeploymentGroup, PreparationStep, Service,
                                 _pointer_value, apply_config_overrides, load_deployment, resolve_groups)
 from .deployment_config_files import prepare_instance_configs
@@ -336,7 +337,9 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                     if mount["type"] == "bind" and Path(mount["source"]).is_relative_to(group_dir / "state"):
                         Path(mount["source"]).mkdir(parents=True, exist_ok=True, mode=0o700)
             compose_file = group_dir / "compose.yaml"
-            compose_file.write_text(yaml.safe_dump(rendered, sort_keys=False))
+            document = (compose_document(rendered, _service_templates(group, rendered))
+                        if config.env_file else rendered)
+            compose_file.write_text(yaml.safe_dump(document, sort_keys=False))
             project = rendered["name"]
             state.projects[group.project_key] = project
             state.containers[group.project_key] = {}
@@ -427,7 +430,7 @@ def deploy(config_path: Path, cwd: Path, docker: DockerClient,
                 f"deployment failed: {exc}; rollback failed for {', '.join(rollback_errors)}. "
                 f"Retry with memory-bench undeploy --deployment {config.name}"
             ) from exc
-        shutil.rmtree(directory)
+        _remove_owned_directory(directory)
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise DeploymentFailed(str(exc)) from exc
@@ -459,7 +462,8 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
         groups = {g.project_key: g for g in resolve_groups(config)}
         for group_key, project in state.projects.items():
             group = groups[group_key]
-            rendered = yaml.safe_load((store.directory(name) / group_key / "compose.yaml").read_text())
+            compose_file = store.directory(name) / group_key / "compose.yaml"
+            rendered = compose_expectations(yaml.safe_load(compose_file.read_text()))
             for service_name, template in _service_templates(group, rendered).items():
                 cid = state.containers[group_key][service_name]
                 if docker.compose_ps(project, store.directory(name) / group_key / "compose.yaml", service_name) != cid:
@@ -488,6 +492,28 @@ def status(name: str, cwd: Path, docker: DockerClient) -> DeploymentStatus:
     return DeploymentStatus(state.ready and not drift, tuple(drift), state)
 
 
+def _remove_owned_directory(directory: Path) -> None:
+    def retry_readonly_parent(func, path, exc_info):
+        error = exc_info[1]
+        entry = Path(path)
+        parent = entry.parent
+        if (not isinstance(error, PermissionError) or func not in (os.unlink, os.rmdir)
+                or not parent.is_relative_to(directory)):
+            raise error
+        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            mode = stat.S_IMODE(info.st_mode)
+            if info.st_uid != os.geteuid() or mode & stat.S_IWUSR:
+                raise error
+            os.fchmod(fd, mode | stat.S_IWUSR)
+            func(entry.name, dir_fd=fd)
+        finally:
+            os.close(fd)
+
+    shutil.rmtree(directory, onerror=retry_readonly_parent)
+
+
 def undeploy(name: str, cwd: Path, docker: DockerClient) -> None:
     store = DeploymentStore(cwd)
     store.acquire_lock(name)
@@ -502,6 +528,6 @@ def undeploy(name: str, cwd: Path, docker: DockerClient) -> None:
         for group_key, project in reversed(list(state.projects.items())):
             compose_file = store.directory(name) / group_key / "compose.yaml"
             docker.compose_down(project, compose_file)
-        shutil.rmtree(store.directory(name))
+        _remove_owned_directory(store.directory(name))
     finally:
         store.release_lock(name)

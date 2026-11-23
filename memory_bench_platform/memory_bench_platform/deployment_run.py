@@ -104,6 +104,10 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                         "--run-id", f"{suite_id}-{combo.id}"]
                 if combo.entrypoint:
                     argv += ["--entrypoint", combo.entrypoint]
+                if combo.execution.qa_concurrency is not None:
+                    argv += ["--qa-concurrency", str(combo.execution.qa_concurrency)]
+                if combo.execution.judge_concurrency is not None:
+                    argv += ["--judge-concurrency", str(combo.execution.judge_concurrency)]
                 if profiling_config is not None:
                     from .profiling_config import load_profiling_config
                     from .profiling_targets import resolve_targets
