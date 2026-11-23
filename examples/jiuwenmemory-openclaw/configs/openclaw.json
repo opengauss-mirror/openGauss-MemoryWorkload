@@ -1,0 +1,24 @@
+{
+  "models": {
+    "providers": {
+      "bench": {
+        "baseUrl": "${LLM_BASE_URL}",
+        "apiKey": "${LLM_API_KEY}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "${LLM_MODEL}",
+            "name": "${LLM_MODEL}"
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "bench/${LLM_MODEL}"
+      }
+    }
+  }
+}

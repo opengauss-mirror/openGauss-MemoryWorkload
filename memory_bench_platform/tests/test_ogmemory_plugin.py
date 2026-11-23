@@ -666,7 +666,7 @@ def test_degraded_phase_requires_native_engine_after_restart(runtime, monkeypatc
     monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(path.parent / "state"))
     monkeypatch.setattr(module.gateway_recovery, "dedicated_container", lambda path, env: "dedicated")
-    monkeypatch.setattr(module.gateway_recovery, "wait_gateway", lambda config: None)
+    monkeypatch.setattr(module.gateway_recovery, "wait_gateway", lambda config, container: None)
     calls = []
     def docker(cmd, **kwargs):
         calls.append(cmd[1])
@@ -690,7 +690,7 @@ def test_quarantined_compact_restores_only_gateway(runtime, monkeypatch, rpc_res
     monkeypatch.setenv("OPENCLAW_TRANSPORT", "http")
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(path.parent / "state"))
     monkeypatch.setattr(module.gateway_recovery, "dedicated_container", lambda path, env: "sample-gateway")
-    monkeypatch.setattr(module.gateway_recovery, "wait_gateway", lambda config: None)
+    monkeypatch.setattr(module.gateway_recovery, "wait_gateway", lambda config, container: None)
     submitted, restarts, probes = [], [], []
     quarantined = False
     loaded = f"http server listening (1 plugin: {module.PLUGIN};"

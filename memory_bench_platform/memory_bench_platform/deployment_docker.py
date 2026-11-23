@@ -11,6 +11,13 @@ from typing import Callable
 
 
 class DockerClient:
+    def container_logs(self, container: str) -> str:
+        result = self.command(["docker", "logs", "--tail", "10000", container],
+                              text=True, capture_output=True, check=False, timeout=30)
+        if result.returncode:
+            raise RuntimeError("could not archive container logs")
+        return result.stdout + result.stderr
+
     def __init__(self, command: Callable[..., subprocess.CompletedProcess] = subprocess.run):
         self.command = command
 

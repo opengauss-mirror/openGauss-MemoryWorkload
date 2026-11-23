@@ -1,0 +1,46 @@
+llm:
+  provider: openai
+  api_key: $${LLM_API_KEY}
+  base_url: $${LLM_BASE_URL}
+  model: $${LLM_MODEL}
+  max_tokens: 16384
+embedding:
+  provider: openai
+  api_key: $${EMBEDDING_API_KEY}
+  base_url: $${EMBEDDING_BASE_URL}
+  model: $${EMBEDDING_MODEL}
+vector_db:
+  type: opengauss
+  connection_string: host=vector port=5432 dbname=postgres user=gaussdb
+  dimension: $${EMBEDDING_DIMENSION}
+  table_name: vector_index
+storage:
+  backend: agfs
+agfs:
+  base_url: http://127.0.0.1:1833
+  mount_prefix: /local/plugin
+service:
+  http_port: 8090
+  workers: 1
+  threads: 2
+mcp:
+  enabled: false
+index:
+  interval: 15
+  workers: 1
+identity:
+  account_id: workload
+  user_id: workload
+  agent_id: workload
+auth:
+  role_control_enabled: true
+  root_api_key: $${OG_ROOT_API_KEY}
+memory:
+  after_turn_threshold: 1000000
+  mode: eager
+  dual_pass_enabled: false
+extraction:
+  mode: eager
+  dual_pass_enabled: false
+agent_memory:
+  enabled: false

@@ -5,6 +5,7 @@ agent: openclaw
 memory: hindsight
 entry:
   runner: scripts/run_lifecycle.py
+  deployer: scripts/deploy_runtime.py
 runtime:
   actions: [validate, prepare, set_phase, before_agent, after_agent, finalize]
 capabilities:

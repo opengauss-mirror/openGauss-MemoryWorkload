@@ -5,6 +5,7 @@ agent: openclaw
 memory: openviking
 entry:
   runner: scripts/run_lifecycle.py
+  deployer: scripts/deploy_runtime.py
 runtime:
   actions:
     - validate

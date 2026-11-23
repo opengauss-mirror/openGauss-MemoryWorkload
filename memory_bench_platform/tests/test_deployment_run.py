@@ -25,6 +25,7 @@ def test_run_deployment_routes_each_combination_and_summarizes(tmp_path, monkeyp
     rc = run_deployment("suite", tmp_path, None, docker, invoke)
     assert rc == 0
     assert len(seen) == 2
+    assert all("--qa-concurrency" not in argv and "--judge-concurrency" not in argv for argv, _, _ in seen)
     assert seen[0][1]["MEMORY_URL"] == "http://127.0.0.1:28080"
     assert seen[0][1]["SERVICE_URL"] == "http://127.0.0.1:28080"
     assert "WORKER_URL" not in seen[0][1]
@@ -33,6 +34,29 @@ def test_run_deployment_routes_each_combination_and_summarizes(tmp_path, monkeyp
     summaries = list((tmp_path / "runs").glob("suite-*/suite_summary.json"))
     assert len(summaries) == 1
     assert len(json.loads(summaries[0].read_text())["combinations"]) == 2
+
+
+def test_deployment_run_forwards_concurrency_per_combination(tmp_path):
+    path, raw = fixture_config(tmp_path)
+    direct, plugin = raw["combinations"]
+    direct["memory_integration"] = "backend_direct"
+    direct["execution"] = {"qa_concurrency": 4, "judge_concurrency": 3}
+    plugin["execution"] = {"judge_concurrency": 2}
+    path.write_text(yaml.safe_dump(raw))
+
+    docker = RecordingDocker()
+    deploy(path, tmp_path, docker)
+    seen = []
+
+    def invoke(argv, *, env, cwd):
+        seen.append(argv)
+        return 0
+
+    assert run_deployment("suite", tmp_path, None, docker, invoke) == 0
+    assert len(seen) == 2
+    assert seen[0][-4:] == ["--qa-concurrency", "4", "--judge-concurrency", "3"]
+    assert "--qa-concurrency" not in seen[1]
+    assert seen[1][-2:] == ["--judge-concurrency", "2"]
 
 
 def test_deployment_run_forwards_profile_to_each_child(tmp_path):

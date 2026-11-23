@@ -285,3 +285,18 @@ def test_unknown_yaml_field_and_duplicate_combination_rejected(tmp_path):
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ValueError, match="duplicate"):
         load_deployment(path)
+
+
+@pytest.mark.parametrize(("execution", "message"), [
+    ({"qa_concurrency": 2}, "agent_plugin deployment requires execution.qa_concurrency=1"),
+    ({"qa_concurrency": 0}, "greater than 0"),
+    ({"judge_concurrency": -1}, "greater than 0"),
+    ({"judge_concurrency": True}, "valid integer"),
+    ({"sample_concurrency": 2}, "Extra inputs are not permitted"),
+])
+def test_invalid_deployment_concurrency(tmp_path, execution, message):
+    path, raw = fixture_config(tmp_path)
+    raw["combinations"][0]["execution"] = execution
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match=message):
+        load_deployment(path)

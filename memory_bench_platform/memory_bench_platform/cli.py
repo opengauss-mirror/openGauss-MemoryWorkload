@@ -113,7 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_experiment = sub.add_parser("experiment")
     p_experiment.add_argument("--config", type=Path, required=True)
-    p_experiment.add_argument("--profiling-config", type=Path, required=True)
+    p_experiment.add_argument("--profiling-config", type=Path,
+                              help="Optional performance collection configuration")
     p_experiment.add_argument("--pressure-test")
     p_experiment.add_argument("--cleanup-owned-deployment", action="store_true")
 
@@ -953,6 +954,25 @@ def _build_smoke_summary(run_id: str, smoke_id: str, result: dict) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    from .deployment_env import deployment_environment
+    config_path = None
+    if args.command in {"deploy", "experiment"}:
+        config_path = getattr(args, "config", None)
+    if (args.command == "run" and args.deployment) or (
+            args.command == "deploy" and args.deploy_action == "status"):
+        from .deployment_store import DeploymentStore
+        config_path = Path(DeploymentStore(Path.cwd()).read(args.deployment).config_path)
+    try:
+        with deployment_environment(config_path):
+            return _main(args, parser)
+    except ValueError as exc:
+        if config_path is None:
+            # Preserve the existing non-deployment CLI/API error contract.
+            raise
+        parser.error(str(exc))
+
+
+def _main(args, parser) -> None:
     if args.command == "experiment":
         from .deployment_docker import DockerClient
         from .profiling_experiment import run_experiment

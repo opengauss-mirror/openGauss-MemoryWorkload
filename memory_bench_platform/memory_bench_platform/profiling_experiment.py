@@ -26,16 +26,17 @@ class ExperimentResult:
     suite_dir: Path | None
 
 
-def run_experiment(config_path: Path, profiling_path: Path, cwd: Path, docker, *,
+def run_experiment(config_path: Path, profiling_path: Path | None, cwd: Path, docker, *,
                    pressure_test: str | None = None,
                    cleanup_owned_deployment: bool = False) -> ExperimentResult:
     if pressure_test is not None:
         raise ValueError("--pressure-test requires the separate multi-agent pressure implementation")
     config_path = config_path.resolve()
-    profiling_path = profiling_path.resolve()
+    profiling_path = profiling_path.resolve() if profiling_path else None
     config = load_deployment(config_path)
-    profile = load_profiling_config(profiling_path)
-    if profile.mode == "required" and profile.hardware.stat != "off" and (
+    cleanup_owned_deployment = cleanup_owned_deployment or config.experiment.cleanup_owned_deployment
+    profile = load_profiling_config(profiling_path) if profiling_path else None
+    if profile and profile.mode == "required" and profile.hardware.stat != "off" and (
             platform.system() != "Linux" or shutil.which("perf") is None):
         raise RuntimeError("required perf is unavailable on this host")
 
@@ -60,6 +61,8 @@ def run_experiment(config_path: Path, profiling_path: Path, cwd: Path, docker, *
         record("create", "completed")
         store = DeploymentStore(cwd)
         if store.directory(config.name).exists():
+            if config.experiment.fresh:
+                raise RuntimeError("fresh experiment requires an absent deployment; undeploy the previous owned environment first")
             deployed = store.read(config.name)
             if (Path(deployed.config_path).resolve() != config_path or
                     deployed.config_sha256 != hashlib.sha256(config_path.read_bytes()).hexdigest()):
@@ -100,6 +103,19 @@ def run_experiment(config_path: Path, profiling_path: Path, cwd: Path, docker, *
         record("experiment", "failed", error_type=type(exc).__name__)
         raise
     finally:
+        # Preserve container evidence before removing owned services. Archives are
+        # private; raw service logs may contain model inputs or credentials.
+        if owned and hasattr(docker, "container_logs"):
+            try:
+                deployed = DeploymentStore(cwd).read(config.name)
+                for group, services in deployed.containers.items():
+                    for service, cid in services.items():
+                        log = archive / f"{group}-{service}.log"
+                        with os.fdopen(os.open(log, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600), "w") as stream:
+                            stream.write(docker.container_logs(cid))
+                record("logs", "completed")
+            except Exception as exc:
+                record("logs", "unavailable", error_type=type(exc).__name__)
         if owned and cleanup_owned_deployment:
             try:
                 undeploy(config.name, cwd, docker)

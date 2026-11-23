@@ -46,7 +46,7 @@ def operations(config, bank, missing=False):
         headers['Authorization'] = 'Bearer ' + cfg['hindsightApiToken']
     rows, offset = [], 0
     while True:
-        url = cfg['hindsightApiUrl'].rstrip('/') + '/v1/default/banks/' + bank + '/operations?limit=100&offset=' + str(offset)
+        url = (os.environ.get('HINDSIGHT_PLUGIN_API_URL') or cfg['hindsightApiUrl']).rstrip('/') + '/v1/default/banks/' + bank + '/operations?limit=100&offset=' + str(offset)
         try:
             with urllib.request.build_opener(NoRedirect()).open(urllib.request.Request(url, headers=headers), timeout=20) as response:
                 page = json.load(response)

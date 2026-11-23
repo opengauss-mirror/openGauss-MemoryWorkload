@@ -93,6 +93,36 @@ def test_owned_cleanup_only_when_requested(tmp_path, monkeypatch):
     assert (result.archive_dir / "experiment.json").is_file()
 
 
+def test_interrupted_experiment_removes_readonly_history(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_experiment as module
+    from test_deployment_more_plugins import fixture
+
+    config, raw = fixture(tmp_path, "memos")
+    raw["experiment"] = {"fresh": True, "cleanup_owned_deployment": True}
+    config.write_text(yaml.safe_dump(raw))
+    history = None
+
+    def interrupt(*args, **kwargs):
+        nonlocal history
+        state = module.DeploymentStore(tmp_path).read("suite")
+        runtime = Path(state.plugin_runtimes["claw-common"]["directory"])
+        history = runtime / "qa-workspace/history"
+        history.mkdir(parents=True)
+        (history / "trace-1.txt").write_text("synthetic history")
+        history.chmod(0o555)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "run_deployment", interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            module.run_experiment(config, None, tmp_path, RecordingDocker())
+    finally:
+        if history is not None and history.exists():
+            history.chmod(0o755)
+    assert history is not None
+    assert not module.DeploymentStore(tmp_path).directory("suite").exists()
+
+
 def test_run_failure_retains_experiment_archive(tmp_path, monkeypatch):
     from memory_bench_platform import profiling_experiment as module
     config, profile = _files(tmp_path)
@@ -120,6 +150,36 @@ def test_pressure_test_still_rejected(tmp_path):
     with pytest.raises(ValueError, match="pressure-test"):
         run_experiment(config, profile, tmp_path, RecordingDocker(), pressure_test="many")
     assert not (tmp_path / ".memory-bench" / "deployments" / "suite").exists()
+
+
+def test_plain_experiment_honors_cleanup_config_without_profiling(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_experiment as module
+    config, _ = _files(tmp_path)
+    raw = yaml.safe_load(config.read_text())
+    raw['experiment'] = {'fresh': True, 'cleanup_owned_deployment': True}
+    config.write_text(yaml.safe_dump(raw))
+    def run(*args, **kwargs):
+        assert kwargs['profiling_config'] is None
+        return _fake_run(tmp_path)(*args, **kwargs)
+    monkeypatch.setattr(module, 'run_deployment', run)
+    monkeypatch.setattr(module, 'analyze_run', lambda *_: None)
+    result = module.run_experiment(config, None, tmp_path, RecordingDocker())
+    assert result.status == 'completed'
+    assert not module.DeploymentStore(tmp_path).directory('suite').exists()
+
+
+def test_fresh_experiment_never_deletes_existing_deployment(tmp_path, monkeypatch):
+    from memory_bench_platform import profiling_experiment as module
+    config, _ = _files(tmp_path)
+    raw = yaml.safe_load(config.read_text())
+    raw['experiment'] = {'fresh': True, 'cleanup_owned_deployment': True}
+    config.write_text(yaml.safe_dump(raw))
+    docker = RecordingDocker()
+    module.deploy(config, tmp_path, docker)
+    monkeypatch.setattr(module, 'run_deployment', lambda *a, **kw: pytest.fail('must not run'))
+    with pytest.raises(RuntimeError, match='fresh experiment'):
+        module.run_experiment(config, None, tmp_path, docker)
+    assert module.DeploymentStore(tmp_path).directory('suite').exists()
 
 
 def test_unsupported_platform_best_effort_keeps_skipped_hardware(tmp_path):

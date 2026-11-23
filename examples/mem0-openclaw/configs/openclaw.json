@@ -1,0 +1,65 @@
+{
+  "models": {
+    "providers": {
+      "bench": {
+        "baseUrl": "${LLM_BASE_URL}",
+        "apiKey": "${LLM_API_KEY}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "${LLM_MODEL}",
+            "name": "${LLM_MODEL}"
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "bench/${LLM_MODEL}"
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "openclaw-mem0": {
+        "config": {
+          "mode": "open-source",
+          "oss": {
+            "embedder": {
+              "provider": "openai",
+              "config": {
+                "apiKey": "${EMBEDDING_API_KEY}",
+                "baseURL": "${EMBEDDING_BASE_URL}",
+                "model": "${EMBEDDING_MODEL}",
+                "embeddingDims": "${EMBEDDING_DIMENSION:int}"
+              }
+            },
+            "llm": {
+              "provider": "openai",
+              "config": {
+                "apiKey": "${LLM_API_KEY}",
+                "baseURL": "${LLM_BASE_URL}",
+                "model": "${LLM_MODEL}"
+              }
+            },
+            "vectorStore": {
+              "provider": "pgvector",
+              "config": {
+                "host": "vector",
+                "port": 5432,
+                "user": "postgres",
+                "password": "${DB_PASSWORD}",
+                "dbname": "postgres",
+                "collectionName": "workload",
+                "embeddingModelDims": "${EMBEDDING_DIMENSION:int}"
+              }
+            },
+            "historyDbPath": "/runtime/mem0-history.db"
+          }
+        }
+      }
+    }
+  }
+}
