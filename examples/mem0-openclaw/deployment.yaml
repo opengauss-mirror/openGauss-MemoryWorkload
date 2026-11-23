@@ -14,6 +14,7 @@ agents:
     container_port: 18789
     environment:
       NODE_PATH: /official
+    healthcheck_interval_seconds: 5
     healthcheck:
     - CMD
     - node

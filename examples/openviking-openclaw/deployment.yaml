@@ -12,6 +12,7 @@ agents:
     - gateway
     - run
     container_port: 18789
+    healthcheck_interval_seconds: 5
     healthcheck:
     - CMD
     - node

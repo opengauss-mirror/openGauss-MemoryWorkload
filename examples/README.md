@@ -661,6 +661,8 @@ export MEMORY_BENCH_JUDGE_MAX_TOKENS=2048
 
 聊天接口用于回答和默认 Judge。Embedding 接口必须提供 `/embeddings`。如果使用无需鉴权的内部 Embedding 服务，密钥可填 `local`。Judge 若使用独立服务，设置相应的三个 `LOCOMO_*` 变量。
 
+MemOS 插件在 QA 阶段默认最多等待召回 **30 秒**。需要调整时，在当前目录的 `.env` 中修改 `MEMOS_BEFORE_PROMPT_SOFT_TIMEOUT_MS`（单位：毫秒）；同名 Shell 环境变量优先。比较评测结果时请记录实际值，因为超时后返回的记忆无法注入本次回答。
+
 ### 3. 部署、测试、看报告
 
 ```bash

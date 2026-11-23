@@ -13,6 +13,8 @@ agents:
     - run
     container_port: 18789
     healthcheck_interval_seconds: 5
+    environment:
+      MEMOS_BEFORE_PROMPT_SOFT_TIMEOUT_MS: "${MEMOS_BEFORE_PROMPT_SOFT_TIMEOUT_MS:-30000}"
     healthcheck:
     - CMD
     - node
