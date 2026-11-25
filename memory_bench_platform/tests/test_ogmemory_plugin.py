@@ -668,8 +668,13 @@ def test_degraded_phase_requires_native_engine_after_restart(runtime, monkeypatc
     monkeypatch.setattr(module.gateway_recovery, "dedicated_container", lambda path, env: "dedicated")
     monkeypatch.setattr(module.gateway_recovery, "wait_gateway", lambda config, container: None)
     calls = []
+    now = [0.0]
+    monkeypatch.setattr(module.gateway_recovery.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module.gateway_recovery.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
     def docker(cmd, **kwargs):
         calls.append(cmd[1])
+        if cmd[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout="true", stderr="")
         engine = module.PLUGIN if plugin_loaded else "other"
         return SimpleNamespace(returncode=0, stdout=f"[gateway] http server listening (1 plugin: {engine}; 1s)", stderr="")
     monkeypatch.setattr(module.subprocess, "run", docker)
@@ -679,7 +684,8 @@ def test_degraded_phase_requires_native_engine_after_restart(runtime, monkeypatc
     else:
         with pytest.raises(RuntimeError, match="did not confirm"):
             run("set_phase", phase="qa", recover_read_only=True, scope_id="r:a")
-    assert calls == ["restart", "logs"]
+    assert calls[:2] == ["restart", "logs"]
+    assert calls.count("restart") == 1
 
 @pytest.mark.parametrize("rpc_result,archive", [("legacy_success", True), ("cli_error", False)])
 def test_quarantined_compact_restores_only_gateway(runtime, monkeypatch, rpc_result, archive):

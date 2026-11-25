@@ -266,7 +266,7 @@ def test_parallel_qa_shared_state_counts_each_transcript_once(tmp_path):
 
 @pytest.mark.parametrize("failure,restore,graded", [
     ("SettledHistoryFailure", True, True),
-    ("SettledHistoryFailure", False, True),
+    ("SettledHistoryFailure", False, False),
     ("TimeoutError", True, True),
     ("RuntimeError", True, True),
 ])
@@ -290,7 +290,7 @@ def test_plugin_history_failure_and_read_only_gate(tmp_path, monkeypatch, failur
                     "output": {"read_only_verified": restore}}
         if step.operator_kind == "agent":
             if step.inputs["metadata"]["purpose"] == "memory_qa":
-                assert switches and (restore or step.inputs.get("qa_without_plugin"))
+                assert switches and restore
                 qa.append(step.step_id)
             return {"status": "ok", "output": {"session_handle": "session"}, "turns": [{"text": "tea"}]}
         return {"status": "ok", "output": {"operation": {"id": step.step_id}, "ready": True}}
@@ -387,39 +387,3 @@ def test_session_failure_continues_sibling_sessions_and_qa(tmp_path, monkeypatch
                for row in result["step_results"] if row.step_id.endswith("agent-answer"))
 
 
-@pytest.mark.parametrize("api", ["openai-completions", "openai-responses"])
-def test_isolated_answer_uses_original_question_and_sample_model(tmp_path, api):
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from threading import Thread
-    from memory_bench_platform.workflow_operators import _answer_without_plugin
-
-    requests = []
-    class Model(BaseHTTPRequestHandler):
-        def do_POST(self):
-            requests.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
-            raw = {"usage": {"input_tokens": 4, "output_tokens": 1},
-                   "choices": [{"message": {"content": "tea"}}],
-                   "output": [{"type": "message", "content": [{"type": "output_text", "text": "tea"}]}]}
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(json.dumps(raw).encode())
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Model)
-    thread = Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        path = tmp_path / "config.json"
-        path.write_text(json.dumps({"agents": {"defaults": {"model": {"primary": "bench/original"}}},
-            "models": {"providers": {"bench": {"api": api, "baseUrl": f"http://127.0.0.1:{server.server_port}/v1"}}}}))
-        q = RenderedTaskInput(task_id="q", system_prompt="Original rules",
-                              messages=[{"role": "user", "content": "Original question"}])
-        with adapter_environment({"OPENCLAW_CONFIG_PATH": str(path)}):
-            answer = _answer_without_plugin("model_without_plugin", q)
-        assert answer["agent_answer"] == "tea" and answer["raw"]["usage"]["input_tokens"] == 4
-        [(route, body)] = requests
-        assert route == ("/v1/responses" if api == "openai-responses" else "/v1/chat/completions")
-        assert body["model"] == "original" and "tools" not in body
-        assert (body.get("input") or body["messages"])[-1] == q.messages[-1]
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()

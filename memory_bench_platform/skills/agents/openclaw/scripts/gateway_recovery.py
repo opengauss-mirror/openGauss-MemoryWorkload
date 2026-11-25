@@ -62,8 +62,36 @@ def restart_dedicated_gateway(runtime_dir, container_env, config, *, expected_pl
     wait_gateway(config, container)
     if expected_plugin is None:
         return
-    startup = operation_logs(container, started)
-    for plugin_list in re.findall(r"http server listening \(\d+ plugins?: ([^;)\n]+)[;)]", startup):
-        if expected_plugin in (name.strip() for name in plugin_list.split(",")):
-            return
-    raise RuntimeError(f"Restarted Gateway did not confirm the native plugin {expected_plugin}")
+    deadline = time.monotonic() + 30
+    diagnostic = {"container": container, "since": started, "plugin": expected_plugin,
+                  "confirmed": False, "attempts": 0}
+    try:
+        while time.monotonic() < deadline:
+            diagnostic["attempts"] += 1
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                logs = subprocess.run(["docker", "logs", "--since", started, container],
+                                      capture_output=True, text=True, timeout=min(5, remaining))
+                diagnostic["log_returncode"] = logs.returncode
+                diagnostic["log_error"] = logs.stderr if logs.returncode else None
+                startup = logs.stdout + "\n" + logs.stderr if logs.returncode == 0 else ""
+                plugins = re.findall(r"http server listening \(\d+ plugins?: ([^;)\n]+)[;)]", startup)
+                diagnostic["observed_plugins"] = plugins
+                if any(expected_plugin in (name.strip() for name in names.split(",")) for names in plugins):
+                    diagnostic["confirmed"] = True
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                state = subprocess.run(["docker", "inspect", "--format", "{{.State.Running}}", container],
+                                       capture_output=True, text=True, timeout=min(5, remaining))
+                diagnostic["container_state"] = state.stdout.strip()
+                if state.returncode == 0 and state.stdout.strip() == "false":
+                    raise RuntimeError("Restarted Gateway exited before plugin confirmation")
+            except (OSError, subprocess.SubprocessError) as exc:
+                diagnostic["log_error"] = f"{type(exc).__name__}: {exc}"
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+        raise RuntimeError(f"Restarted Gateway did not confirm the native plugin {expected_plugin}; "
+                           f"see {runtime_dir / 'gateway-readiness.json'}")
+    finally:
+        (runtime_dir / "gateway-readiness.json").write_text(json.dumps(diagnostic, indent=2), encoding="utf-8")

@@ -84,28 +84,34 @@ def capture_receipt(path, after_id, session_key):
     return matching[0] if matching else None
 
 
-def recall_receipt(text):
+def recall_receipt(text, allow_recall_failure=False):
     # Original plugin prints a compact completion line even when structured
     # logger fields are omitted by the host. Exclusive serial window required.
-    if any(marker in text for marker in ('memos.onTurnStart.failed', 'memos.onTurnStart.soft_timeout', 'memos.onTurnStart.late_failure', 'memos.onTurnEnd.failed', 'closeSession.flush_failed')):
+    if any(marker in text for marker in ('memos.onTurnEnd.failed', 'closeSession.flush_failed')):
+        raise RuntimeError('Official MemOS hook failed or timed out')
+    failures = [marker for marker in ('memos.onTurnStart.failed', 'memos.onTurnStart.soft_timeout', 'memos.onTurnStart.late_failure') if marker in text]
+    if failures and not allow_recall_failure:
         raise RuntimeError('Official MemOS hook failed or timed out')
     hits = re.findall(r'memos\.onTurnStart returned hits=(\d+) durationMs=[\d.]+ contextChars=(\d+) injected=(yes|no) truncated=(yes|no) softTimedOut=(yes|no)', text)
     if len(hits) > 1:
         raise RuntimeError('Multiple recall receipts in exclusive request window')
     if not hits:
-        return None
+        return {'recall_verified': False, 'errors': failures} if failures else None
     count, chars, injected, truncated, timed_out = hits[0]
-    if timed_out != 'no':
+    if timed_out != 'no' and not allow_recall_failure:
         raise RuntimeError('Native recall soft timeout; late results are not valid injection')
-    return {'hits': int(count), 'context_chars': int(chars), 'injected': injected == 'yes', 'truncated': truncated == 'yes', 'soft_timed_out': False}
+    result = {'hits': int(count), 'context_chars': int(chars), 'injected': injected == 'yes', 'truncated': truncated == 'yes', 'soft_timed_out': timed_out != 'no'}
+    if failures or timed_out != 'no':
+        result.update(recall_verified=False, errors=failures)
+    return result
 
 
-def container_logs(name, since):
+def container_logs(name, since, allow_recall_failure=False):
     p = subprocess.run(['docker', 'logs', '--since', str(since), name], capture_output=True, text=True, check=True, timeout=15)
     text = p.stdout + '\n' + p.stderr
     # Check each source independently: duplicate receipts or failures in either
     # source must not be hidden by merging. Always inspect the file window.
-    console_recall = recall_receipt(text)
+    console_recall = recall_receipt(text, allow_recall_failure)
     script = r"""
 const fs=require('node:fs');const since=Number(process.argv[1])*1000;
 const dir='/tmp/openclaw';
@@ -127,13 +133,18 @@ if(fs.existsSync(dir))for(const file of fs.readdirSync(dir).filter(n=>/^openclaw
     if fallback.returncode != 0:
         return text
     file_text = fallback.stdout
-    file_recall = recall_receipt(file_text)
-    if console_recall and file_recall and console_recall != file_recall:
+    file_recall = recall_receipt(file_text, allow_recall_failure)
+    receipt_fields = ('hits', 'context_chars', 'injected', 'truncated', 'soft_timed_out')
+    console_complete = console_recall is not None and 'hits' in console_recall
+    file_complete = file_recall is not None and 'hits' in file_recall
+    if console_complete and file_complete and any(console_recall[key] != file_recall[key] for key in receipt_fields):
         raise RuntimeError('Conflicting recall receipts across native log sources')
-    # Keep all file events, including identical messages. Select one source for
-    # recall counting; only supplement completion markers from the other source.
-    selected = file_text if file_recall is not None else text
-    for marker in ('memos.agent_end.skipped', 'memos.onTurnEnd'):
+    # Count one complete receipt, but preserve diagnostics from both sources.
+    # A failure-only file log must not replace a complete console receipt.
+    selected = file_text if file_complete else text
+    for marker in ('memos.agent_end.skipped', 'memos.onTurnEnd',
+                   'memos.onTurnStart.failed', 'memos.onTurnStart.soft_timeout',
+                   'memos.onTurnStart.late_failure'):
         if marker not in selected and (marker in text or marker in file_text):
             selected += '\n' + marker
     return selected
@@ -513,8 +524,9 @@ def _dispatch(request, root, info, config):
             deadline = time.monotonic() + info.get('completion_timeout_seconds', 600)
             scoped_capture = pending["phase"] == "ingest" and bool(state.get("failed_ingest_sessions"))
             while time.monotonic() < deadline:
-                log = container_logs(info['container'], pending['log_since']) if lease == 'pending' and not scoped_capture else ''
-                recall = (recall_receipt(log) if lease == 'pending' and not scoped_capture else
+                log_args = {'allow_recall_failure': True} if pending['phase'] == 'ingest' else {}
+                log = container_logs(info['container'], pending['log_since'], **log_args) if lease == 'pending' and not scoped_capture else ''
+                recall = (recall_receipt(log, **log_args) if lease == 'pending' and not scoped_capture else
                           {'recall_verified': False, 'recall_verification_reason': 'gateway_window_shared'})
                 snapshot = db_snapshot(db)
                 capture = capture_receipt(db, pending['before']['add_id'], pending['session_key']) if pending['phase'] == 'ingest' else None
