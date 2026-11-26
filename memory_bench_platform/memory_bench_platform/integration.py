@@ -47,14 +47,28 @@ def adapter_environment(environment: dict[str, str] | None):
         _adapter_environment.reset(token)
 
 
+# Keys exported by each deployment adapter. Both point to the endpoints the
+# plugin actually uses, so scheduling validates the same binding as execution.
+MANAGED_GATEWAYS = {
+    "openclaw-ogmemory": ("OGMEM_GATEWAY_CONTAINER", "OGMEM_API_URL"),
+    "openclaw-jiuwenmemory": ("JIUWEN_MCP_GATEWAY_CONTAINER", "JIUWENMEMORY_MCP_URL"),
+    "openclaw-mem0": ("MEM0_GATEWAY_CONTAINER", "MEM0_SHARED_VECTOR_STORE"),
+    "openclaw-memos-local": ("MEMOS_LOCAL_GATEWAY_CONTAINER", None),
+    "openclaw-hindsight": ("HINDSIGHT_GATEWAY_CONTAINER", "HINDSIGHT_PLUGIN_API_URL"),
+    "openclaw-openviking": ("OPENVIKING_GATEWAY_CONTAINER", "OPENVIKING_PLUGIN_API_URL"),
+}
+
+
 @contextmanager
-def sample_runtime_environment(runtime_context, sample):
+def sample_runtime_environment(runtime_context, sample, gateway=None):
     import hashlib
-    environment = {**_adapter_environment.get(), **runtime_context.sample_environments.get(sample, {})}
+    environment = {**_adapter_environment.get(), **(gateway or runtime_context.sample_environments.get(sample, {}))}
     if runtime_context.memory_integration == "agent_plugin":
         plugin_dir = Path(runtime_context.run_dir) / "artifacts" / "sample-runtimes" / hashlib.sha256(sample.encode()).hexdigest()
         plugin_dir.mkdir(parents=True, exist_ok=True)
         environment["MEMORY_BENCH_PLUGIN_RUN_DIR"] = str(plugin_dir)
+        if gateway:
+            environment["MEMORY_BENCH_POOL_RUN_DIR"] = str(Path(runtime_context.run_dir).resolve())
     with adapter_environment(environment):
         yield
 
@@ -413,7 +427,7 @@ def run_agent_task(skill_id: str, rendered_input: RenderedTaskInput, *,
     )
 
 
-def validate_sample_identities(context, skill_id, sample_scopes):
+def validate_sample_identities(context, skill_id, sample_scopes, *, managed_gateway=None):
     """Run an optional skill-local preflight before scheduling any sample writes."""
     if not skill_id or Path(skill_id).name != skill_id or skill_id in {".", ".."}:
         raise ValueError("Invalid skill ID for sample isolation")
@@ -425,7 +439,7 @@ def validate_sample_identities(context, skill_id, sample_scopes):
     for sample, scopes in sample_scopes.items():
         try:
             payload = run_json_script(script, stdin_payload={"scopes": sorted(scopes)},
-                                      environment=context.sample_environments.get(sample, {}), timeout_seconds=60)
+                                      environment=managed_gateway or context.sample_environments.get(sample, {}), timeout_seconds=60)
         except (subprocess.SubprocessError, ValueError) as exc:
             raise ValueError(f"{skill_id} memory identity preflight failed for sample {sample}") from exc
         identities = payload.get("identities")

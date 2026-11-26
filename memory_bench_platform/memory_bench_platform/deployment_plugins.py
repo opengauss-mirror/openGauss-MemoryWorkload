@@ -45,57 +45,58 @@ def prepare_plugin_runtimes(group, group_dir: Path, rendered: dict) -> dict:
         spec = combo.plugin_runtime
         agent, memory = group.agents[combo.id], group.memory_template
         script, adapter = deployment_adapter(agent.skill, memory.skill)
-        directory = (group_dir / "plugin-runtimes" / combo.id).resolve()
-        name = "agent_" + combo.id.replace("-", "_")
-        context = {"directory": str(directory), "gateway_port": agent.container_port,
-                   "memory_port": memory.container_port,
-                   "memory_url": f"{memory.endpoint_scheme}://{'127.0.0.1' if memory.placement == 'agent' else 'memory'}:{memory.container_port}" if memory.container_port else ""}
-        sources = {"memory_config": str((group.source_root / spec.memory_config).resolve()) if spec.memory_config else None,
-                   "source_config": str((group.source_root / spec.source_config).resolve()),
-                   "upstream_plugin": str((group.source_root / spec.upstream_plugin).resolve()) if spec.upstream_plugin else None,
-                   "options": spec.options}
-        if spec.expand_env:
-            from .deployment_env import expand_environment
-            import yaml
-            inputs = group_dir / "plugin-inputs" / combo.id
-            inputs.mkdir(parents=True, mode=0o700)
-            for key in ("source_config", "memory_config"):
-                if not sources[key]:
-                    continue
-                source = Path(sources[key])
-                value = (json.loads(source.read_text()) if source.suffix == ".json"
-                         else yaml.safe_load(source.read_text()))
-                value = expand_environment(value)
-                target = inputs / (key + source.suffix)
-                with os.fdopen(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w") as output:
-                    output.write(json.dumps(value) if source.suffix == ".json" else yaml.safe_dump(value))
-                sources[key] = str(target)
-        result = adapter["prepare"](sources, context)
-        patch = result["service"]
-        if set(patch) - {"volumes", "labels", "environment", "user"}:
-            raise ValueError("Plugin deployment can only add runtime mounts, labels, environment and user")
-        service = rendered["services"][name]
-        # Docker can reallocate a published port of 0 on restart. Native phase
-        # switching must keep the URL supplied to the workflow stable.
-        for port in service.get("ports", []):
-            if not port.get("published"):
-                while True:
-                    with socket.socket() as reservation:
-                        reservation.bind(("127.0.0.1", 0))
-                        selected = reservation.getsockname()[1]
-                    if selected not in chosen_ports:
-                        chosen_ports.add(selected)
-                        port["published"] = selected
-                        break
-        service.setdefault("volumes", []).extend(patch.get("volumes", []))
-        for key in ("labels", "environment"):
-            service.setdefault(key, {}).update(patch.get(key, {}))
-        if "user" in patch:
-            service["user"] = patch["user"]
-        bindings[combo.id] = {"agent": agent.skill, "memory": memory.skill,
-                              "directory": str(directory), "service": name, "group": group.project_key,
-                              "adapter_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
-                              "metadata": result.get("metadata", {})}
+        for index, name in enumerate(combo.agent_services()):
+            binding_id = combo.id if not index else name
+            directory = (group_dir / "plugin-runtimes" / binding_id).resolve()
+            context = {"directory": str(directory), "gateway_port": agent.container_port,
+                       "memory_port": memory.container_port,
+                       "memory_url": f"{memory.endpoint_scheme}://{'127.0.0.1' if memory.placement == 'agent' else 'memory'}:{memory.container_port}" if memory.container_port else ""}
+            sources = {"memory_config": str((group.source_root / spec.memory_config).resolve()) if spec.memory_config else None,
+                       "source_config": str((group.source_root / spec.source_config).resolve()),
+                       "upstream_plugin": str((group.source_root / spec.upstream_plugin).resolve()) if spec.upstream_plugin else None,
+                       "options": spec.options}
+            if spec.expand_env:
+                from .deployment_env import expand_environment
+                import yaml
+                inputs = group_dir / "plugin-inputs" / binding_id
+                inputs.mkdir(parents=True, mode=0o700)
+                for key in ("source_config", "memory_config"):
+                    if not sources[key]:
+                        continue
+                    source = Path(sources[key])
+                    value = (json.loads(source.read_text()) if source.suffix == ".json"
+                             else yaml.safe_load(source.read_text()))
+                    value = expand_environment(value)
+                    target = inputs / (key + source.suffix)
+                    with os.fdopen(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w") as output:
+                        output.write(json.dumps(value) if source.suffix == ".json" else yaml.safe_dump(value))
+                    sources[key] = str(target)
+            result = adapter["prepare"](sources, context)
+            patch = result["service"]
+            if set(patch) - {"volumes", "labels", "environment", "user"}:
+                raise ValueError("Plugin deployment can only add runtime mounts, labels, environment and user")
+            service = rendered["services"][name]
+            # Docker can reallocate a published port of 0 on restart. Native phase
+            # switching must keep the URL supplied to the workflow stable.
+            for port in service.get("ports", []):
+                if not port.get("published"):
+                    while True:
+                        with socket.socket() as reservation:
+                            reservation.bind(("127.0.0.1", 0))
+                            selected = reservation.getsockname()[1]
+                        if selected not in chosen_ports:
+                            chosen_ports.add(selected)
+                            port["published"] = selected
+                            break
+            service.setdefault("volumes", []).extend(patch.get("volumes", []))
+            for key in ("labels", "environment"):
+                service.setdefault(key, {}).update(patch.get(key, {}))
+            if "user" in patch:
+                service["user"] = patch["user"]
+            bindings[binding_id] = {"agent": agent.skill, "memory": memory.skill,
+                                  "directory": str(directory), "service": name, "group": group.project_key,
+                                  "adapter_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+                                  "metadata": result.get("metadata", {})}
     return bindings
 
 

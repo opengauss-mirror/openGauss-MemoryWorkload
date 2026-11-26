@@ -54,8 +54,19 @@ def prepare(spec, context):
 def environment(binding, endpoints):
     directory = Path(binding["directory"])
     return {**COMMON["environment"](directory, endpoints),
+            "MEM0_SHARED_VECTOR_STORE": shared_vector_store(directory),
             "MEM0_PLUGIN_STATE_FILE": str(directory / "phase.json"),
             "MEM0_GATEWAY_CONTAINER": endpoints["container"]}
+
+
+def shared_vector_store(directory):
+    config = json.loads((directory / "openclaw.json").read_text())
+    store = config["plugins"]["entries"][PLUGIN]["config"]["oss"].get("vectorStore", {})
+    settings = store.get("config", {})
+    host = settings.get("host")
+    if store.get("provider") != "pgvector" or not host or host in ("localhost", "127.0.0.1", "::1"):
+        return ""
+    return json.dumps([host, settings.get("port", 5432), settings.get("dbname"), settings.get("collectionName")])
 
 
 def issues(binding):

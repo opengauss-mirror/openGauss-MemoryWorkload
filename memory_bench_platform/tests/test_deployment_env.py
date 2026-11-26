@@ -143,7 +143,9 @@ def test_native_exit_zero_does_not_hide_invalid_evaluation(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('provider', ['ogmemory', 'mem0', 'openviking', 'hindsight', 'jiuwenmemory', 'memos'])
-def test_shipped_examples_prepare_native_runtime(tmp_path, provider, monkeypatch):
+@pytest.mark.parametrize("enable_parallel", [False, True])
+@pytest.mark.parametrize("benchmark", ["locomo", "longmemeval"])
+def test_shipped_examples_prepare_native_runtime(tmp_path, provider, monkeypatch, enable_parallel, benchmark):
     import shutil
     from dotenv import dotenv_values
     from memory_bench_platform.deployment_compose import render_project
@@ -158,7 +160,13 @@ def test_shipped_examples_prepare_native_runtime(tmp_path, provider, monkeypatch
     repo = Path(__file__).resolve().parents[2]
     shutil.copytree(repo / 'examples' / (provider + '-openclaw'), example)
     dataset = tmp_path / 'data.json'
-    dataset.write_text(json.dumps([SAMPLE]))
+    dataset.write_text(json.dumps([SAMPLE, {**SAMPLE, "sample_id": "second-conversation"}]))
+    deployment = example / 'deployment.yaml'
+    template = deployment.read_text().replace("benchmark: locomo", f"benchmark: {benchmark}")
+    if enable_parallel:
+        for setting in ("execution:", "  sample_concurrency: 2", "  qa_concurrency: 2", "  judge_concurrency: 4"):
+            template = template.replace("  # " + setting, "  " + setting)
+    deployment.write_text(template)
     native = tmp_path / 'backend.yaml'
     native.write_text('{}')
     values = dotenv_values(example / '.env.example', interpolate=False)
@@ -171,12 +179,18 @@ def test_shipped_examples_prepare_native_runtime(tmp_path, provider, monkeypatch
     (example / '.env').write_text(''.join(f'{k}={v}\n' for k, v in values.items()))
     with deployment_environment(example / 'deployment.yaml'):
         cfg = load_deployment(example / 'deployment.yaml')
+        combo = cfg.combinations[0]
+        assert combo.benchmark == benchmark
+        assert (combo.execution.sample_concurrency, combo.execution.qa_concurrency,
+                combo.execution.judge_concurrency) == ((2, 2, 4) if enable_parallel else (1, None, None))
         group = resolve_groups(cfg)[0]
         target = tmp_path / 'generated'
         target.mkdir()
         mounts = prepare_instance_configs(group, target / 'configs')
         rendered = render_project(group, cfg.name, mounts, target)
-        binding = prepare_plugin_runtimes(group, target, rendered)[provider + '-openclaw']
+        bindings = prepare_plugin_runtimes(group, target, rendered)
+        assert len(bindings) == (2 if enable_parallel else 1)
+        binding = bindings[provider + '-openclaw']
     output = json.loads((Path(binding['directory']) / 'openclaw.json').read_text())
     assert output['models']['providers']['bench']['apiKey'] == values['LLM_API_KEY']
     assert output['agents']['defaults']['model']['primary'] == 'bench/' + values['LLM_MODEL']

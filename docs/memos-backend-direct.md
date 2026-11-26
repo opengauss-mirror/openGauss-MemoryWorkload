@@ -4,7 +4,7 @@
 
 ## 服务要求
 
-使用独立 MemOS 实例和独立存储，启用原生 scheduler。同步 `/product/add` 完成提取和落库后仍可能提交后台整理，适配器会查询 `/product/scheduler/allstatus`，等待 waiting/in_progress/pending 全部为零；失败、取消或状态不可观测均报运行失败。该状态接口是实例级，因此不能与其他负载共享实例。写入、检索和 scheduler 状态请求均禁止自动 HTTP 重定向；MEMOS_API_URL 必须直接指向实际服务地址，重定向按运行失败处理，避免凭据跨源转发或 HTTPS 降级。HTTP 写入没有自动重试；会话 ID 用于来源关联，不代表服务提供幂等保证。
+启用原生 scheduler 及其 Redis 任务状态跟踪。多个样本可共享一个 MemOS 服务，每个样本使用独立的用户与记忆库。同步 `/product/add` 返回后，适配器通过 `/product/scheduler/status` 按本次写入的 `user_id` 和 `task_id` 确认后台整理完成。任务暂未登记时只重查状态；到期仍未确认会记录 `IndexReadinessUnconfirmed`。写入不会自动重发。写入、检索和状态查询均禁止自动 HTTP 重定向，`MEMOS_API_URL` 应直接指向实际服务地址。采集整轮模型代理用量时，代理仍须由本轮独占。
 
 使用官方 Docker 部署所需的 Neo4j、Qdrant 和模型配置。固定源码 commit/镜像摘要，记录原生配置。不要复用别人的数据库。官方参考：https://github.com/MemTensor/MemOS/tree/main/docker
 
@@ -14,7 +14,6 @@
 
 ```bash
 export MEMOS_API_URL=http://127.0.0.1:8000
-export MEMOS_EXCLUSIVE_INSTANCE=1
 export MEMOS_RUNTIME_VERSION=<实际源码commit或版本>
 # 如服务启用鉴权，通过环境设置 MEMOS_API_KEY；发送 Authorization: Token ...
 export MEMORY_BENCH_MEMORY_TOKEN_SOURCE=model_proxy

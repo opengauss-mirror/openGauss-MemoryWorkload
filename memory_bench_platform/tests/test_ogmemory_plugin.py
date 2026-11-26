@@ -50,7 +50,8 @@ def entry(state):
     return json.loads(state.with_name("openclaw.json").read_text())["plugins"]["entries"]["og-memory-context-engine"]["config"]
 
 
-def test_native_configuration_phases_isolation_and_finalize(runtime):
+def test_native_configuration_phases_isolation_and_finalize(runtime, monkeypatch):
+    monkeypatch.setenv("OGMEM_ACCOUNT_ID", "shared-account")
     state, module, run = runtime
     assert run("validate")["output"]["context_engine"] == "og-memory-context-engine"
     assert entry(state)["autoCapture"] is False
@@ -67,7 +68,12 @@ def test_native_configuration_phases_isolation_and_finalize(runtime):
         module.run({"action": "prepare", "inputs": {"scope_id": "run:b"},
                     "runtime_context": {"run_dir": "another"}})
     run("prepare", scope_id="run:b")
-    assert json.loads(state.read_text())["identity"] != identity_a
+    identity_b = json.loads(state.read_text())["identity"]
+    assert entry(state)["authAccountId"] == identity_b["accountId"]
+    assert identity_a["accountId"] != identity_b["accountId"]
+    assert all(i["accountId"].startswith("shared-account-") for i in (identity_a, identity_b))
+    assert identity_b["userId"] != identity_a["userId"]
+    assert identity_b["agentId"] != identity_a["agentId"]
     finalized = run("finalize")
     assert json.loads(state.read_text())["active"] is False
     assert entry(state)["autoCapture"] is False and entry(state)["autoRecall"] is False
@@ -114,6 +120,33 @@ def test_wait_uses_native_session_and_checks_index(runtime, monkeypatch):
     assert all(c[2] == identity for c in calls)
     with pytest.raises(ValueError, match="scope"):
         run("wait_ready", scope_id="wrong", operation={"compact_completed": True, "scope_id": "run:a", "session_id": "native-id"})
+
+
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("dead_letter", ["none", "own", "peer"])
+def test_index_retry_in_sample_account(runtime, monkeypatch, pooled, dead_letter):
+    _, module, run = runtime
+    if pooled:
+        monkeypatch.setenv("MEMORY_BENCH_POOL_RUN_DIR", "/pool")
+    account = run("prepare", scope_id="sample-a")["output"]["identity"]["accountId"]
+    attempts = []
+    def backend(base, path, body, identity, **options):
+        assert identity["accountId"] == account
+        if options.get("method") == "GET":
+            return {"commit_count": 1}
+        if body["drainOutbox"]:
+            attempts.append(account)
+            return {"drain": {"failed": int(len(attempts) == 1), "moved_to_dlq": int(dead_letter != "none")}}
+        pending = int(body.get("waitOutbox") and len(attempts) == 1)
+        return {"idle": not pending, "outbox": {"total": pending, "failed": int(dead_letter == "own")}}
+    monkeypatch.setattr(module, "backend", backend)
+    args = dict(scope_id="sample-a", operation={"compact_completed": True, "scope_id": "sample-a", "session_id": "native-id"}, interval_seconds=0)
+    if dead_letter == "own":
+        with pytest.raises(module.SettledHistoryFailure, match="indexing failed"):
+            run("wait_ready", **args)
+    else:
+        assert run("wait_ready", **args)["output"]["history_archived"]
+        assert len(attempts) == 2
 
 
 @pytest.mark.parametrize("kind", ["missing", "empty", "index_failure", "unsupported"])

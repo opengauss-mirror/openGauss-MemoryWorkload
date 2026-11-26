@@ -25,7 +25,9 @@
     "entries": {
       "openviking": {
         "config": {
-          "apiKey": "${MEMORY_API_KEY}"
+          "apiKey": "${MEMORY_API_KEY}",
+          "accountId": "${MEMORY_ACCOUNT_ID}",
+          "userId": "${MEMORY_USER_ID}"
         }
       }
     }

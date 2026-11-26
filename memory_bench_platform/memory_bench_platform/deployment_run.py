@@ -93,19 +93,44 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                     env["OPENCLAW_POOL_ROUTE_PREFIX"] = f"{suite_id}:{combo.id}"
                 else:
                     env[agent.client.endpoint_env] = _child_url(group_ports, "agent_" + combo.id.replace("-", "_"), agent)
+                env.pop("MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS", None)
                 binding = state.plugin_runtimes.get(combo.id)
+                bindings = [binding] if binding else []
+                for name in combo.agent_services()[1:] if binding else ():
+                    bindings.append(state.plugin_runtimes[name])
                 if binding:
                     from .deployment_plugins import plugin_environment
-                    env.update(plugin_environment(binding, state, env[agent.client.endpoint_env],
-                                                  env.get(memory.client.endpoint_env, "")))
+                    gateways = [plugin_environment(item, state, _child_url(group_ports, item["service"], agent),
+                                                   _child_url(group_ports, item["service"], memory)
+                                                   if memory.placement == "agent" and memory.container_port
+                                                   else env.get(memory.client.endpoint_env, "")) for item in bindings]
+                    if len(gateways) > 1:
+                        if memory.skill == "openviking":
+                            for gateway in gateways:
+                                gateway["OPENVIKING_MANAGED_SAMPLE_USER"] = "1"
+                        env.update({k: v for k, v in gateways[0].items() if k in ("OGMEM_API_URL", "OGMEM_API_KEY")})
+                        if memory.skill == "ogmemory" and env.get("MEMORY_BENCH_OGMEMORY_EXCLUSIVE") == "1":
+                            env["MEMORY_BENCH_OGMEMORY_CONTAINER"] = state.containers[group.project_key]["memory"]
+                        env["MEMORY_BENCH_DEPLOYED_SAMPLE_GATEWAYS"] = json.dumps(gateways)
+                    else:
+                        env.update(gateways[0])
                 argv = ["run", "--benchmark", combo.benchmark, "--agent", agent.skill,
                         "--memory-backend", memory.skill, "--memory-integration", combo.memory_integration,
                         "--data-path", str((group.source_root / combo.data_path).resolve()),
                         "--run-id", f"{suite_id}-{combo.id}"]
+                sample_limit = (combo.execution.sample_concurrency if combo.memory_integration == "backend_direct"
+                                else len(bindings))
+                if sample_limit > 1:
+                    if profiling_config:
+                        raise ValueError("Phase profiling requires sample_concurrency=1")
+                    argv += ["--sample-concurrency", str(sample_limit)]
                 if combo.entrypoint:
                     argv += ["--entrypoint", combo.entrypoint]
                 if combo.execution.qa_concurrency is not None:
-                    argv += ["--qa-concurrency", str(combo.execution.qa_concurrency)]
+                    qa_limit = combo.execution.qa_concurrency
+                    if combo.memory_integration == "agent_plugin" and combo.execution.sample_concurrency > 1:
+                        qa_limit = min(qa_limit, len(bindings))
+                    argv += ["--qa-concurrency", str(qa_limit)]
                 if combo.execution.judge_concurrency is not None:
                     argv += ["--judge-concurrency", str(combo.execution.judge_concurrency)]
                 if profiling_config is not None:
@@ -122,25 +147,22 @@ def run_deployment(name: str, cwd: Path, combination_id: str | None, docker: Doc
                 try:
                     warmup = combo.preparation.warmup
                     if warmup.enabled:
-                        target_name = warmup.target
-                        if target_name == "agent":
-                            target_name = "agent_" + combo.id.replace("-", "_")
-                        elif target_name == "mock":
-                            if group.shared_memory_instance_id:
-                                target_name = ("mock_" + combo.id.replace("-", "_")) if combo.mock else "mock_memory"
-                        target_id = state.containers[group.project_key].get(target_name)
-                        if not target_id:
-                            raise ValueError(f"unknown warmup target: {warmup.target}")
-                        record["warmup"] = docker.exec_json(target_id, warmup.command)
+                        results = {}
+                        for name in deployment_lifecycle._target_services(group, warmup.target, combo):
+                            target_id = state.containers[group.project_key].get(name)
+                            if not target_id:
+                                raise ValueError(f"unknown warmup target: {name}")
+                            results[name] = docker.exec_json(target_id, warmup.command)
+                        record["warmup"] = next(iter(results.values())) if len(results) == 1 else results
                     try:
                         rc = invoke(argv, env=env, cwd=cwd)
                     finally:
-                        if binding:
+                        for binding in bindings:
                             from .deployment_plugins import runtime_issues
                             issues = runtime_issues(binding)
                             cid = state.containers[binding["group"]][binding["service"]]
                             inspect = docker.inspect(cid)
-                            deadline = time.monotonic() + 60
+                            deadline = time.monotonic() + max(60, (agent.healthcheck_interval_seconds or 0) + 30)
                             while (inspect.get("State", {}).get("Running") and
                                    inspect.get("State", {}).get("Health", {}).get("Status") == "starting" and
                                    time.monotonic() < deadline):

@@ -442,7 +442,13 @@ def _dispatch(request, root, info, config):
     owner = request.get('runtime_context', {}).get('run_dir')
     if not owner:
         raise ValueError('runtime_context.run_dir required')
-    if state.get('owner') and state['owner'] != owner:
+    pool_root = os.environ.get('MEMORY_BENCH_POOL_RUN_DIR')
+    sample_parent = Path(pool_root) / 'artifacts/sample-runtimes' if pool_root else None
+    reuse = (sample_parent is not None and state.get('phase') == 'finished'
+             and action in ('validate', 'prepare') and state.get('owner') != owner
+             and Path(state['owner']).resolve().parent == sample_parent
+             and Path(owner).resolve().parent == sample_parent)
+    if state.get('owner') and state['owner'] != owner and not reuse:
         raise ValueError('Runtime already belongs to another run; use a fresh directory')
     lease = qa_lease_key(request)
     db = root / 'memos/data/memos.db'
@@ -456,7 +462,7 @@ def _dispatch(request, root, info, config):
         previous_scope = state.get('scope_id')
         completed_scopes = state.get('completed_scopes', [])
         if state.get('owner'):
-            if (not info.get('serial_samples') or state.get('phase') != 'qa'
+            if (not info.get('serial_samples') or (state.get('phase') != 'qa' and not reuse)
                     or scope == previous_scope or scope in completed_scopes):
                 raise ValueError('Cannot repeat prepare for the active or a completed sample')
             if state.get('pending') or any(key.startswith('qa_pending:') for key in state):

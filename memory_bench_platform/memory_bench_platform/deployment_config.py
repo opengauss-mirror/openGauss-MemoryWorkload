@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from .integration import resolve_benchmark_entrypoint, resolve_run_skill_bundle
+from .integration import MANAGED_GATEWAYS, resolve_benchmark_entrypoint, resolve_run_skill_bundle
 from .paths import SKILLS_ROOT
 
 
@@ -177,6 +177,7 @@ class PluginRuntime(StrictModel):
 
 
 class DeploymentExecution(StrictModel):
+    sample_concurrency: int = Field(default=1, gt=0, strict=True)
     qa_concurrency: int | None = Field(default=None, gt=0, strict=True)
     judge_concurrency: int | None = Field(default=None, gt=0, strict=True)
 
@@ -199,13 +200,22 @@ class Combination(StrictModel):
     execution: DeploymentExecution = Field(default_factory=DeploymentExecution)
     preparation: Preparation = Field(default_factory=Preparation)
 
+    _sample_gateways: int = PrivateAttr(default=1)
+
+    def agent_services(self):
+        base = "agent_" + self.id.replace("-", "_")
+        if self.gateway_pool:
+            return [f"{base}_{i}" for i in range(1, self.agent_replicas + 1)]
+        return [base, *(f"{base}_lane_{i}" for i in range(2, self._sample_gateways + 1))]
+
     @model_validator(mode="after")
     def one_memory(self):
         if (self.memory is None) == (self.memory_instance is None):
             raise ValueError("exactly one of memory and memory_instance is required")
         if self.memory_instance and (self.vector or self.graph):
             raise ValueError("shared memory combination cannot override vector or graph")
-        if self.memory_integration == "agent_plugin" and (self.execution.qa_concurrency or 1) > 1:
+        if (self.memory_integration == "agent_plugin" and self.execution.sample_concurrency == 1
+                and (self.execution.qa_concurrency or 1) > 1):
             raise ValueError("agent_plugin deployment requires execution.qa_concurrency=1")
         return self
 
@@ -400,6 +410,18 @@ def _load_deployment(path: Path) -> DeploymentConfig:
                 raise ValueError(f"unknown {label}: {ref}")
         if not (root / combo.data_path).is_file():
             raise ValueError(f"missing data_path: {combo.data_path}")
+        memory_id = combo.memory or config.shared_memory_instances[combo.memory_instance].memory
+        bundle = resolve_run_skill_bundle(combo.benchmark, config.agents[combo.agent].skill,
+                                          config.memories[memory_id].skill, combo.memory_integration)
+        if combo.memory_integration == "agent_plugin" and combo.execution.sample_concurrency > 1:
+            if (not combo.plugin_runtime or combo.benchmark not in ("locomo", "longmemeval") or combo.entrypoint
+                    or config.agents[combo.agent].skill != "openclaw" or not memory_id
+                    or bundle.memory_plugin_id not in MANAGED_GATEWAYS or combo.gateway_pool):
+                raise ValueError("Pooled sample execution requires the native LoCoMo or LongMemEval OpenClaw deployment with a supported memory plugin")
+            samples = json.loads((root / combo.data_path).read_text())
+            if not isinstance(samples, list) or not samples:
+                raise ValueError("Expected a nonempty benchmark sample list")
+            combo._sample_gateways = min(len(samples), combo.execution.sample_concurrency)
         if combo.agent_replicas < 1 or (not combo.gateway_pool and combo.agent_replicas != 1):
             raise ValueError("agent_replicas requires gateway_pool and must be positive")
         if combo.gateway_pool:
@@ -414,9 +436,7 @@ def _load_deployment(path: Path) -> DeploymentConfig:
         entry = resolve_benchmark_entrypoint(combo.benchmark, combo.entrypoint)
         if entry.entrypoint_kind not in ("case_builder", "scenario_builder"):
             raise ValueError(f"external benchmark entrypoint: {combo.entrypoint}")
-        memory_id = combo.memory or config.shared_memory_instances[combo.memory_instance].memory
-        resolve_run_skill_bundle(combo.benchmark, config.agents[combo.agent].skill,
-                                 config.memories[memory_id].skill, combo.memory_integration)
+
     group_combos: dict[str, list[Combination]] = {}
     for combo in config.combinations:
         group_combos.setdefault(combo.memory_instance or combo.id, []).append(combo)
@@ -441,9 +461,7 @@ def _load_deployment(path: Path) -> DeploymentConfig:
     for combo in config.combinations:
         group_key = combo.memory_instance or combo.id
         names = physical_names.setdefault(group_key, set())
-        base = "agent_" + combo.id.replace("-", "_")
-        planned = ([f"{base}_{n}" for n in range(1, combo.agent_replicas + 1)]
-                   if combo.gateway_pool else [base])
+        planned = combo.agent_services()
         if any(name in names for name in planned):
             raise ValueError(f"service name collision in {group_key}")
         names.update(planned)

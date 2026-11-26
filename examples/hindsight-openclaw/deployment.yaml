@@ -64,6 +64,11 @@ combinations:
   memory: hindsight
   memory_integration: agent_plugin
   data_path: ${DATA_PATH}
+  # 默认串行。启用跨样本 QA 并发时，同时取消 execution、sample_concurrency 和 qa_concurrency 的注释。
+  # execution:
+  #   sample_concurrency: 2
+  #   qa_concurrency: 2
+  #   judge_concurrency: 4
   plugin_runtime:
     source_config: configs/openclaw.json
     expand_env: true

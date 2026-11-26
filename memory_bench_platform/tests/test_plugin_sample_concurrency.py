@@ -13,7 +13,7 @@ from memory_bench_platform.protocol import CaseRecord, StepRecord, ExecutionSpec
 from test_workflow_concurrency import grade
 
 
-def plugin_plan(*, extra_question=False, questions_per_checkpoint=1, backend="ogmemory", extra_history=False):
+def plugin_plan(*, extra_question=False, questions_per_checkpoint=1, backend="ogmemory", extra_history=False, sample_count=2):
     payload = json.loads(Path("tests/golden/multi_checkpoint_scenario.json").read_text())
     original = payload["samples"][0]
     if extra_question:
@@ -25,7 +25,7 @@ def plugin_plan(*, extra_question=False, questions_per_checkpoint=1, backend="og
     if extra_history:
         event = original["timeline"][0]
         original["timeline"][1:1] = [dict(copy.deepcopy(event), event_id=f"history-{i}") for i in (2, 3)]
-    payload["samples"] = [copy.deepcopy(original), copy.deepcopy(original)]
+    payload["samples"] = [copy.deepcopy(original) for _ in range(sample_count)]
     for index, sample in enumerate(payload["samples"]):
         sample["sample_id"] = f"sample-{index}"
     binding = RunBinding(benchmark_id=payload["benchmark_id"], run_id="r", agent_id="openclaw",
@@ -47,7 +47,7 @@ def plugin_plan(*, extra_question=False, questions_per_checkpoint=1, backend="og
 
 @pytest.mark.parametrize("concurrency", [1, 2])
 def test_plugin_samples_order_and_environment(tmp_path, monkeypatch, concurrency):
-    cases, steps, environments = plugin_plan()
+    cases, steps, environments = plugin_plan(backend="mem0")
     barrier = Barrier(2)
     seen, ready, ingested = set(), set(), set()
     owners = {c.case_id: c.source_metadata.get("sample_id") or c.reference.get("sample_id") for c in cases}
@@ -76,9 +76,9 @@ def test_plugin_samples_order_and_environment(tmp_path, monkeypatch, concurrency
     monkeypatch.setattr(workflow, "_execute_step_operator", operator)
     monkeypatch.setattr(workflow, "run_llm_judge", grade)
     context = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
-        agent_id="openclaw", memory_id="ogmemory", memory_plugin_id="openclaw-ogmemory",
+        agent_id="openclaw", memory_id="mem0", memory_plugin_id="openclaw-mem0",
         memory_integration="agent_plugin", sample_environments=environments)
-    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="ogmemory",
+    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="mem0",
         runtime_context=context, cases=cases, steps=steps, run_dir=tmp_path,
         execution_spec=ExecutionSpec(sample_concurrency=concurrency))
     assert seen == set(environments)
@@ -91,7 +91,7 @@ def test_plugin_samples_order_and_environment(tmp_path, monkeypatch, concurrency
 def test_plugin_qa_overlap_only_across_gateways(tmp_path, monkeypatch, qa_limit):
     from time import monotonic_ns
 
-    cases, steps, environments = plugin_plan(extra_question=True)
+    cases, steps, environments = plugin_plan(extra_question=True, backend="mem0")
     barrier = Barrier(2)
     lock = Lock()
     intervals = []
@@ -110,9 +110,9 @@ def test_plugin_qa_overlap_only_across_gateways(tmp_path, monkeypatch, qa_limit)
     monkeypatch.setattr(workflow, "_execute_step_operator", operator)
     monkeypatch.setattr(workflow, "run_llm_judge", grade)
     context = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
-        agent_id="openclaw", memory_id="ogmemory", memory_plugin_id="openclaw-ogmemory",
+        agent_id="openclaw", memory_id="mem0", memory_plugin_id="openclaw-mem0",
         memory_integration="agent_plugin", sample_environments=environments)
-    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="ogmemory",
+    result = workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="mem0",
         runtime_context=context, cases=cases, steps=steps, run_dir=tmp_path,
         execution_spec=ExecutionSpec(sample_concurrency=2, qa_concurrency=qa_limit, judge_concurrency=4))
     assert len(intervals) == len(result["judge_results"]) == 6
@@ -124,14 +124,14 @@ def test_plugin_qa_overlap_only_across_gateways(tmp_path, monkeypatch, qa_limit)
 
 
 def test_plugin_shared_environment_rejected_before_writing(tmp_path, monkeypatch):
-    cases, steps, environments = plugin_plan()
+    cases, steps, environments = plugin_plan(backend="mem0")
     environments["sample-1"] = environments["sample-0"]
     monkeypatch.setattr(workflow, "_execute_case", lambda **kw: pytest.fail("unexpected write"))
     context = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
-        agent_id="openclaw", memory_id="ogmemory", memory_plugin_id="openclaw-ogmemory",
+        agent_id="openclaw", memory_id="mem0", memory_plugin_id="openclaw-mem0",
         memory_integration="agent_plugin", sample_environments=environments)
     with pytest.raises(ValueError, match="distinct"):
-        workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="ogmemory",
+        workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id="mem0",
             runtime_context=context, cases=cases, steps=steps, run_dir=tmp_path,
             execution_spec=ExecutionSpec(sample_concurrency=2, qa_concurrency=2))
 
@@ -387,3 +387,96 @@ def test_session_failure_continues_sibling_sessions_and_qa(tmp_path, monkeypatch
                for row in result["step_results"] if row.step_id.endswith("agent-answer"))
 
 
+@pytest.mark.parametrize("fail_restore", [False, True])
+@pytest.mark.parametrize("backend", ["ogmemory", "hindsight", "openviking", "memos", "mem0", "jiuwenmemory"])
+def test_managed_gateway_handoff(tmp_path, monkeypatch, fail_restore, backend):
+    plugin = "openclaw-memos-local" if backend == "memos" else f"openclaw-{backend}"
+    container, endpoint = workflow.MANAGED_GATEWAYS[plugin]
+    if backend == "openviking":
+        # The native preflight is tested separately; this fixture has no server.
+        monkeypatch.setattr(workflow, "validate_sample_identities", lambda *args, **kwargs: None)
+    cases, steps, _ = plugin_plan(sample_count=3, backend=backend)
+    gateways = [{"OPENCLAW_GATEWAY_URL": f"http://localhost:{8000 + i}", "OPENCLAW_STATE_DIR": str(tmp_path / str(i)),
+                 container: f"claw-{i}", **({endpoint: "http://shared-memory"} if endpoint else
+                     {"MEMOS_LOCAL_RUNTIME_DIR": str(tmp_path / str(i)), "MEMOS_LOCAL_VIEWER_URL": f"http://localhost:{8800+i}"})}
+                for i in range(2)]
+    barrier = Barrier(2)
+    owners, restored = {}, set()
+    qa_lanes = set()
+    qa_lock = Lock()
+    qa_barrier = Barrier(2)
+
+    def operator(step, **kwargs):
+        if step.inputs.get("action") == "validate":
+            lane = _adapter_environment.get()[container]
+            sample = step.case_id.split("-stage")[0]
+            if lane in owners and owners[lane] != sample:
+                assert owners[lane] in restored
+            elif lane not in owners:
+                owners[lane] = sample
+                barrier.wait(timeout=10)
+            owners[lane] = sample
+        if step.operator_kind == "agent" and step.inputs["metadata"]["purpose"] == "memory_qa":
+            lane = _adapter_environment.get()[container]
+            with qa_lock:
+                first = lane not in qa_lanes
+                qa_lanes.add(lane)
+            if first:
+                qa_barrier.wait(timeout=10)
+        return {"status": "ok", "output": {"operation": {"id": step.step_id}, "ready": True,
+                "session_handle": "s"}, "turns": [{"text": "Paris"}]}
+
+    def finalize(sample, gateway):
+        assert _adapter_environment.get()[container] == gateway[container]
+        if fail_restore and gateway == gateways[0]:
+            raise RuntimeError("restore failed")
+        restored.add(sample)
+
+    monkeypatch.setattr(workflow, "_execute_step_operator", operator)
+    monkeypatch.setattr(workflow, "run_llm_judge", grade)
+    context = WorkflowRuntimeContext(run_id="r", run_dir=str(tmp_path), benchmark_id="locomo",
+        agent_id="openclaw", memory_id=backend, memory_plugin_id=plugin, memory_integration="agent_plugin")
+    def run():
+        return workflow.execute_cases(run_id="r", agent_id="openclaw", memory_id=backend,
+            runtime_context=context, cases=cases, steps=steps, run_dir=tmp_path,
+            execution_spec=ExecutionSpec(sample_concurrency=2, qa_concurrency=2), sample_gateways=gateways, finalize_sample=finalize)
+    if fail_restore:
+        with pytest.raises(RuntimeError, match="restore failed"):
+            run()
+        assert owners["claw-0"] != "sample-2"
+        assert "sample-2" in restored
+    else:
+        result = run()
+        assert all(step.status == "passed" for step in result["step_results"])
+        assert restored == {"sample-0", "sample-1", "sample-2"}
+        assert qa_lanes == {"claw-0", "claw-1"}
+
+
+@pytest.mark.parametrize("matched", [True, False])
+def test_managed_openviking_verifies_server_user(monkeypatch, matched):
+    import io
+    import runpy
+    from urllib.request import Request
+    script = Path("skills/memory_plugins/openclaw-openviking/scripts/run_lifecycle.py")
+    check = runpy.run_path(str(script))["managed_user"]
+    from memory_bench_platform.deployment_env import expand_environment
+    monkeypatch.setenv("MEMORY_API_KEY", "fixture-key")
+    monkeypatch.setenv("MEMORY_ACCOUNT_ID", "test")
+    monkeypatch.setenv("MEMORY_USER_ID", "bench")
+    template = Path("../examples/openviking-openclaw/configs/openclaw.json")
+    config = expand_environment(json.loads(template.read_text())["plugins"]["entries"]["openviking"]["config"])
+    assert config["accountId"] == "test"
+    assert config["userId"] == "bench"
+
+    monkeypatch.setitem(check.__globals__, "_task_headers", lambda: {})
+    monkeypatch.setitem(check.__globals__, "_base_url", lambda: "http://localhost")
+    def health(opener, req, timeout):
+        assert isinstance(req, Request)
+        user = dict((k.lower(), v) for k, v in req.header_items())["x-openviking-user"]
+        return io.BytesIO(json.dumps({"account_id": "test", "user_id": user if matched else "default"}).encode())
+    monkeypatch.setattr("urllib.request.OpenerDirector.open", health)
+    if matched:
+        assert check("sample-1", config) != check("sample-2", config)
+    else:
+        with pytest.raises(ValueError, match="confirm"):
+            check("sample-1", config)

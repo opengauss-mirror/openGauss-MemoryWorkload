@@ -2,8 +2,20 @@
 
 原生 `cli run` / `cli plan` 支持 `--sample-concurrency N`，默认 1。
 支持 `backend_direct` 和配置了独立 OpenClaw 运行实例的 `agent_plugin`。
-第一版使用上面的原生手动运行入口，`run --deployment` 不透传此选项，
-显式设置大于 1 会报错，不会静默忽略。
+使用统一部署的 OpenClaw 插件测试 LoCoMo 或 LongMemEval 时，在已有的
+`combinations[].execution` 中设置 `sample_concurrency: 2`，再照常运行
+`memory-bench experiment --config deployment.yaml`。部署最多启动两个独立的 OpenClaw Gateway。实际 Gateway 数量取并发数和
+conversation 数量的较小值。省略该字段时仍使用一个 Gateway。
+
+每个 Gateway 同时执行一个完整 conversation。完成 QA、评分和插件状态恢复后，
+空闲 Gateway 才领取下一样本。Hindsight 为每个样本绑定独立 bank。OpenViking 的托管模式要求服务支持按用户指定身份，并通过 `/health` 确认实际账号和用户；身份无法确认时在写入前报错。oGMemory 的 Gateway 共享后端地址。串行和并发运行都以 `OGMEM_ACCOUNT_ID`（默认 `memory-bench`）为前缀，为每个样本生成独立账号、用户和 Agent。后端凭据须允许访问这些账号。
+恢复失败会记录错误，该 Gateway 不再领取新样本。需要采集独占后端计数器时，
+在确认服务仅供本轮使用后设置 `MEMORY_BENCH_OGMEMORY_EXCLUSIVE=1`，
+记忆侧用量按整个 run 采集一次。
+
+- JiuwenMemory 的 Gateway 共享官方 MCP 服务，每个样本的写入和搜索携带一致的独立 user 和 session。
+- Mem0 OSS 的 SDK 在 Gateway 内运行，可共享 PGVector 存储。每个样本使用独立的 `userId`，每个 Gateway 有自己的插件状态和本地历史库。原生召回超时仍可能触发无记忆回答。
+- MemOS Local 的记忆库位于 Gateway 内。每个 Gateway 使用独立的数据目录、SQLite 和 Viewer 端口；接手同一轮的下一样本时，必须先完成上一样本、确认没有未结束的请求，再清理本地历史并验证库为空。
 
 ## 运行
 
@@ -62,8 +74,7 @@ OpenViking 并发运行需要 `OPENVIKING_SCOPE_USERS_FILE`。使用原生账号
 
 ## OpenClaw agent_plugin
 
-复用同一调度器，每个样本绑定一个已部署的专用 Gateway。首次只支持 OpenClaw
-组合；不会自动创建容器，也不会自动为任意记忆系统提供隔离。
+下列命令适用于手动部署的 Gateway。每个样本绑定一个已部署的独立 Gateway。统一部署的 oGMemory 示例使用本文开头的 YAML 配置。
 
 准备私有 `sample-runtimes.json`（权限 0600，不提交到仓库）：
 
@@ -87,21 +98,20 @@ OpenViking 并发运行需要 `OPENVIKING_SCOPE_USERS_FILE`。使用原生账号
 ```
 
 键必须与数据集计划的 sample_id 完全对应。LongMemEval 使用 question_id。
-每份环境还需包含所选组合原有的环境配置；oGMemory 的
-`OGMEM_GATEWAY_CONTAINER`、`OGMEM_PLUGIN_STATE_FILE` 分别指向当前样本容器和独立阶段文件。
+每份环境还需包含所选组合原有的环境配置。oGMemory 插件的跨样本测试统一通过部署配置启动。
 `OPENCLAW_BIN` 是指向当前实例的 CLI 包装脚本。服务共享时，必须配置不同的
 原生账号/用户/记忆 scope；仅分开 Gateway 端口不能保证后端数据隔离。
-OpenViking 在各实例原生配置中绑定独立账号/用户，oGMemory 沿用适配器的样本 scope 绑定。
+OpenViking 在各实例原生配置中绑定独立账号/用户。
 
 ```bash
 python -m memory_bench_platform.cli run \
-  --benchmark locomo --agent openclaw --memory-backend ogmemory \
+  --benchmark locomo --agent openclaw --memory-backend openviking \
   --memory-integration agent_plugin --data-path /absolute/two-samples.json \
   --sample-concurrency 2 --sample-runtime-config /absolute/sample-runtimes.json \
   --qa-concurrency 2 --judge-concurrency 4
 ```
 
-OpenViking 更换 memory-backend 和实例配置，LongMemEval 更换 benchmark 与数据文件。
+其他支持手工绑定的插件更换 memory-backend 和实例配置。LongMemEval 更换 benchmark 与数据文件。
 串行对照可保留独立实例绑定，将 sample-concurrency 和 qa-concurrency 均设为 1。
 每段历史依次执行 Agent 接收、原生提交（若支持）、就绪检查（若支持），
 然后才进入下一段。QA 在线程池中跨样本并发，全局上限为 qa-concurrency，默认每个样本的 Gateway 同时最多一题。Judge 使用已有共享线程池。

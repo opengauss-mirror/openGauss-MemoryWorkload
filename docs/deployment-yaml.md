@@ -20,14 +20,16 @@ experiment:
 ```yaml
     memory_integration: backend_direct
     execution:
+      sample_concurrency: 2
       qa_concurrency: 4
       judge_concurrency: 4
 ```
 
 `experiment --config deployment.yaml` 和 `run --deployment <部署名>` 都会读取对应组合的配置。使用 Workload 原生入口时，这两个值须为正整数，省略时各为 `1`。
 
-- `backend_direct` 支持配置 QA 和 Judge 并发。同一样本完成历史写入后，再并发执行 QA，并对已生成的答案并发评分。
-- `agent_plugin` 支持配置 Judge 并发。QA 逐题执行，可省略 `qa_concurrency` 或显式设为 `1`。
+- `backend_direct` 将样本、QA 和 Judge 并发上限分别传给原生 `cli run`。上例最多并行处理两个样本，共用全局 QA、Judge 并发预算。每个样本沿用原生运行器的历史写入顺序、就绪检查和记忆隔离规则。增加样本并发无需增加 Gateway。采集阶段性能（profiling）时使用 `sample_concurrency: 1`。
+- LoCoMo 和 LongMemEval 的 OpenClaw 组合支持 `execution.sample_concurrency`。每个活跃样本独占一个 Gateway。oGMemory、Hindsight、OpenViking、JiuwenMemory 共享记忆服务，Mem0 OSS 共享 PGVector，MemOS Local 按 Gateway 隔离本地数据库。详见[跨样本并发](sample-concurrency.md)。
+- `agent_plugin` 支持单独配置 Judge 并发。样本并发为 1 时，QA 并发须为 1 或省略；启用多 Gateway 时可配置跨样本 QA 并发，每个样本同时回答一题，全局 QA 上限取配置值和实际 Gateway 数量的较小值。
 
 ## 环境变量和服务配置
 
