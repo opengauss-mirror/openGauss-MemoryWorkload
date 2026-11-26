@@ -11,6 +11,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+beam = [
+  "json-repair>=0.30",
+]
 dev = [
   "pytest>=8.2",
 ]

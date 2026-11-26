@@ -1,0 +1,14 @@
+{
+  "upstream": "https://github.com/mohammadtavakoli78/BEAM",
+  "prompt_git_blob": "4c9fb1528da7bf40ae01e7d0b5720d8b3bc0708e",
+  "compute_metrics_git_blob": "85048250af007704feccbb0bc46c6a8240b49a51",
+  "report_results_git_blob": "64a3872a78a90ff3d0b559bf6fc32ae9c5a1dc78",
+  "judge_sha256": "593373c642a288a7b590577d8a8fc92c3f9a2b70e2f64ad6e59a040a6c56b7f5",
+  "implementation": "Official per-criterion prompt and score mean; event ordering uses official LLM alignment and Kendall tau-b; report uses tau_norm for ordering.",
+  "differences": [
+    "Strict numeric score validation",
+    "Undefined Kendall tau is reported as Judge error",
+    "Workload HTTP model transport, configured model, request retries and deadline"
+  ],
+  "upstream_revision_checked": "b2da22eac88bb0874c64665f13457eb99835774a"
+}
