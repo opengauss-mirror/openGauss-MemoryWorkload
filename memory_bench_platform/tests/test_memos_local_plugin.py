@@ -12,6 +12,60 @@ def test_zero_recall():
 @pytest.mark.parametrize('text',[LINE+'\n'+LINE,LINE.replace('softTimedOut=no','softTimedOut=yes'),LINE+' memos.onTurnStart.failed',LINE+' memos.onTurnStart.soft_timeout',LINE+' closeSession.flush_failed'])
 def test_invalid_recall(text):
     with pytest.raises(RuntimeError):a.recall_receipt(text)
+
+@pytest.mark.parametrize('file_has_receipt', [True, False])
+@pytest.mark.parametrize('reverse_sources', [True, False])
+def test_ingest_capture_survives_recall_timeout(tmp_path, monkeypatch, file_has_receipt, reverse_sources):
+    from types import SimpleNamespace
+    before = {'counts': {'traces': 0}, 'add_id': 0, 'retry_count': 0}
+    pending = {'nonce': 'n', 'session_key': 'agent:main:ingest', 'phase': 'ingest', 'log_since': 1, 'before': before}
+    a.save(tmp_path/'phase.json', {'owner': str(tmp_path), 'scope_id': 's', 'phase': 'ingest', 'pending': pending, 'trace_ids': []})
+    log = LINE.replace('softTimedOut=no', 'softTimedOut=yes') + '\nmemos.onTurnStart.soft_timeout\nmemos.onTurnEnd'
+    console = LINE.replace('softTimedOut=no', 'softTimedOut=yes') + '\nmemos.onTurnEnd'
+    file_log = (console if file_has_receipt else '') + '\nmemos.onTurnStart.soft_timeout'
+    if reverse_sources:
+        console, file_log = file_log, console
+    def execute(args, **kwargs):
+        return SimpleNamespace(stdout=console if args[1]=='logs' else file_log, stderr='', returncode=0)
+    monkeypatch.setattr(a.subprocess, 'run', execute)
+    monkeypatch.setattr(a, 'db_snapshot', lambda *args: {'counts': {'traces': 1}, 'add_id': 1, 'retry_count': 0})
+    monkeypatch.setattr(a, 'capture_receipt', lambda *args: {'id': 1})
+    monkeypatch.setattr(a, 'captured_trace_id', lambda *args: 'trace-1')
+    request = {'action': 'after_agent', 'runtime_context': {'run_dir': str(tmp_path)}, 'inputs': {
+        'check_context': pending, 'agent_result': {'status': 'ok', 'output': {'session_handle': {
+            'session_id': 'uuid', 'gateway_session_key': pending['session_key']}}}}}
+    result = a.dispatch(request, tmp_path, {'container': 'test'}, {})
+    assert result['status'] == 'ok'
+    assert result['output']['recall']['recall_verified'] is False
+    assert result['output']['recall']['hits'] == 0
+    assert result['output']['recall']['errors'] == ['memos.onTurnStart.soft_timeout']
+    assert json.loads((tmp_path/'phase.json').read_text())['trace_ids'] == ['trace-1']
+    with pytest.raises(RuntimeError):
+        a.container_logs('test', 1)
+    with pytest.raises(RuntimeError):
+        a.recall_receipt(log + '\nmemos.onTurnEnd.failed', allow_recall_failure=True)
+
+@pytest.mark.parametrize('file_log', [
+    LINE.replace('hits=0', 'hits=1'),
+    LINE + '\nmemos.onTurnEnd.failed',
+    LINE + '\ncloseSession.flush_failed',
+    LINE + '\n' + LINE,
+])
+def test_ingest_log_merge_rejects_conflict_and_write_failure(monkeypatch, file_log):
+    from types import SimpleNamespace
+    monkeypatch.setattr(a.subprocess, 'run', lambda args, **kwargs: SimpleNamespace(
+        stdout=LINE if args[1]=='logs' else file_log, stderr='', returncode=0))
+    with pytest.raises(RuntimeError):
+        a.container_logs('test', 1, allow_recall_failure=True)
+
+def test_log_merge_preserves_diagnostics_from_both_sources(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(a.subprocess, 'run', lambda args, **kwargs: SimpleNamespace(
+        stdout=LINE+'\nmemos.onTurnStart.soft_timeout' if args[1]=='logs'
+        else LINE+'\nmemos.onTurnStart.late_failure', stderr='', returncode=0))
+    receipt = a.recall_receipt(a.container_logs('test', 1, allow_recall_failure=True), allow_recall_failure=True)
+    assert receipt['errors'] == ['memos.onTurnStart.soft_timeout', 'memos.onTurnStart.late_failure']
+    assert receipt['hits'] == 0
 def test_capture_identity(tmp_path):
     p=tmp_path/'db.sqlite'
     with sqlite3.connect(p) as db:
@@ -189,18 +243,12 @@ def test_framework_keeps_invalid_qa_answer_and_tokens(tmp_path, monkeypatch):
         if req.action=='before_agent':return MemoryPluginTaskOutput(status='ok',state='completed')
         return MemoryPluginTaskOutput(status='failed',state='failed',output={'qa_valid':False},
                                      error={'type':'InvalidQARead','message':'QA invalid: history read audit failed'})
-    def isolated(_id, request):
-        assert request.messages == [{'role':'user','content':'question'}]
-        return {'status':'ok','agent_answer':'independent answer',
-                'raw':{'usage':{'prompt_tokens':4,'completion_tokens':2,'total_tokens':6}}}
-    monkeypatch.setattr('memory_bench_platform.workflow_operators._answer_without_plugin', isolated)
     with token_usage.scope({'run_dir':str(tmp_path),'run_id':'r','memory_backend':'memos'}):
         output=_execute_agent(step,'openclaw',agent,context,plugin)
-    assert output['status']=='ok' and output['qa_without_plugin']
-    assert output['agent_answer']=='independent answer'
-    assert output['plugin_attempt']['agent_answer']=='retained original answer'
+    assert output['status']=='failed'
+    assert output['agent_answer']=='retained original answer'
     assert output['plugin_checks']['after_agent']['output']['qa_valid'] is False
-    assert token_usage.rebuild(tmp_path)['observed_agent_qa_tokens']==23
+    assert token_usage.rebuild(tmp_path)['observed_agent_qa_tokens']==17
 
 
 @pytest.mark.parametrize('console,file_log', [

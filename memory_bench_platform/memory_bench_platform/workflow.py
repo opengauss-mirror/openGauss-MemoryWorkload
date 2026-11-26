@@ -161,10 +161,10 @@ def _execute_case(
         inherited_plugin_failure = bool(unsatisfied_case_dependencies) and all(
             case_failure_kind.get(dep) in {"plugin-history-incomplete-qa-ready", "plugin-qa-unavailable"} for dep in unsatisfied_case_dependencies
         )
-        isolated_answer = plugin_qa and any(case_failure_kind.get(dep) == "plugin-qa-unavailable"
+        plugin_qa_unavailable = plugin_qa and any(case_failure_kind.get(dep) == "plugin-qa-unavailable"
                                                for dep in unsatisfied_case_dependencies)
         if ((failed_memory_dependencies and (resilient_qa or preparation))
-                or (inherited_plugin_failure and (plugin_qa or plugin_setup))):
+                or (inherited_plugin_failure and (plugin_qa or plugin_setup))) and not plugin_qa_unavailable:
             if resilient_qa or plugin_qa:
                 qa_degradation["setup_failed"] = list(unsatisfied_case_dependencies)
             unsatisfied_case_dependencies = []
@@ -263,8 +263,6 @@ def _execute_case(
                     for dep in recall_fallbacks:
                         input_scope["steps"][dep] = {"output": {"evidence_text": ""}}
                 resolved_inputs = resolve_inputs(step.inputs, input_scope)
-                if isolated_answer:
-                    resolved_inputs["qa_without_plugin"] = True
                 if restore_qa:
                     resolved_inputs["recover_read_only"] = True
             except InputResolutionError as exc:
@@ -455,8 +453,6 @@ def _execute_case(
             if restore_qa:
                 qa_phase_restored = (result.status == "passed"
                                      and result.structured_output["output"].get("read_only_verified") is True)
-            if plugin_qa and result.structured_output.get("raw", {}).get("qa_without_plugin"):
-                qa_degradation["without_memory"] = True
             if (resilient_qa or plugin_qa) and step.operator_kind == "agent" and qa_degradation:
                 result.structured_output["qa_degradation"] = dict(qa_degradation)
             case_step_results.append(result)
