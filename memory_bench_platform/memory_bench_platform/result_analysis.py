@@ -80,7 +80,10 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         "agent_id": run_record.get("agent_id"),
         "entrypoint_kind": run_record.get("source_kind"),
         "status": summary["status"],
-        "overall_accuracy": _compute_accuracy(summary, external_result),
+        "primary_metric": summary.get("primary_metric", "accuracy"),
+        "primary_score": _compute_accuracy(summary, external_result),
+        "overall_accuracy": (_compute_accuracy(summary, external_result)
+                             if summary.get("primary_metric", "accuracy") == "accuracy" else None),
         "case_total": summary["case_total"],
         "case_passed": summary["case_passed"],
         "case_failed": summary["case_failed"],
@@ -108,6 +111,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     compact_timed_out = "memory_compact_timeout" in validity.get("reasons", [])
     if validity.get("valid") is False or compact_timed_out:
         analysis["overall_accuracy"] = None
+        analysis["primary_score"] = None
     if degraded:
         analysis["degraded_qa"] = degraded
         paths = evaluation.get("qa_paths") or {}
@@ -663,6 +667,8 @@ def _render_analysis_markdown(analysis: dict[str, Any]) -> str:
         f"- agent_id: `{analysis.get('agent_id')}`",
         f"- entrypoint_kind: `{analysis.get('entrypoint_kind')}`",
         f"- status: `{analysis.get('status')}`",
+        f"- primary_metric: {analysis.get('primary_metric', 'accuracy')}",
+        f"- primary_score: {analysis.get('primary_score')}",
         f"- overall_accuracy: `{analysis.get('overall_accuracy')}`",
         "",
         "## Failure Summary",
@@ -710,7 +716,8 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
         except Exception:
             return "0.00%"
 
-    accuracy = analysis.get("overall_accuracy")
+    accuracy = analysis.get("primary_score", analysis.get("overall_accuracy"))
+    metric_label = "Overall Accuracy" if analysis.get("primary_metric", "accuracy") == "accuracy" else html.escape(str(analysis["primary_metric"]))
     accuracy_display = "—" if accuracy is None else pct(accuracy)
 
     def render_mapping(mapping: dict[str, Any]) -> str:
@@ -1007,7 +1014,7 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <div class="muted">benchmark={esc(analysis.get("benchmark_id"))} · agent={esc(analysis.get("agent_id"))} · status={esc(analysis.get("status"))}</div>
     </section>
     <section class="grid">
-      <div class="card"><div class="metric-label">Overall Accuracy</div><div class="metric-value">{accuracy_display}</div></div>
+      <div class="card"><div class="metric-label">{metric_label}</div><div class="metric-value">{accuracy_display}</div></div>
       <div class="card"><div class="metric-label">Cases</div><div class="metric-value">{esc(analysis.get("case_passed"))} / {esc(analysis.get("case_total"))}</div></div>
       <div class="card"><div class="metric-label">Failures</div><div class="metric-value">{esc(analysis.get("case_failed"))}</div></div>
       <div class="card"><div class="metric-label">EntryPoint</div><div class="metric-value">{esc(analysis.get("entrypoint_kind"))}</div></div>

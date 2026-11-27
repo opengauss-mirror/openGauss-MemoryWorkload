@@ -1770,6 +1770,9 @@ def _main(args, parser) -> None:
         judge_results,
         workflow_output["step_results"],
     )
+    from .judge_handlers import apply_primary_metric
+    evaluation_summary = apply_primary_metric(
+        evaluation_summary, cases, judge_results, run_contract.get("judge_runtime") or {})
     finalize_failed = lifecycle_result is not None and lifecycle_result.status == "failed"
     evaluation_summary = _apply_native_run_validity(
         evaluation_summary,
@@ -1877,6 +1880,8 @@ def _main(args, parser) -> None:
         case_passed=evaluation_summary["case_passed"],
         case_failed=evaluation_summary["case_failed"],
         case_ungraded=evaluation_summary["case_ungraded"],
+        primary_metric=evaluation_summary.get("primary_metric", "accuracy"),
+        full_score_pass_rate=evaluation_summary.get("full_score_pass_rate"),
         benchmark_score=evaluation_summary["benchmark_score"],
         raw_benchmark_score=evaluation_summary["raw_benchmark_score"],
         evaluation_coverage=evaluation_summary["evaluation_coverage"],

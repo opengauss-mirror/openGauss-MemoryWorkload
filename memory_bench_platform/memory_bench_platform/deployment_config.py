@@ -414,11 +414,12 @@ def _load_deployment(path: Path) -> DeploymentConfig:
         bundle = resolve_run_skill_bundle(combo.benchmark, config.agents[combo.agent].skill,
                                           config.memories[memory_id].skill, combo.memory_integration)
         if combo.memory_integration == "agent_plugin" and combo.execution.sample_concurrency > 1:
-            if (not combo.plugin_runtime or combo.benchmark not in ("locomo", "longmemeval") or combo.entrypoint
+            if (not combo.plugin_runtime or not bundle.benchmark.entry.scenario_builder or combo.entrypoint
                     or config.agents[combo.agent].skill != "openclaw" or not memory_id
                     or bundle.memory_plugin_id not in MANAGED_GATEWAYS or combo.gateway_pool):
-                raise ValueError("Pooled sample execution requires the native LoCoMo or LongMemEval OpenClaw deployment with a supported memory plugin")
-            samples = json.loads((root / combo.data_path).read_text())
+                raise ValueError("Pooled sample execution requires the scenario-based OpenClaw deployment with a supported memory plugin")
+            from .integration import build_benchmark_scenario
+            samples = build_benchmark_scenario(combo.benchmark, str(root / combo.data_path)).samples
             if not isinstance(samples, list) or not samples:
                 raise ValueError("Expected a nonempty benchmark sample list")
             combo._sample_gateways = min(len(samples), combo.execution.sample_concurrency)

@@ -292,7 +292,7 @@ def test_unknown_yaml_field_and_duplicate_combination_rejected(tmp_path):
     ({"qa_concurrency": 0}, "greater than 0"),
     ({"judge_concurrency": -1}, "greater than 0"),
     ({"judge_concurrency": True}, "valid integer"),
-    ({"sample_concurrency": 2}, "requires the native LoCoMo"),
+    ({"sample_concurrency": 2}, "requires the scenario-based OpenClaw"),
 ])
 def test_invalid_deployment_concurrency(tmp_path, execution, message):
     path, raw = fixture_config(tmp_path)

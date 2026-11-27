@@ -159,14 +159,29 @@ def test_inactive_config_without_gateway_ack_is_not_reusable(tmp_path, provider)
     undeploy('suite', tmp_path, docker)
 
 
+def locomo_rows(count):
+    return [{"sample_id": str(i),
+             "conversation": {"session_1_date_time": "2024-03-15",
+                              "session_1": [{"speaker": "Alice", "text": "I prefer tea.", "dia_id": "D1:1"}]},
+             "qa": [{"question": "Drink?", "answer": "tea", "category": 1, "evidence": ["D1:1"]}]}
+            for i in range(count)]
+
+
 @pytest.mark.parametrize(("samples", "gateways"), [(1, 1), (3, 2)])
-@pytest.mark.parametrize("benchmark", ["locomo", "longmemeval"])
+@pytest.mark.parametrize("benchmark", ["locomo", "longmemeval", "beam"])
 def test_managed_ogmemory_gateways_share_service(tmp_path, samples, gateways, benchmark):
     path, raw = configured(tmp_path, "ogmemory")
     combo = raw["combinations"][0]
     combo["benchmark"] = benchmark
     combo["execution"] = {"sample_concurrency": 2}
-    (tmp_path / combo["data_path"]).write_text(json.dumps([{"sample_id": str(i)} for i in range(samples)]))
+    rows = locomo_rows(samples) if benchmark == "locomo" else [{"sample_id": str(i)} for i in range(samples)]
+    if benchmark == "beam":
+        rows = [{"conversation_id": str(i),
+                 "chat": [{"role": "user", "content": "Remember my preference for tea."}],
+                 "probing_questions": {"information_extraction": [
+                     {"question": "What drink?", "rubric": ["tea"]}]}}
+                for i in range(samples)]
+    (tmp_path / combo["data_path"]).write_text(json.dumps(rows))
     path.write_text(yaml.safe_dump(raw))
     docker = RecordingDocker()
     state = deploy(path, tmp_path, docker)
@@ -192,7 +207,7 @@ def test_managed_gateway_preparation_and_qa_budget(tmp_path, monkeypatch):
     combo["preparation"] = {step: {"enabled": True, "target": "agent", "command": [command]}
                            for step, command in (("seed", "seed"), ("readiness", "ready"), ("warmup", "warmup"))}
     raw["agents"]["claw"]["healthcheck_interval_seconds"] = 90
-    (tmp_path / combo["data_path"]).write_text(json.dumps([{"sample_id": "a"}, {"sample_id": "b"}]))
+    (tmp_path / combo["data_path"]).write_text(json.dumps(locomo_rows(2)))
     path.write_text(yaml.safe_dump(raw))
     docker = RecordingDocker()
     state = deploy(path, tmp_path, docker)
@@ -221,3 +236,22 @@ def test_managed_gateway_preparation_and_qa_budget(tmp_path, monkeypatch):
     for command in ("seed", "ready", "warmup"):
         assert {cid for cid, cmd in docker.exec_calls if cmd == [command]} == ids
     assert elapsed[0] == 90
+
+
+@pytest.mark.parametrize(("data_format", "count"), [("object", 1), ("jsonl", 2)])
+def test_beam_gateway_count_uses_scenario_builder(tmp_path, data_format, count):
+    path, raw = configured(tmp_path, "ogmemory")
+    combo = raw["combinations"][0]
+    combo.update(benchmark="beam", execution={"sample_concurrency": 3})
+    rows = [{"conversation_id": str(i),
+             "chat": [{"role": "user", "content": "I prefer tea."}],
+             "probing_questions": {"information_extraction": [
+                 {"question": "What drink?", "rubric": ["tea"]}]}}
+            for i in range(count)]
+    content = json.dumps(rows[0]) if data_format == "object" else "\n".join(map(json.dumps, rows))
+    (tmp_path / combo["data_path"]).write_text(content)
+    path.write_text(yaml.safe_dump(raw))
+    docker = RecordingDocker()
+    state = deploy(path, tmp_path, docker)
+    assert len(state.plugin_runtimes) == count
+    undeploy("suite", tmp_path, docker)

@@ -341,6 +341,8 @@ class JudgeResult(BaseModel):
 
 
 class ReportSummary(BaseModel):
+    primary_metric: str = "accuracy"
+    full_score_pass_rate: float | None = None
     run_id: str
     status: Literal["pending", "running", "passed", "failed", "partial", "invalid", "stubbed"]
     case_total: int

@@ -296,13 +296,10 @@ def build_run_contract(
     memory_ingest = memory.ingest if memory is not None else {}
     memory_recall = memory.recall if memory is not None else {}
     memory_completion = memory.completion if memory is not None else {}
-    judge_runtime = dict(benchmark.judging or {})
-    prompt_template = judge_runtime.get("prompt_template")
-    if prompt_template:
-        prompt_path = skills_root / "benchmarks" / benchmark.id / str(prompt_template)
-        if not prompt_path.is_file():
-            raise ValueError(f"benchmark judge prompt template not found: {prompt_path}")
-        judge_runtime["prompt_template_text"] = prompt_path.read_text(encoding="utf-8")
+    from .judge_handlers import resolve_handler_config
+    judge_runtime = resolve_handler_config(
+        benchmark.judging or {}, skills_root / "benchmarks" / benchmark.id,
+        (benchmark.evaluation or {}).get("primary_metric", "accuracy"))
 
     return {
         "selection": {
@@ -613,7 +610,12 @@ def score_benchmark_run(skill_id: str, run_dir: Path, source_path: str | None = 
     args = [str(run_dir)]
     if source_path:
         args.append(source_path)
-    return run_json_script(_script_for_manifest(manifest_path, manifest.entry.scorer), args=args)
+    # Keep scorer imports on the same Workload version as the invoking CLI.
+    pythonpath = os.pathsep.join(filter(None, [
+        str(Path(__file__).resolve().parents[1]), os.environ.get("PYTHONPATH")]))
+    return run_json_script(_script_for_manifest(manifest_path, manifest.entry.scorer),
+                           args=args, environment={"PYTHONPATH": pythonpath})
+
 
 
 def classify_entrypoint(entry: dict[str, Any]) -> str:

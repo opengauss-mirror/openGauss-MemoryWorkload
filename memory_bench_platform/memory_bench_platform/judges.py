@@ -182,6 +182,7 @@ def _judge_prompt(runtime_config: dict[str, Any], judge_input: JudgeInput, actua
     raise ValueError(f"unknown judge profile: {profile or '<missing>'}")
 
 
+
 def run_llm_judge(
     run_id: str,
     judge_input: JudgeInput,
@@ -245,7 +246,7 @@ def run_llm_judge(
     deadline = time.monotonic() + timeout
     max_tokens = int(runtime_config.get("max_tokens") or os.environ.get("MEMORY_BENCH_JUDGE_MAX_TOKENS", "256"))
     try:
-        prompt = _judge_prompt(runtime_config, judge_input, actual)
+        prompt = "" if runtime_config.get("handler_path") else _judge_prompt(runtime_config, judge_input, actual)
     except ValueError as exc:
         return JudgeResult(
             judge_id=f"{judge_input.case_id}-llm",
@@ -289,25 +290,31 @@ def run_llm_judge(
     user_agent = os.environ.get("MEMORY_BENCH_JUDGE_USER_AGENT", "memory-bench/1")
     if user_agent:
         headers["User-Agent"] = user_agent
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
     opener = urlopen or urllib.request.urlopen
-    attempts = 0
+    retries = 0
     attempt_errors: list[str] = []
-    try:
+
+    def invoke(text, system=SYSTEM_PROMPT):
+        nonlocal retries
+        body["messages"] = [{"role": "user", "content": text}]
+        if api_format == "anthropic":
+            body.pop("system", None)
+            if system:
+                body["system"] = system
+        elif system:
+            body["messages"].insert(0, {"role": "system", "content": system})
+        request = urllib.request.Request(
+            endpoint, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
+        )
         for attempt in range(3):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("judge deadline exceeded")
             try:
-                attempts += 1
+                retries += int(attempt > 0)
                 with opener(request, timeout=remaining) as response:
                     payload = json.loads(response.read().decode("utf-8") or "{}")
-                break
+                return _llm_response_text(payload, api_format)
             except (TimeoutError, urllib.error.URLError) as exc:
                 attempt_errors.append(f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError)
                                       else type(exc).__name__)
@@ -315,8 +322,16 @@ def run_llm_judge(
                 if not retryable or attempt == 2:
                     raise
                 time.sleep(min(attempt + 1, max(0, deadline - time.monotonic())))
-        content = _llm_response_text(payload, api_format)
-        passed, rationale = _parse_llm_grade(content)
+
+    try:
+        if runtime_config.get("handler_path"):
+            from .judge_handlers import evaluate_handler
+            score, rationale = evaluate_handler(runtime_config, judge_input.reference, actual, invoke)
+            passed = score == 1.0
+        else:
+            content = invoke(prompt)
+            passed, rationale = _parse_llm_grade(content)
+            score = float(passed)
     except Exception as exc:
         return JudgeResult(
             judge_id=f"{judge_input.case_id}-llm",
@@ -326,7 +341,7 @@ def run_llm_judge(
             label="judge-error",
             passed=None,
             rationale=f"LLM judge failed: {type(exc).__name__}: {exc}",
-            retry_count=max(0, attempts - 1),
+            retry_count=retries,
             attempt_errors=attempt_errors,
         )
 
@@ -334,10 +349,10 @@ def run_llm_judge(
         judge_id=f"{judge_input.case_id}-llm",
         run_id=run_id,
         case_id=judge_input.case_id,
-        score=1.0 if passed else 0.0,
-        label="correct" if passed else "wrong",
+        score=score,
+        label="correct" if passed else "partial" if score > 0 else "wrong",
         passed=passed,
         rationale=rationale or ("LLM judge marked the answer correct." if passed else "LLM judge marked the answer wrong."),
-        retry_count=max(0, attempts - 1),
+        retry_count=retries,
         attempt_errors=attempt_errors,
     )
