@@ -749,3 +749,126 @@ def test_recall_degradation_reports_recall_failure_with_formal_validity(tmp_path
     note, = [note for note in analysis["analysis_notes"] if note.startswith("Degraded QA")]
     assert "memory recall failure" in note
     assert "compact timeout" not in note and "history preparation" not in note
+
+
+@pytest.mark.parametrize("metric,score", [("accuracy", 0.8), ("mean_category_score", 0.625),
+                                         ("accuracy", 0.0), ("accuracy", None)])
+@pytest.mark.parametrize("reason", ["memory_compact_timeout", "runtime_failure_rate_above_maximum"])
+def test_failed_run_keeps_observed_score_and_coverage(tmp_path, metric, score, reason):
+    run_dir = tmp_path / "observed-score"
+    _build_minimal_run(run_dir)
+    path = run_dir / "reports" / "summary.json"
+    summary = json.loads(path.read_text())
+    summary.update(
+        primary_metric=metric, benchmark_score=None, raw_benchmark_score=score,
+        case_total=5, case_passed=0 if score is None else 3,
+        case_ungraded=5 if score is None else 1,
+        run_validity={"valid": False, "reasons": [reason]},
+    )
+    path.write_text(json.dumps(summary))
+
+    analysis = analyze_run(run_dir)
+    assert analysis["primary_score"] is None
+    assert analysis["observed_score"] == score
+    assert analysis["case_graded"] == (0 if score is None else 4)
+    assert analysis["evaluation_coverage"] == (0.0 if score is None else 0.8)
+    assert analysis["run_validity"]["reasons"] == [reason]
+    report = (run_dir / "reports" / "run_report.html").read_text()
+    label = "Overall Accuracy" if metric == "accuracy" else metric
+    display = "—" if score is None else f"{score * 100:.2f}%"
+    assert f"Observed {label} (graded answers only)</div><div class=\"metric-value\">{display}</div>" in report
+    assert "Evaluation Coverage" in report
+    assert "ungraded" in report
+    assert "observed_score:" in (run_dir / "reports" / "analysis.md").read_text()
+    # Both machine-readable and human-readable exports retain the result.
+    assert analysis["observed_score"] == json.loads(
+        (run_dir / "reports" / "analysis.json").read_text())["observed_score"]
+
+
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("results,score,graded", [
+    (["CORRECT", "CORRECT", "CORRECT", "WRONG", ""], 0.75, 4),
+    (["", "", "", "", ""], None, 0),
+    (["WRONG", "WRONG", "WRONG", "WRONG", "WRONG"], 0.0, 5),
+])
+def test_external_observed_score_uses_actual_grades(tmp_path, archived, results, score, graded):
+    from memory_bench_platform.external_report_import import import_external_result
+
+    run_dir = tmp_path / "external-grades"
+    _build_minimal_run(run_dir)
+    artifacts = run_dir / "external_artifacts" / "official_small"
+    artifacts.mkdir(parents=True)
+    header = "sample_id,qi,question,expected,response,category,result,reasoning"
+    rows = [f"conv-1,{i},Q,A,R,1,{result}," for i, result in enumerate(results)]
+    (artifacts / "qa_results.csv").write_text("\n".join([header, *rows]) + "\n")
+    if archived:
+        imported = import_external_result(artifacts)
+        (run_dir / "reports" / "external_result_summary.json").write_text(json.dumps(imported))
+        (run_dir / "reports" / "case_results.json").write_text(json.dumps(imported["case_results"]))
+        # Emulate an older summary without case_ungraded; no refresh is performed.
+        path = run_dir / "reports" / "summary.json"
+        summary = json.loads(path.read_text())
+        summary.update(case_total=5, case_passed=results.count("CORRECT"))
+        path.write_text(json.dumps(summary))
+        path = run_dir / "run.json"
+        record = json.loads(path.read_text())
+        record["source_kind"] = "benchmark"
+        path.write_text(json.dumps(record))
+
+    analysis = analyze_run(run_dir)
+    assert analysis["case_graded"] == graded
+    assert analysis["failure_summary"]["correct_count"] == results.count("CORRECT")
+    assert analysis["failure_summary"]["wrong_count"] == results.count("WRONG")
+    assert analysis["failure_summary"]["ungraded_count"] == 5 - graded
+    assert analysis["case_ungraded"] == 5 - graded
+    assert analysis["evaluation_coverage"] == graded / 5
+    assert analysis["observed_score"] == score
+    if not archived:
+        summary = json.loads((run_dir / "reports" / "summary.json").read_text())
+        assert summary["case_ungraded"] == 5 - graded
+    report = (run_dir / "reports" / "run_report.html").read_text()
+    display = "—" if score is None else f"{score * 100:.2f}%"
+    assert f'Observed Overall Accuracy (graded answers only)</div><div class="metric-value">{display}</div>' in report
+    assert f"{graded} / 5 graded" in report
+    assert f"{5 - graded} ungraded" in report
+    assert f"{graded / 5 * 100:.2f}%" in report
+    exported = json.loads((run_dir / "reports" / "analysis.json").read_text())
+    assert exported["observed_score"] == score
+    assert exported["case_graded"] == graded
+    markdown = (run_dir / "reports" / "analysis.md").read_text()
+    assert f"- evaluation_coverage: {graded} / 5" in markdown
+    assert f"- observed_score: {score}" in markdown
+
+
+@pytest.mark.parametrize("ungraded_row", [
+    {"passed": None, "label": "judge-error"},
+    {"passed": False, "label": "ungraded"},
+])
+@pytest.mark.parametrize("raw_score,expected", [(None, 0.75), (0.625, 0.625), (0.0, 0.0)])
+def test_legacy_score_fallback_shares_coverage_denominator(tmp_path, ungraded_row, raw_score, expected):
+    run_dir = tmp_path / "legacy-grades"
+    _build_minimal_run(run_dir)
+    path = run_dir / "reports" / "summary.json"
+    summary = json.loads(path.read_text())
+    summary.update(case_total=5, case_passed=3, case_failed=1)
+    if raw_score is not None:
+        summary["raw_benchmark_score"] = raw_score
+    assert "case_ungraded" not in summary
+    path.write_text(json.dumps(summary))
+    rows = [
+        {"case_id": f"q{i}", "passed": i < 3, "label": "correct" if i < 3 else "wrong"}
+        for i in range(4)
+    ] + [{"case_id": "q4", **ungraded_row}]
+    (run_dir / "reports" / "case_results.json").write_text(json.dumps(rows))
+
+    analysis = analyze_run(run_dir)
+    assert analysis["case_graded"] == 4
+    assert analysis["case_ungraded"] == 1
+    assert analysis["evaluation_coverage"] == 0.8
+    assert analysis["observed_score"] == expected
+    assert analysis["failure_summary"]["correct_count"] == 3
+    assert analysis["failure_summary"]["wrong_count"] == 1
+    assert analysis["failure_summary"]["ungraded_count"] == 1
+    html = (run_dir / "reports" / "run_report.html").read_text()
+    assert f'Observed Overall Accuracy (graded answers only)</div><div class="metric-value">{expected * 100:.2f}%</div>' in html
+    assert "4 / 5 graded" in html

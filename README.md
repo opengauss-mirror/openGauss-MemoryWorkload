@@ -293,6 +293,14 @@ memory-bench analyze-run \
   --run-dir /path/to/run-directory
 ```
 
+分析报告中的 observed_score 展示已完成评分题目的实际得分，并同时列出
+evaluation_coverage、已评分和未评分数量。即使 compact 超时或召回失败导致
+完整性检查不通过，已有得分也会保留在 JSON、Markdown 和 HTML 中。
+准确率以已评分题目为分母；BEAM 继续使用其分类分数聚合，不换算成满分题通过率。
+所有题目均未评分时显示“—”，正常零分显示 0.00%。
+benchmark_score 和运行完整性标记保留原有规则，错误不会被改成成功；
+这项报告调整不重跑历史、QA 或 Judge，也不改变提示词和 Token 统计。
+
 ## 结果目录和报告
 
 每次 run 默认写入：

@@ -49,8 +49,16 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     if refreshed is not None:
         summary, case_results, external_result = refreshed
 
+    # Archived external rows use label="ungraded", passed=False.
+    external_summary = (external_result or {}).get("summary", {})
+    if "ungraded_count" in external_summary or "total_graded" in external_summary:
+        summary["case_ungraded"] = (
+            int(external_summary["ungraded_count"] or 0)
+            if "ungraded_count" in external_summary else
+            max(0, summary["case_total"] - int(external_summary["total_graded"] or 0))
+        )
     failures = [item for item in case_results if item.get("passed") is False]
-    ungraded = [item for item in case_results if item.get("passed") is None]
+    ungraded = [item for item in case_results if _is_ungraded(item)]
     buckets = _bucket_failures(failures)
     external_output_dir = _resolve_external_output_dir(run_dir)
     chain_diagnostics: dict[str, Any] = {}
@@ -112,6 +120,17 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     if validity.get("valid") is False or compact_timed_out:
         analysis["overall_accuracy"] = None
         analysis["primary_score"] = None
+    graded = max(0, analysis["case_total"] - analysis["case_ungraded"])
+    analysis["observed_score"] = _observed_score(summary, external_result, graded=graded)
+    analysis["case_graded"] = graded
+    analysis["evaluation_coverage"] = (graded / analysis["case_total"]
+                                       if analysis["case_total"] else 0.0)
+    analysis["run_validity"] = validity
+    if validity.get("valid") is False:
+        analysis["analysis_notes"].append(
+            "Run integrity checks failed. Observed score uses graded answers only; "
+            "see evaluation coverage and recorded failures."
+        )
     if degraded:
         analysis["degraded_qa"] = degraded
         paths = evaluation.get("qa_paths") or {}
@@ -240,6 +259,7 @@ def _summary_from_external_result(run_id: str, imported: dict[str, Any]) -> dict
         "status": status,
         "case_total": total_questions,
         "case_passed": total_correct,
+        "case_ungraded": ungraded_count,
         "case_failed": total_graded - total_correct if ungraded_count <= 0 else total_questions - total_correct,
         "category_summary": summary.get("accuracy_by_category", {}),
         "run_validity": run_validity if isinstance(run_validity, dict) else {},
@@ -288,6 +308,25 @@ def _extract_benchmark_id(run_record: dict[str, Any]) -> str | None:
     return source_id or None
 
 
+def _observed_score(
+    summary: dict[str, Any], external_result: dict[str, Any] | None, *, graded: int,
+) -> float | None:
+    # External importers may encode "no grades" as overall_accuracy=0.0.
+    external_summary = (external_result or {}).get("summary", {})
+    if "total_graded" in external_summary and int(external_summary["total_graded"] or 0) <= 0:
+        return None
+    # Keep the benchmark's own aggregation (including partial-credit metrics).
+    for key in ("raw_benchmark_score", "benchmark_score"):
+        if summary.get(key) is not None:
+            return float(summary[key])
+    if external_result is not None:
+        value = external_result.get("summary", {}).get("overall_accuracy")
+        return float(value) if value is not None else None
+    if summary.get("primary_metric", "accuracy") == "accuracy" and graded > 0:
+        return round(int(summary.get("case_passed", 0) or 0) / graded, 4)
+    return None
+
+
 def _compute_accuracy(summary: dict[str, Any], external_result: dict[str, Any] | None) -> float:
     if external_result is not None:
         return float(external_result.get("summary", {}).get("overall_accuracy", 0.0))
@@ -331,10 +370,14 @@ def _bucket_failures(failures: list[dict[str, Any]]) -> dict[str, list[dict[str,
     return buckets
 
 
+def _is_ungraded(item: dict[str, Any]) -> bool:
+    return item.get("passed") is None or item.get("label") == "ungraded"
+
+
 def _summarize_failures(case_results: list[dict[str, Any]], buckets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    correct_count = sum(1 for item in case_results if item.get("passed") is True)
-    wrong_count = sum(1 for item in case_results if item.get("passed") is False)
-    ungraded_count = sum(1 for item in case_results if item.get("passed") is None)
+    correct_count = sum(1 for item in case_results if not _is_ungraded(item) and item.get("passed") is True)
+    wrong_count = sum(1 for item in case_results if not _is_ungraded(item) and item.get("passed") is False)
+    ungraded_count = sum(1 for item in case_results if _is_ungraded(item))
     return {
         "correct_count": correct_count,
         "wrong_count": wrong_count,
@@ -670,6 +713,10 @@ def _render_analysis_markdown(analysis: dict[str, Any]) -> str:
         f"- primary_metric: {analysis.get('primary_metric', 'accuracy')}",
         f"- primary_score: {analysis.get('primary_score')}",
         f"- overall_accuracy: `{analysis.get('overall_accuracy')}`",
+        f"- observed_score: {analysis.get('observed_score')} (graded answers only)",
+        f"- evaluation_coverage: {analysis.get('case_graded')} / {analysis.get('case_total')} "
+        f"({analysis.get('evaluation_coverage')})",
+        f"- run_validity: {analysis.get('run_validity', {})}",
         "",
         "## Failure Summary",
         "",
@@ -719,6 +766,9 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
     accuracy = analysis.get("primary_score", analysis.get("overall_accuracy"))
     metric_label = "Overall Accuracy" if analysis.get("primary_metric", "accuracy") == "accuracy" else html.escape(str(analysis["primary_metric"]))
     accuracy_display = "—" if accuracy is None else pct(accuracy)
+    observed = analysis.get("observed_score")
+    observed_display = "—" if observed is None else pct(observed)
+    coverage_display = pct(analysis.get("evaluation_coverage", 0.0))
 
     def render_mapping(mapping: dict[str, Any]) -> str:
         if not mapping:
@@ -1018,6 +1068,10 @@ def _render_analysis_html(analysis: dict[str, Any]) -> str:
       <div class="card"><div class="metric-label">Cases</div><div class="metric-value">{esc(analysis.get("case_passed"))} / {esc(analysis.get("case_total"))}</div></div>
       <div class="card"><div class="metric-label">Failures</div><div class="metric-value">{esc(analysis.get("case_failed"))}</div></div>
       <div class="card"><div class="metric-label">EntryPoint</div><div class="metric-value">{esc(analysis.get("entrypoint_kind"))}</div></div>
+    </section>
+    <section class="grid">
+      <div class="card"><div class="metric-label">Observed {metric_label} (graded answers only)</div><div class="metric-value">{observed_display}</div></div>
+      <div class="card"><div class="metric-label">Evaluation Coverage</div><div class="metric-value">{coverage_display}</div><div class="muted">{esc(analysis.get("case_graded"))} / {esc(analysis.get("case_total"))} graded · {esc(analysis.get("case_ungraded"))} ungraded</div></div>
     </section>
     {qa_mode_html}
     {stage_timing_cards_html}
