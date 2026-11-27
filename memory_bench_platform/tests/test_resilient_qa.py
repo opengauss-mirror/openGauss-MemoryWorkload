@@ -13,7 +13,7 @@ from memory_bench_platform.protocol import (
 
 @pytest.mark.parametrize("backend", ["ogmemory", "hindsight", "mem0"])
 @pytest.mark.parametrize("failure", [None, "ingest", "flush", "status", "recall", "exception",
-                                     "empty", "both", "invalid", "invalid_setup"])
+                                     "empty", "both", "invalid", "invalid_setup", "compact_timeout", "source_only"])
 def test_memory_failure_does_not_prevent_qa(monkeypatch, tmp_path, backend, failure):
     actions, prompts = [], []
 
@@ -21,6 +21,13 @@ def test_memory_failure_does_not_prevent_qa(monkeypatch, tmp_path, backend, fail
         actions.append(request.action)
         if failure == "exception" and request.action == "recall":
             raise RuntimeError("recall transport failed")
+        if failure == "compact_timeout" and request.action == "flush":
+            return MemoryTaskOutput(status="failed", state="failed",
+                                    error={"code": "CompactTimeout", "message": "backend still running"})
+        if failure == "source_only" and request.action == "flush":
+            return MemoryTaskOutput(status="failed", state="failed",
+                                    output={"recovery_mode": "source_only"},
+                                    error={"code": "ExtractionDegraded", "message": "source preserved"})
         if request.action == failure or (failure == "both" and request.action in {"flush", "recall"}):
             return MemoryTaskOutput(status="failed", state="failed",
                                     output={"evidence_text": "DO NOT USE FAILED OUTPUT"},
